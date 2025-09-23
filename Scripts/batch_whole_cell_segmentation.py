@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+import os, argparse, numpy as np, tifffile as tiff, xml.etree.ElementTree as ET
+from pathlib import Path
+from cellpose import models, io
+from scipy import ndimage as ndi
+
+# ---------- OME helpers ----------
+def read_ome(path):
+    with tiff.TiffFile(path) as tf:
+        arr = tf.asarray()
+        axes = tf.series[0].axes  # e.g. 'TCZYX', 'CZYX', 'ZCYX', 'CYX', 'YX'
+        meta_xml = tf.ome_metadata
+    return arr, axes, meta_xml
+
+def to_ZCYX(arr, axes):
+    """
+    Reorder to (Z, C, Y, X), adding singleton Z/C if missing.
+    Works for most common OME axis strings.
+    """
+    ax = {a: i for i, a in enumerate(axes)}
+    # add missing Z or C dims as singleton
+    if 'Z' not in ax:
+        arr = np.expand_dims(arr, 0)
+        axes = 'Z' + axes
+    if 'C' not in ax:
+        # insert C after Z (or at start)
+        arr = np.expand_dims(arr, 0)
+        axes = axes[:1] + 'C' + axes[1:]
+    ax = {a: i for i, a in enumerate(axes)}
+    order = [ax['Z'], ax['C'], ax['Y'], ax['X']]
+    out = np.moveaxis(arr, order, (0, 1, 2, 3))
+    return out
+
+def channel_names_from_ome(meta_xml):
+    names = []
+    if not meta_xml:
+        return names
+    root = ET.fromstring(meta_xml)
+    ns = {'ome': 'http://www.openmicroscopy.org/Schemas/OME/2016-06'}
+    for ch in root.findall('.//ome:Image/ome:Pixels/ome:Channel', ns):
+        nm = ch.get('Name') or ch.get('ID') or ''
+        names.append(nm)
+    return names
+
+def pick_cy3_idx(ch_names, hints):
+    """Pick Cy3 channel by name (case-insensitive)."""
+    if not ch_names:
+        return 0
+    lname = [str(n).lower() for n in ch_names]
+    for h in hints:
+        h = str(h).lower()
+        for i, n in enumerate(lname):
+            if h in n:
+                return i
+    return 0  # fallback
+
+# ---------- simple viz helpers ----------
+def percentile_norm(img2d, p1=1, p99=99):
+    lo, hi = np.percentile(img2d, (p1, p99))
+    if hi <= lo:
+        return np.zeros_like(img2d, dtype=np.uint8)
+    x = np.clip((img2d - lo) / (hi - lo), 0, 1)
+    return (x * 255).astype(np.uint8)
+
+def random_label_colors(mask, seed=0):
+    """Return RGB image coloring each label (0 stays black)."""
+    H, W = mask.shape
+    K = int(mask.max()) + 1
+    rng = np.random.default_rng(seed)
+    palette = rng.integers(0, 255, size=(K, 3), dtype=np.uint8)
+    palette[0] = 0
+    rgb = palette[mask]
+    return rgb
+
+def mask_outlines(mask):
+    """Boolean outline map on mask pixels (4-neighborhood)."""
+    m = mask > 0
+    edge = np.zeros_like(m, dtype=bool)
+    edge[:-1, :] |= m[:-1, :] != m[1:, :]
+    edge[1:,  :] |= m[1:,  :] != m[:-1, :]
+    edge[:, :-1] |= m[:, :-1] != m[:, 1:]
+    edge[:, 1:]  |= m[:, 1:]  != m[:, :-1]
+    return edge & m
+
+def overlay_outlines_on_gray(gray, mask, edge_color=(255, 0, 0), alpha_fill=0.0):
+    """
+    gray: uint8 (Y,X)
+    mask: uint16/uint32 labels (Y,X)
+    - draws red outlines
+    - optionally alpha blends filled labels if alpha_fill>0
+    """
+    rgb = np.dstack([gray, gray, gray]).astype(np.uint8)
+    if alpha_fill > 0:
+        fill = random_label_colors(mask)
+        rgb = (rgb*(1-alpha_fill) + fill*alpha_fill).astype(np.uint8)
+    edges = mask_outlines(mask)
+    rgb[edges] = np.array(edge_color, dtype=np.uint8)
+    return rgb
+
+# ---------- light background subtraction for 2.5D ----------
+def percentile_bg_sub(zimg, p=2):
+    # subtract a low percentile per-slice to cut haze, keep >= 0
+    bg = np.percentile(zimg, p)
+    out = zimg.astype(np.float32) - bg
+    out[out < 0] = 0
+    return out.astype(zimg.dtype)
+
+# ---------- MODE A: MIP → 2D segmentation (original approach) ----------
+def process_one_mip2d(path, out_proj_dir, out_mask2d_dir, out_prev_dir,
+                      cy3_idx=None, cy3_hints=('cy3', 'mscarlet', 'm-scarlet', '568'),
+                      cellprob_threshold=-5.5, pretrained_model = "cyto2", flow_threshold=0.4, diameter=None, gpu=True):
+    arr, axes, meta = read_ome(path)
+    ZCYX = to_ZCYX(arr, axes)
+    ch_names = channel_names_from_ome(meta)
+    if cy3_idx is None:
+        cy3_idx = pick_cy3_idx(ch_names, cy3_hints)
+
+    cy3_stack = ZCYX[:, cy3_idx]             # (Z, Y, X)
+    proj = np.max(cy3_stack, axis=0)         # 2D max projection
+    proj_u8 = percentile_norm(proj, 1, 99)
+
+    # CP-SAM expects 1–3 channels; we can give grayscale using channel_axis=None
+    model = models.CellposeModel(gpu=gpu, pretrained_model=pretrained_model)
+    masks, flows, styles = model.eval(
+        proj_u8,
+        channel_axis=None,        # grayscale
+        do_3D=False,
+        normalize=True,
+        diameter=diameter,
+        cellprob_threshold=cellprob_threshold,
+        flow_threshold=flow_threshold
+    )
+    masks = masks.astype(np.uint16)
+
+    stem = Path(path).stem.replace('.ome', '')
+    proj_tif = os.path.join(out_proj_dir, f"{stem}_proj.tif")
+    mask2d_tif = os.path.join(out_mask2d_dir, f"{stem}_mask2d.tif")
+    png_proj = os.path.join(out_prev_dir, f"{stem}_proj.png")
+    png_mask = os.path.join(out_prev_dir, f"{stem}_mask.png")
+    png_overlay = os.path.join(out_prev_dir, f"{stem}_overlay.png")
+
+    io.imsave(proj_tif, proj_u8)
+    io.imsave(mask2d_tif, masks)
+
+    mask_rgb = random_label_colors(masks)
+    overlay_rgb = overlay_outlines_on_gray(proj_u8, masks, edge_color=(255, 0, 0), alpha_fill=0.0)
+    tiff.imwrite(png_proj, proj_u8, photometric='minisblack')
+    tiff.imwrite(png_mask, mask_rgb)
+    tiff.imwrite(png_overlay, overlay_rgb)
+
+    return {
+        "proj_tif": proj_tif,
+        "mask2d_tif": mask2d_tif,
+        "png_proj": png_proj,
+        "png_mask": png_mask,
+        "png_overlay": png_overlay,
+        "cy3_idx": cy3_idx,
+        "channel_names": ch_names
+    }
+
+# ---------- MODE B: 2.5D (2D per-slice on GPU + 3D linking) ----------
+
+
+from scipy import ndimage as ndi
+import numpy as np
+import tifffile as tiff
+from cellpose import models, io
+
+def _lap_var(img):
+    return ndi.variance(ndi.laplace(img.astype(np.float32)))
+
+def _pick_focus_band(stack, half_width=4):
+    # pick slice with max focus and keep ±half_width around it
+    scores = np.array([_lap_var(z) for z in stack])
+    z0 = int(scores.argmax())
+    zlo = max(0, z0 - half_width)
+    zhi = min(stack.shape[0], z0 + half_width + 1)
+    return np.arange(zlo, zhi)
+
+def _clip_and_smooth(stack, lo=1, hi=99.5, sigma=1.5):
+    # global percentile clip, per-slice normalize, light Gaussian smooth
+    lo_v, hi_v = np.percentile(stack, (lo, hi))
+    stack = np.clip(stack, lo_v, hi_v)
+    out = np.empty_like(stack, dtype=np.uint8)
+    for i in range(stack.shape[0]):
+        z = stack[i].astype(np.float32)
+        if sigma and sigma > 0:
+            z = ndi.gaussian_filter(z, sigma=sigma)
+        mn, mx = np.percentile(z, (1, 99))
+        if mx <= mn:
+            out[i] = 0
+        else:
+            z = (np.clip(z, mn, mx) - mn) / (mx - mn) * 255.0
+            out[i] = z.astype(np.uint8)
+    return out
+
+def process_one_vol2p5d(path, out_mask3d_dir, out_prev_dir,
+                        cy3_idx=None, cy3_hints=('cy3','mscarlet','m-scarlet','568'),
+                        cellprob_threshold=-3.0, flow_threshold=0.5,
+                        diameter=80, gpu=True, bg_percentile=None,
+                        pretrained_model ="cyto2", min_size=1500,
+                        focus_halfwidth=4, batch_size=8):
+    # --- load ---
+    arr, axes, meta = read_ome(path)
+    ZCYX = to_ZCYX(arr, axes)                 # (Z,C,Y,X)
+    ch_names = channel_names_from_ome(meta)
+    if cy3_idx is None:
+        cy3_idx = pick_cy3_idx(ch_names, cy3_hints)
+    cy3_stack = ZCYX[:, cy3_idx].astype(arr.dtype)  # (Z,Y,X)
+
+    # optional very light background subtraction
+    if bg_percentile is not None:
+        bg = np.percentile(cy3_stack, bg_percentile)
+        cy3_stack = np.clip(cy3_stack.astype(np.float32) - bg, 0, None).astype(arr.dtype)
+
+    # --- focus band + preprocess ---
+    keep_z = _pick_focus_band(cy3_stack, half_width=focus_halfwidth)
+    sub = cy3_stack[keep_z]
+    sub_u8 = _clip_and_smooth(sub, lo=1, hi=99.5, sigma=1.0)  # uint8 stack
+
+    # --- batch 2D eval (one call) ---
+    model = models.CellposeModel(gpu=gpu, pretrained_model=pretrained_model)
+    img_list = [sub_u8[i] for i in range(sub_u8.shape[0])]
+    masks_list, flows, styles = model.eval(
+        img_list,
+        channel_axis=None,     # grayscale
+        do_3D=False,
+        normalize=True,
+        diameter=diameter,
+        cellprob_threshold=cellprob_threshold,
+        flow_threshold=flow_threshold,
+        min_size=min_size,     # remove tiny blobs (puncta)
+        # net_avg=False,         # faster
+        # augment=False,         # faster
+        # batch_size=batch_size  # fewer forward passes
+    )
+
+    # --- rebuild full-Z label volume (zeros outside focus band) ---
+    Z, H, W = cy3_stack.shape
+    masks_slices = np.zeros((Z, H, W), dtype=np.uint16)
+    for i, z in enumerate(keep_z):
+        masks_slices[z] = masks_list[i].astype(np.uint16)
+
+    # --- 3D linking (6-connectivity) ---
+    fg_3d = masks_slices > 0
+    structure = ndi.generate_binary_structure(3, 1)
+    mask3d, _ = ndi.label(fg_3d, structure=structure)
+    mask3d = mask3d.astype(np.uint16)
+
+    # --- save preview + mask ---
+    stem = Path(path).stem.replace('.ome','')
+    mask3d_tif = os.path.join(out_mask3d_dir, f"{stem}_mask3d.tif")
+    io.imsave(mask3d_tif, mask3d)
+
+    mip_signal = np.max(cy3_stack, axis=0)
+    mip_u8 = percentile_norm(mip_signal, 1, 99)
+    mip_labels = np.max(mask3d, axis=0).astype(np.uint16)
+    overlay = overlay_outlines_on_gray(mip_u8, mip_labels, edge_color=(255,0,0), alpha_fill=0.0)
+    png_overlay = os.path.join(out_prev_dir, f"{stem}_overlay.png")
+    tiff.imwrite(png_overlay, overlay)
+
+    return {
+        "mask3d_tif": mask3d_tif,
+        "png_overlay": png_overlay,
+        "n_objects": int(mask3d.max()),
+        "cy3_idx": cy3_idx,
+        "channel_names": ch_names
+    }
+
+
+# ---------- MODE C: true 3D Cellpose on CPU (optional) ----------
+def process_one_vol3d_cpu(path, out_mask3d_dir, out_prev_dir,
+                          cy3_idx=None, cy3_hints=('cy3','mscarlet','m-scarlet','568'),
+                          cellprob_threshold=-5.5, flow_threshold=0.4,
+                          diameter=None, gpu=False, pretrained_model = "cyto2", anisotropy=None):
+    """
+    True 3D eval. Works on CPU on macOS (MPS 3D is not supported by Cellpose).
+    """
+    arr, axes, meta = read_ome(path)
+    ZCYX = to_ZCYX(arr, axes)
+    ch_names = channel_names_from_ome(meta)
+    if cy3_idx is None:
+        cy3_idx = pick_cy3_idx(ch_names, cy3_hints)
+    cy3_stack = ZCYX[:, cy3_idx]              # (Z,Y,X)
+
+    model = models.CellposeModel(gpu=False, pretrained_model=pretrained_model)  # force CPU for 3D on macOS
+
+    masks3d, flows, styles = model.eval(
+        cy3_stack,                 # (Z,Y,X)
+        channel_axis=None,         # grayscale
+        z_axis=0,
+        do_3D=True,
+        normalize=True,
+        diameter=diameter,
+        cellprob_threshold=cellprob_threshold,
+        flow_threshold=flow_threshold,
+        anisotropy=anisotropy
+    )
+    masks3d = masks3d.astype(np.uint16)
+
+    stem = Path(path).stem.replace('.ome', '')
+    mask3d_tif = os.path.join(out_mask3d_dir, f"{stem}_mask3d.tif")
+    io.imsave(mask3d_tif, masks3d)
+
+    proj_u8 = percentile_norm(np.max(cy3_stack, axis=0), 1, 99)
+    mip_labels = np.max(masks3d, axis=0).astype(np.uint16)
+    png_overlay = os.path.join(out_prev_dir, f"{stem}_overlay.png")
+    overlay = overlay_outlines_on_gray(proj_u8, mip_labels, edge_color=(255, 0, 0), alpha_fill=0.0)
+    tiff.imwrite(png_overlay, overlay)
+
+    return {
+        "mask3d_tif": mask3d_tif,
+        "png_overlay": png_overlay,
+        "n_objects": int(masks3d.max()),
+        "cy3_idx": cy3_idx,
+        "channel_names": ch_names
+    }
+
+# ---------- CLI ----------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--in_dir", required=True, help="Folder with *.ome.tif / *.ome.tiff")
+    ap.add_argument("--out_dir", default="cellpose_out", help="Output root folder")
+    ap.add_argument("--mode", choices=["mip2d", "vol2p5d", "vol3d_cpu"], default="vol2p5d",
+                    help="mip2d: MIP->2D seg; vol2p5d: 2D per-slice + 3D link (GPU OK); vol3d_cpu: true 3D on CPU")
+    ap.add_argument("--cy3_idx", type=int, default=None, help="Force Cy3 channel index (overrides name hints)")
+    ap.add_argument("--cy3_hint", nargs="*", default=["cy3", "mscarlet", "m-scarlet", "568"],
+                    help="Name hints for Cy3 channel")
+    ap.add_argument("--diameter", type=float, default=80, help="Cell diameter in pixels (None = estimate)")
+    ap.add_argument("--cellprob", type=float, default=0.2)
+    ap.add_argument("--flow", type=float, default=0.9)
+    ap.add_argument("--cpu", action="store_true", help="Force CPU for mip2d/vol2p5d (GPU by default)")
+    ap.add_argument("--bgp", type=float, default=2.0, help="Per-slice bg percentile for vol2p5d (None to disable)")
+    ap.add_argument("--anisotropy", type=float, default=None,
+                    help="Voxel z/y (or z/x) size ratio for vol3d_cpu (optional)")
+    ap.add_argument("--model", default="cyto2",
+                choices=["cpsam","cyto2","cpcy","cpnc","cyto"],
+                help="Cellpose pretrained model to use")
+    args = ap.parse_args()
+
+    in_dir = Path(args.in_dir)
+    out_root = Path(args.out_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    # create subfolders based on mode
+    out_prev = out_root / "previews"; out_prev.mkdir(parents=True, exist_ok=True)
+    if args.mode == "mip2d":
+        out_proj = out_root / "projections"; out_proj.mkdir(parents=True, exist_ok=True)
+        out_mask2d = out_root / "masks_2d"; out_mask2d.mkdir(parents=True, exist_ok=True)
+    else:
+        out_mask3d = out_root / "masks_3d"; out_mask3d.mkdir(parents=True, exist_ok=True)
+
+    paths = sorted(list(in_dir.glob("*.ome.tif")) + list(in_dir.glob("*.ome.tiff")))
+    if not paths:
+        print("No OME-TIFFs found. Supported suffixes: *.ome.tif, *.ome.tiff")
+        return
+
+    model_info_printed = False
+    for p in paths:
+        if args.mode == "mip2d":
+            info = process_one_mip2d(
+                str(p), str(out_proj), str(out_mask2d), str(out_prev),
+                cy3_idx=args.cy3_idx,
+                cy3_hints=args.cy3_hint,
+                diameter=args.diameter,
+                cellprob_threshold=args.cellprob,
+                flow_threshold=args.flow,
+                pretrained_model= args.model,
+                gpu=not args.cpu
+            )
+            if not model_info_printed:
+                print(f"[mip2d] Detected channels for {p.name}: {info['channel_names'] or '[none in OME XML]'}; using Cy3 idx = {info['cy3_idx']}")
+                model_info_printed = True
+            print(f"✓ {p.name} →")
+            print(f"   {info['proj_tif']}")
+            print(f"   {info['mask2d_tif']}")
+            print(f"   {info['png_proj']}")
+            print(f"   {info['png_mask']}")
+            print(f"   {info['png_overlay']}")
+        elif args.mode == "vol2p5d":
+            info = process_one_vol2p5d(
+                str(p), str(out_mask3d), str(out_prev),
+                cy3_idx=args.cy3_idx,
+                cy3_hints=args.cy3_hint,
+                diameter=args.diameter,
+                cellprob_threshold=args.cellprob,
+                flow_threshold=args.flow,
+                gpu=not args.cpu,
+                pretrained_model= args.model,
+                bg_percentile=args.bgp,
+                # model_type=args.model 
+            )
+            if not model_info_printed:
+                print(f"[vol2p5d] Detected channels for {p.name}: {info['channel_names'] or '[none in OME XML]'}; using Cy3 idx = {info['cy3_idx']}")
+                model_info_printed = True
+            print(f"✓ {p.name} →")
+            print(f"   {info['mask3d_tif']}")
+            print(f"   {info['png_overlay']}")
+            print(f"   objects: {info['n_objects']}")
+        else:  # vol3d_cpu
+            info = process_one_vol3d_cpu(
+                str(p), str(out_mask3d), str(out_prev),
+                cy3_idx=args.cy3_idx,
+                cy3_hints=args.cy3_hint,
+                diameter=args.diameter,
+                cellprob_threshold=args.cellprob,
+                flow_threshold=args.flow,
+                gpu=False,
+                pretrained_model= args.model,
+                anisotropy=args.anisotropy
+            )
+            if not model_info_printed:
+                print(f"[vol3d_cpu] Detected channels for {p.name}: {info['channel_names'] or '[none in OME XML]'}; using Cy3 idx = {info['cy3_idx']}")
+                model_info_printed = True
+            print(f"✓ {p.name} →")
+            print(f"   {info['mask3d_tif']}")
+            print(f"   {info['png_overlay']}")
+            print(f"   objects: {info['n_objects']}")
+
+if __name__ == "__main__":
+    main()
