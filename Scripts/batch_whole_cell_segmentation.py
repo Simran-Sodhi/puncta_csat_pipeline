@@ -3,6 +3,7 @@ import os, argparse, numpy as np, tifffile as tiff, xml.etree.ElementTree as ET
 from pathlib import Path
 from cellpose import models, io
 from scipy import ndimage as ndi
+from skimage import filters, morphology, segmentation, measure
 
 # ---------- OME helpers ----------
 def read_ome(path):
@@ -96,6 +97,66 @@ def overlay_outlines_on_gray(gray, mask, edge_color=(255, 0, 0), alpha_fill=0.0)
     edges = mask_outlines(mask)
     rgb[edges] = np.array(edge_color, dtype=np.uint8)
     return rgb
+
+def segment_nuclei_binary(nuc_slice_u8, min_area=50):
+    """Simple per-slice nuclei mask: Otsu threshold + cleanup."""
+    if nuc_slice_u8.max() == 0:
+        return np.zeros_like(nuc_slice_u8, dtype=bool)
+    thr = filters.threshold_otsu(nuc_slice_u8)
+    m = nuc_slice_u8 > thr
+    m = morphology.remove_small_objects(m, min_size=min_area)
+    m = morphology.remove_small_holes(m, area_threshold=min_area)
+    return m
+
+def split_with_nuclei_on_slice(cyto_u8, mask_slice, nuc_u8):
+    """
+    Split fused cell masks on one Z-slice using nuclei as seeds.
+    - cyto_u8 : uint8 cytoplasm slice
+    - mask_slice : uint16 labels from Cellpose (Y,X)
+    - nuc_u8 : uint8 nuclei slice
+    Returns a new uint16 mask slice.
+    """
+    if mask_slice.max() == 0:
+        return mask_slice
+
+    # 1) nuclei → markers
+    nuc_bin = segment_nuclei_binary(nuc_u8)
+    markers = measure.label(nuc_bin)  # instance seeds
+
+    if markers.max() <= 1:
+        # not enough nuclei info; just return original
+        return mask_slice
+
+    # 2) boundary cue from cyto gradient
+    grad = filters.sobel(cyto_u8.astype(np.float32))
+
+    # 3) watershed per connected component of the original mask
+    out = np.zeros_like(mask_slice, dtype=np.uint16)
+    cur = 1
+    for lab in range(1, mask_slice.max() + 1):
+        region = (mask_slice == lab)
+        if not region.any():
+            continue
+        # restrict markers to this region
+        local_markers = markers * 0
+        # keep only nuclei that fall inside this region
+        inside = markers[region]
+        if inside.max() <= 1:
+            # nothing to split here
+            out[region] = cur
+            cur += 1
+            continue
+        # keep those marker ids
+        keep_ids = np.unique(inside)
+        keep_ids = keep_ids[keep_ids > 0]
+        lm = np.zeros_like(markers, dtype=np.int32)
+        for i, mid in enumerate(keep_ids, start=1):
+            lm[markers == mid] = i
+        ws = segmentation.watershed(grad, markers=lm, mask=region)
+        for sid in range(1, ws.max() + 1):
+            out[ws == sid] = cur
+            cur += 1
+    return out
 
 # ---------- light background subtraction for 2.5D ----------
 def percentile_bg_sub(zimg, p=2):
@@ -198,8 +259,10 @@ def process_one_vol2p5d(path, out_mask3d_dir, out_prev_dir,
                         cy3_idx=None, cy3_hints=('cy3','mscarlet','m-scarlet','568'),
                         cellprob_threshold=-3.0, flow_threshold=0.5,
                         diameter=80, gpu=True, bg_percentile=None,
-                        pretrained_model ="cyto2", min_size=1500,
-                        focus_halfwidth=4, batch_size=8):
+                        pretrained_model="cpsam", min_size=100,
+                        focus_halfwidth=4, batch_size=8,
+                        nuc_idx=None, nuc_hints=('cy5','h2b','dapi','hoechst','647','dna'),
+                        use_nuclei_post=False, nuc_min_area=50, debug_raw = True):
     # --- load ---
     arr, axes, meta = read_ome(path)
     ZCYX = to_ZCYX(arr, axes)                 # (Z,C,Y,X)
@@ -207,6 +270,17 @@ def process_one_vol2p5d(path, out_mask3d_dir, out_prev_dir,
     if cy3_idx is None:
         cy3_idx = pick_cy3_idx(ch_names, cy3_hints)
     cy3_stack = ZCYX[:, cy3_idx].astype(arr.dtype)  # (Z,Y,X)
+
+    nuc_stack = None
+    if use_nuclei_post:
+        if nuc_idx is None:
+            # pick by hints, default to "not cyto" if possible
+            all_names = [s.lower() for s in ch_names] if ch_names else []
+            fallback = 0
+            if cy3_idx == 0 and ZCYX.shape[1] > 1:
+                fallback = 1
+            nuc_idx = pick_cy3_idx(ch_names, nuc_hints) if ch_names else fallback
+        nuc_stack = ZCYX[:, nuc_idx].astype(arr.dtype)
 
     # optional very light background subtraction
     if bg_percentile is not None:
@@ -218,8 +292,20 @@ def process_one_vol2p5d(path, out_mask3d_dir, out_prev_dir,
     sub = cy3_stack[keep_z]
     sub_u8 = _clip_and_smooth(sub, lo=1, hi=99.5, sigma=1.0)  # uint8 stack
 
+    sub_nuc_u8 = None
+    if nuc_stack is not None:
+        sub_nuc = nuc_stack[keep_z]
+        sub_nuc_u8 = _clip_and_smooth(sub_nuc, lo=1, hi=99.5, sigma=1.0)
+
     # --- batch 2D eval (one call) ---
+    # print(pretrained_model)
     model = models.CellposeModel(gpu=gpu, pretrained_model=pretrained_model)
+    # print(model)
+    # print(model.net)
+    # total_params = sum(p.numel() for p in model.net.parameters())
+    # trainable_params = sum(p.numel() for p in model.net.parameters() if p.requires_grad)
+    # print("Total parameters:", total_params)
+    # print("Trainable parameters:", trainable_params)
     img_list = [sub_u8[i] for i in range(sub_u8.shape[0])]
     masks_list, flows, styles = model.eval(
         img_list,
@@ -234,6 +320,20 @@ def process_one_vol2p5d(path, out_mask3d_dir, out_prev_dir,
         # augment=False,         # faster
         # batch_size=batch_size  # fewer forward passes
     )
+    # raw_masks_stack = np.zeros_like(sub, dtype=np.uint16)
+    # for i in range(sub_u8.shape[0]):
+    #     raw_masks_stack[i] = masks_list[i].astype(np.uint16)
+
+            # --- OPTIONAL nuclei-seeded splitting (per slice) ---
+    if use_nuclei_post and sub_nuc_u8 is not None:
+        for i in range(sub_u8.shape[0]):
+            m = masks_list[i].astype(np.uint16)
+            # quick clean: zero tiny specks (same threshold you use in eval)
+            m = morphology.remove_small_objects(m > 0, min_size=min_size).astype(np.uint16) * 1
+            m = m.astype(np.uint16)
+            masks_list[i] = split_with_nuclei_on_slice(
+                sub_u8[i], m, sub_nuc_u8[i]
+            )
 
     # --- rebuild full-Z label volume (zeros outside focus band) ---
     Z, H, W = cy3_stack.shape
@@ -334,14 +434,24 @@ def main():
     ap.add_argument("--anisotropy", type=float, default=None,
                     help="Voxel z/y (or z/x) size ratio for vol3d_cpu (optional)")
     ap.add_argument("--model", default="cyto2",
-                choices=["cpsam","cyto2","cpcy","cpnc","cyto"],
+                # choices=["cpsam","cyto2","cpcy","cpnc","cyto"],
                 help="Cellpose pretrained model to use")
+    ap.add_argument("--nuc_idx", type=int, default=None, help="Nuclei channel index for post-splitting")
+    ap.add_argument("--nuc_hint", nargs="*", default=["cy5","h2b","dapi","hoechst","647","dna","nucleus","nuclei"],
+                help="Name hints for nuclei channel (used if --nuc_idx not given)")
+    ap.add_argument("--use_nuclei_post", action="store_true",
+                help="Use nuclei-seeded watershed to split fused cells in vol2p5d")
+    ap.add_argument("--nuc_min_area", type=int, default=50, help="Min nucleus area (pixels) for post-splitting")
+
     args = ap.parse_args()
 
     in_dir = Path(args.in_dir)
     out_root = Path(args.out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
 
+    print(f"Using model: {args.model}  "
+      f"({'found' if Path(args.model).exists() else 'builtin name'})")
+    
     # create subfolders based on mode
     out_prev = out_root / "previews"; out_prev.mkdir(parents=True, exist_ok=True)
     if args.mode == "mip2d":
@@ -386,10 +496,14 @@ def main():
                 cellprob_threshold=args.cellprob,
                 flow_threshold=args.flow,
                 gpu=not args.cpu,
-                pretrained_model= args.model,
+                pretrained_model=args.model,
                 bg_percentile=args.bgp,
-                # model_type=args.model 
+                nuc_idx=args.nuc_idx,
+                nuc_hints=args.nuc_hint,
+                use_nuclei_post=args.use_nuclei_post,
+                nuc_min_area=args.nuc_min_area
             )
+
             if not model_info_printed:
                 print(f"[vol2p5d] Detected channels for {p.name}: {info['channel_names'] or '[none in OME XML]'}; using Cy3 idx = {info['cy3_idx']}")
                 model_info_printed = True
