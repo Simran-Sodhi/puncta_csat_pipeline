@@ -1,70 +1,70 @@
-# train_cellpose.py
+# train_cellpose_cyto_only.py
 from pathlib import Path
-import tifffile as tiff
 import numpy as np
-from cellpose import models
-from cellpose import train
+import tifffile as tiff
+from cellpose import models, train
 
-# Folder with paired files:   <name>.ome.tif   and   <name>_masks.tif
-DATA = Path("../Ome_tifs_2D_cleaned")
+DATA = Path("Ome_tifs_2D_cleaned_new")
+CHAN  = 1   # cytoplasm index in your OME files
 
-# Pick your channels (edit to match your data)
-# Example: cytoplasm = green channel index 1 ; nuclei = red channel index 0
-CHAN  = 1   # cytoplasm channel
-CHAN2 = 0   # optional nuclear channel (0 to disable, else integer index)
-
-# Collect training pairs
-X_list, Y_list, CH_list = [], [], []
+X_list, Y_list = [], []
 for img in sorted(DATA.glob("*.ome.tif")):
-    base = img.name.replace('.ome.tif', '')
+    base = img.name.replace(".ome.tif", "")
     msk = img.with_name(base + "_masks.tif")
     if not msk.exists():
         continue
-    X = tiff.imread(img)   # shape could be (C,Y,X) or (Y,X,C); we’ll normalize
-    X = np.asarray(X)
-    # Normalize to CYX for cellpose (channels-first)
-    if X.ndim == 3 and X.shape[-1] in (2,3,4):  # YXC -> CYX
-        X = np.moveaxis(X, -1, 0)
-    elif X.ndim == 2:                            # single-channel image
-        X = X[None, ...]
-    assert X.ndim == 3 and X.shape[0] >= max(CHAN, CHAN2, 0)
 
-    Y = tiff.imread(msk).astype(np.int32)        # labels image (H,W)
-    X_list.append(X)
+    X = tiff.imread(img)            # (C,Y,X) or (Y,X,C) or (Y,X)
+    X = np.asarray(X)
+
+    # normalize to (C,Y,X)
+    if X.ndim == 3 and X.shape[-1] in (2,3,4):   # YXC -> CYX
+        X = np.moveaxis(X, -1, 0)
+    elif X.ndim == 2:                             # YX
+        X = X[None, ...]
+    assert X.ndim == 3 and CHAN < X.shape[0], f"Bad shape {X.shape} for {img}"
+
+    # ---- take ONLY cytoplasm channel -> grayscale (Y,X)
+    X_gray = X[CHAN].astype(np.float32)
+
+    Y = tiff.imread(msk).astype(np.int32)        # (Y,X) integer labels
+    X_list.append(X_gray)
     Y_list.append(Y)
-    CH_list.append([CHAN, CHAN2])                # one [chan,chan2] per image
 
 print(f"Found {len(X_list)} training pairs")
 
-# Create model: start from cyto2
-model = models.CellposeModel(pretrained_model='cyto2', gpu=True)
+# start from cyto2
+model = models.CellposeModel(pretrained_model='cyto', gpu=True)
 
-# Train
-save_dir = Path("cellpose_models/my_cyto2_finetune")
-save_dir.mkdir(parents=True, exist_ok=True)
+# save_dir = Path("cellpose_models/my_cyto2_finetune")
+# save_dir.mkdir(parents=True, exist_ok=True)
 
-train.train_seg(
-    net=model.net,
-    train_data=X_list,
-    train_labels=Y_list, 
-    # channels=CH_list,                  # list of [chan, chan2]
-    channel_axis=0, 
-    n_epochs=30,
-    learning_rate=0.2,
-    batch_size=8,
-    min_train_masks=1,
-    save_path=str(save_dir)
-)
-# model.train(
-#     train_data=X_list,                 # list of arrays (C,Y,X)
-#     train_labels=Y_list,               # list of label images (Y,X)
-#     channels=CH_list,                  # list of [chan, chan2]
-#     channel_axis=0,                    # channels-first
-#     # Common knobs (tune as you like)
-#     n_epochs=100,
+# train.train_seg(
+#     net=model.net,
+#     train_data=X_list,         # list of (Y,X) arrays
+#     train_labels=Y_list,
+#     channel_axis=None,         # grayscale
+#     n_epochs=30,
 #     learning_rate=0.2,
 #     batch_size=8,
 #     min_train_masks=1,
-#     save_path=str(save_dir)
+#     save_path=str(save_dir),
 # )
-print("Training complete. Model saved in:", save_dir)
+model_path = train.train_seg(
+    net=model.net,
+    train_data=X_list,         # list of (Y,X) arrays
+    train_labels=Y_list,
+    # channel_axis=None,         # grayscale
+    n_epochs=35,
+    # batch_size=8,
+    # min_train_masks=1,
+    # save_path=str(save_dir),
+    weight_decay=0.1, 
+    load_files=False,
+    learning_rate=1e-5,
+    min_train_masks=1,
+    model_name="my_new_model_7"
+)
+
+
+print("Training complete:", model_path)
