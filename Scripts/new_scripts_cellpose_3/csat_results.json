@@ -1,0 +1,30 @@
+{
+  "n_cells_total": 664,
+  "n_cells_used": 591,
+  "label_counts_used": {
+    "0": 162,
+    "1": 429
+  },
+  "intensity_column": "intensity_for_cs",
+  "puncta_column": "has_puncta",
+  "filters": {
+    "max_sat_frac": 0.02,
+    "min_cyto_pixels": 50,
+    "min_intensity": null,
+    "max_intensity": null
+  },
+  "logistic_fit": {
+    "b0_intercept": 0.10547161403861637,
+    "b1_coef": 0.003027462655067914,
+    "csat_point_estimate": -34.83828738962607
+  },
+  "bootstrap": {
+    "n_effective_samples": 1000,
+    "csat_median": -28.456514329401337,
+    "csat_ci_95": [
+      -228.25873647976184,
+      57.792302780703714
+    ]
+  },
+  "youden_threshold": 122.5203628540039
+}

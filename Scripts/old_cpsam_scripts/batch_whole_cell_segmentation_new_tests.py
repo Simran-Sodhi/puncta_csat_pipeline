@@ -4,6 +4,8 @@ from pathlib import Path
 from cellpose import models, io
 from scipy import ndimage as ndi
 from skimage import filters, morphology, segmentation, measure
+from skimage.measure import regionprops
+from skimage.segmentation import relabel_sequential
 
 # ---------- OME helpers ----------
 def read_ome(path):
@@ -32,15 +34,26 @@ def to_ZCYX(arr, axes):
     out = np.moveaxis(arr, order, (0, 1, 2, 3))
     return out
 
+# def channel_names_from_ome(meta_xml):
+#     names = []
+#     if not meta_xml:
+#         return names
+#     root = ET.fromstring(meta_xml)
+#     ns = {'ome': 'http://www.openmicroscopy.org/Schemas/OME/2016-06'}
+#     for ch in root.findall('.//ome:Image/ome:Pixels/ome:Channel', ns):
+#         nm = ch.get('Name') or ch.get('ID') or ''
+#         names.append(nm)
+#     return names
+
 def channel_names_from_ome(meta_xml):
-    names = []
-    if not meta_xml:
-        return names
+    if not meta_xml: return []
     root = ET.fromstring(meta_xml)
-    ns = {'ome': 'http://www.openmicroscopy.org/Schemas/OME/2016-06'}
-    for ch in root.findall('.//ome:Image/ome:Pixels/ome:Channel', ns):
-        nm = ch.get('Name') or ch.get('ID') or ''
-        names.append(nm)
+    # find the OME ns dynamically
+    ns = root.tag.split('}')[0].strip('{')
+    NS = {'ome': ns}  # e.g., http://www.openmicroscopy.org/Schemas/OME/2016-06
+    names = []
+    for ch in root.findall('.//ome:Image/ome:Pixels/ome:Channel', NS):
+        names.append(ch.get('Name') or ch.get('ID') or '')
     return names
 
 def pick_cy3_idx(ch_names, hints):
@@ -55,6 +68,14 @@ def pick_cy3_idx(ch_names, hints):
                 return i
     return 0  # fallback
 
+def remove_small_instances(lbl, min_size):
+    keep = np.zeros_like(lbl, dtype=bool)
+    for r in regionprops(lbl):
+        if r.area >= min_size:
+            keep |= (lbl == r.label)
+    lbl = lbl * keep
+    lbl, _, _ = relabel_sequential(lbl)  # compact labels
+    return lbl
 # ---------- simple viz helpers ----------
 def percentile_norm(img2d, p1=1, p99=99):
     lo, hi = np.percentile(img2d, (p1, p99))
@@ -104,8 +125,10 @@ def segment_nuclei_binary(nuc_slice_u8, min_area=50):
         return np.zeros_like(nuc_slice_u8, dtype=bool)
     thr = filters.threshold_otsu(nuc_slice_u8)
     m = nuc_slice_u8 > thr
-    m = morphology.remove_small_objects(m, min_size=min_area)
-    m = morphology.remove_small_holes(m, area_threshold=min_area)
+    m = remove_small_instances(m.astype(np.int32), min_area).astype(np.uint16)
+    m = morphology.remove_small_holes(m > 0, area_threshold=min_area)
+    m = (m > 0) 
+    # m = morphology.remove_small_holes(m, area_threshold=min_area)
     return m
 
 def split_with_nuclei_on_slice(cyto_u8, mask_slice, nuc_u8):
@@ -157,6 +180,321 @@ def split_with_nuclei_on_slice(cyto_u8, mask_slice, nuc_u8):
             out[ws == sid] = cur
             cur += 1
     return out
+
+
+# def _link_by_overlap(masks_list, min_pix_overlap=40, min_frac_overlap=0.05):
+#     """
+#     Link instance labels across consecutive slices by overlap, producing a 3D label volume.
+#     - masks_list: list of 2D label arrays for kept Z slices (length K)
+#     - min_pix_overlap: minimum pixel overlap to consider a match
+#     - min_frac_overlap: min fraction of the smaller object that must overlap
+#     Returns: vol_labels (K,H,W) with consistent instance IDs through Z
+#     """
+#     K, H, W = len(masks_list), masks_list[0].shape[0], masks_list[0].shape[1]
+#     vol = np.zeros((K, H, W), dtype=np.int32)
+#     next_id = 1
+
+#     # map current slice label -> global id
+#     prev_map = {}
+
+#     for k in range(K):
+#         lab = masks_list[k].astype(np.int32)
+#         cur_map = {}
+
+#         if k == 0:
+#             # assign fresh IDs
+#             for l in range(1, lab.max()+1):
+#                 cur_map[l] = next_id; next_id += 1
+#         else:
+#             prev = masks_list[k-1].astype(np.int32)
+
+#             # fast contingency table via hashing pairs
+#             offset = (lab.max()+1)
+#             pairs = prev.reshape(-1).astype(np.int64) * offset + lab.reshape(-1).astype(np.int64)
+#             # ignore background (0)
+#             valid = (prev.reshape(-1) > 0) & (lab.reshape(-1) > 0)
+#             pairs = pairs[valid]
+#             if pairs.size:
+#                 uniq, counts = np.unique(pairs, return_counts=True)
+#                 # decode pairs back to (p, c)
+#                 p_lbl = (uniq // offset).astype(np.int32)
+#                 c_lbl = (uniq %  offset).astype(np.int32)
+
+#                 # compute areas per object
+#                 prev_area = np.bincount(prev.reshape(-1), minlength=prev.max()+1)
+#                 cur_area  = np.bincount(lab.reshape(-1),  minlength=lab.max()+1)
+
+#                 # for each current label, find best previous match by overlap
+#                 best_prev = {}  # cur -> (prev, overlap)
+#                 for (p, c, ov) in zip(p_lbl, c_lbl, counts):
+#                     if ov < min_pix_overlap: 
+#                         continue
+#                     small = min(prev_area[p], cur_area[c])
+#                     if small == 0 or (ov / small) < min_frac_overlap:
+#                         continue
+#                     if (c not in best_prev) or (ov > best_prev[c][1]):
+#                         best_prev[c] = (p, ov)
+
+#                 # resolve: assign current to previous global id when unique,
+#                 # otherwise allocate a fresh id (prevents merges of two prev → one cur)
+#                 used_prev = set()
+#                 for c in range(1, lab.max()+1):
+#                     if c in best_prev:
+#                         p = best_prev[c][0]
+#                         if p not in used_prev:
+#                             cur_map[c] = prev_map.get(p, None)
+#                             used_prev.add(p)
+#                     if c not in cur_map:
+#                         cur_map[c] = next_id; next_id += 1
+#             else:
+#                 # no overlaps found; assign fresh IDs
+#                 for l in range(1, lab.max()+1):
+#                     cur_map[l] = next_id; next_id += 1
+
+#         # write vol with global ids for slice k
+#         out = np.zeros_like(lab, dtype=np.int32)
+#         for l, gid in cur_map.items():
+#             if gid is None:
+#                 gid = next_id; next_id += 1
+#             out[lab == l] = gid
+#         vol[k] = out
+#         prev_map = {l: cur_map[l] for l in cur_map}
+
+#     return vol.astype(np.int32)
+
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+from skimage.measure import regionprops
+
+def _props_from_labels(lbl):
+    # returns {id: (area, cy, cx, bbox)} for nonzero labels
+    out = {}
+    for r in regionprops(lbl):
+        out[r.label] = (r.area, r.centroid[0], r.centroid[1], r.bbox)  # (minr, minc, maxr, maxc)
+    return out
+
+def _iou_approx(lblA, lblB, idsA, idsB):
+    """
+    Fast IoU via pair contingency counts between two label images.
+    Returns dict of ((a,b) -> iou, overlap_pixels).
+    """
+    maxA = lblA.max()
+    maxB = lblB.max()
+    base = maxB + 1
+    a = lblA.reshape(-1).astype(np.int64)
+    b = lblB.reshape(-1).astype(np.int64)
+    valid = (a > 0) & (b > 0)
+    if not valid.any():
+        return {}
+    pairs = a[valid] * base + b[valid]
+    uniq, counts = np.unique(pairs, return_counts=True)
+    res = {}
+    # areas:
+    areaA = np.bincount(a, minlength=maxA + 1)
+    areaB = np.bincount(b, minlength=maxB + 1)
+    for u, ov in zip(uniq, counts):
+        aa = int(u // base)
+        bb = int(u % base)
+        if aa in idsA and bb in idsB:
+            inter = ov
+            union = areaA[aa] + areaB[bb] - inter
+            res[(aa, bb)] = (inter / union if union > 0 else 0.0, inter)
+    return res
+
+def link_with_gaps(masks_list, max_gap=2,        # allow up to this many missing z-slices
+                   min_iou=0.1, max_dist=40.0,   # hard gates
+                   alpha=0.7,                    # weight for IoU vs distance in cost
+                   sigma_xy=20.0,                # px; distance scale
+                   z_spacing=1.0, yx_spacing=1.0 # for anisotropy-aware dist
+                   ):
+    """
+    Link per-slice instance labels into a 3D label volume with:
+    - gap closing up to 'max_gap'
+    - Hungarian assignment using a blended IoU + centroid distance cost
+    - split/merge handling with lineage
+    Returns:
+        vol (K,H,W) uint32   : global-track labels through z
+        lineage (list[dict]) : [{id, parent_ids, start_z, end_z, slices}]
+    """
+    K, H, W = len(masks_list), masks_list[0].shape[0], masks_list[0].shape[1]
+    vol = np.zeros((K, H, W), dtype=np.uint32)
+
+    # Active tracks: id -> dict(last_z, last_label_id, last_centroid, last_slice_label_img_ref, missed)
+    next_id = 1
+    active = {}
+    lineage = {}  # id -> dict(parent_ids, start_z, end_z, slices=list of (z, local_label_id))
+
+    # store precomputed props
+    props = [ _props_from_labels(m) for m in masks_list ]
+
+    def end_track(tid, z):
+        if tid in active:
+            lineage[tid]["end_z"] = z
+            active.pop(tid, None)
+
+    def start_track(z, local_id, centroid, parents=None):
+        nonlocal next_id
+        tid = next_id; next_id += 1
+        active[tid] = {
+            "last_z": z,
+            "last_local": local_id,
+            "last_centroid": centroid,
+            "missed": 0
+        }
+        lineage[tid] = {
+            "id": tid,
+            "parent_ids": [] if parents is None else parents,
+            "start_z": z,
+            "end_z": z,
+            "slices": [(z, local_id)]
+        }
+        return tid
+
+    # initialize at z=0
+    z = 0
+    lbl = masks_list[z]
+    for lid, (area, cy, cx, _) in props[z].items():
+        tid = start_track(z, lid, (cy, cx))
+        vol[z][lbl == lid] = tid
+
+    # helper: compute pair cost between previous set (track tips) and current labels
+    def build_cost(prev_ids, cur_ids, prev_z, cur_z):
+        cur_lbl = masks_list[cur_z]
+        prev_lbl = masks_list[prev_z]
+        # fast IoU where possible (only for prev_z == cur_z-1); for larger Δz IoU is less meaningful
+        iou_map = _iou_approx(prev_lbl, cur_lbl, set([active[tid]["last_local"] for tid in prev_ids]), set(cur_ids)) \
+                  if (cur_z - prev_z) == 1 else {}
+        # assemble cost matrix
+        P, C = len(prev_ids), len(cur_ids)
+        cost = np.full((P, C), fill_value=1e3, dtype=np.float32)
+        for i, tid in enumerate(prev_ids):
+            pa, pcy, pcx, _ = props[prev_z][active[tid]["last_local"]]
+            for j, cid in enumerate(cur_ids):
+                ca, ccy, ccx, _ = props[cur_z][cid]
+                # centroid distance (anisotropy-aware in z handled by look-ahead; here only XY)
+                d = np.hypot((pcy - ccy) * (yx_spacing / yx_spacing),
+                             (pcx - ccx) * (yx_spacing / yx_spacing))
+                if d > max_dist:
+                    continue
+                iou = iou_map.get((active[tid]["last_local"], cid), (0.0, 0))[0]
+                if (cur_z - prev_z) == 1 and iou < min_iou and d > max_dist * 0.5:
+                    # if consecutive slice: require at least tiny IoU or be quite close
+                    continue
+                # blended score -> cost
+                # score in [0,1+] where higher is better
+                score = alpha * iou + (1 - alpha) * np.exp(-(d ** 2) / (2 * sigma_xy ** 2))
+                cost[i, j] = 1.0 - score
+        return cost
+
+    # iterate z>0
+    for z in range(1, K):
+        cur_lbl = masks_list[z]
+        cur_ids = list(props[z].keys())
+        if not cur_ids:
+            # nothing here; just age active tracks
+            for tid in list(active.keys()):
+                active[tid]["missed"] += 1
+                lineage[tid]["end_z"] = z
+                if active[tid]["missed"] > max_gap:
+                    end_track(tid, z)
+            continue
+
+        # try to assign current labels to *some* previous slice within the lookback window
+        assigned_cur = set()
+        claimed_prev = set()  # tracks that already matched (to detect merges)
+        matches = []          # (tid, cid)
+
+        # look back Δz = 1..max_gap+1 (try closest first)
+        for back in range(1, max_gap + 2):
+            prev_z = z - back
+            if prev_z < 0:
+                break
+            # candidate previous tracks that are still 'active' and last seen at prev_z
+            prev_ids = [tid for tid, st in active.items() if st["last_z"] == prev_z and st["missed"] == back - 1]
+            if not prev_ids:
+                continue
+            # cost between those prev tips and unassigned current cids
+            cur_pool = [cid for cid in cur_ids if cid not in assigned_cur]
+            if not cur_pool:
+                break
+            C = build_cost(prev_ids, cur_pool, prev_z, z)
+            if np.all(C >= 1e2):
+                continue
+            r, c = linear_sum_assignment(C)
+            for i, j in zip(r, c):
+                if C[i, j] >= 1.0:  # too costly (no good match)
+                    continue
+                tid = prev_ids[i]
+                cid = cur_pool[j]
+                matches.append((tid, cid))
+                assigned_cur.add(cid)
+                claimed_prev.add(tid)
+
+        # detect merges (multiple tids -> same cid) and splits (one tid -> multiple cids)
+        from collections import defaultdict
+        by_cur = defaultdict(list)
+        by_prev = defaultdict(list)
+        for tid, cid in matches:
+            by_cur[cid].append(tid)
+            by_prev[tid].append(cid)
+
+        # APPLY matches to build volume & update tracks
+        # 1) merges: multiple parents -> one current mask => end parents, start new child with parent_ids
+        handled_tids = set()
+        for cid, tids in by_cur.items():
+            if len(tids) >= 2:
+                # terminate all parents
+                for tid in tids:
+                    handled_tids.add(tid)
+                    lineage[tid]["end_z"] = z
+                    active.pop(tid, None)
+                # create a new track with those parents
+                ca, ccy, ccx, _ = props[z][cid]
+                child = start_track(z, cid, (ccy, ccx), parents=tids)
+                vol[z][cur_lbl == cid] = child
+        # 2) simple one-to-one matches
+        for tid, cids in by_prev.items():
+            if len(cids) == 1 and tid not in handled_tids:
+                cid = cids[0]
+                # continue the same track
+                ccy, ccx = props[z][cid][1], props[z][cid][2]
+                active[tid]["last_z"] = z
+                active[tid]["last_local"] = cid
+                active[tid]["last_centroid"] = (ccy, ccx)
+                active[tid]["missed"] = 0
+                lineage[tid]["slices"].append((z, cid))
+                lineage[tid]["end_z"] = z
+                vol[z][cur_lbl == cid] = tid
+
+        # 3) splits: one parent -> many children (remaining cids assigned from same tid)
+        for tid, cids in by_prev.items():
+            if len(cids) >= 2 and tid not in handled_tids:
+                # parent ends, children start with parent_id = tid
+                lineage[tid]["end_z"] = z
+                active.pop(tid, None)
+                for cid in cids:
+                    ca, ccy, ccx, _ = props[z][cid]
+                    child = start_track(z, cid, (ccy, ccx), parents=[tid])
+                    vol[z][cur_lbl == cid] = child
+
+        # 4) new objects (unassigned current)
+        new_cids = [cid for cid in cur_ids if cid not in by_cur]
+        for cid in new_cids:
+            ca, ccy, ccx, _ = props[z][cid]
+            tid = start_track(z, cid, (ccy, ccx))
+            vol[z][cur_lbl == cid] = tid
+
+        # 5) age unmatched active tracks
+        for tid in list(active.keys()):
+            if active[tid]["last_z"] < z:
+                active[tid]["missed"] += 1
+                lineage[tid]["end_z"] = z
+                if active[tid]["missed"] > max_gap:
+                    end_track(tid, z)
+
+    # compact to uint32 IDs already stable; build lineage list
+    lin = [dict(v) for v in lineage.values()]
+    return vol.astype(np.uint32), lin
 
 # ---------- light background subtraction for 2.5D ----------
 def percentile_bg_sub(zimg, p=2):
@@ -329,7 +667,8 @@ def process_one_vol2p5d(path, out_mask3d_dir, out_prev_dir,
         for i in range(sub_u8.shape[0]):
             m = masks_list[i].astype(np.uint16)
             # quick clean: zero tiny specks (same threshold you use in eval)
-            m = morphology.remove_small_objects(m > 0, min_size=min_size).astype(np.uint16) * 1
+            # m = morphology.remove_small_objects(m > 0, min_size=min_size).astype(np.uint16) * 1
+            m = remove_small_instances(m.astype(np.int32), min_size).astype(np.uint16)
             m = m.astype(np.uint16)
             masks_list[i] = split_with_nuclei_on_slice(
                 sub_u8[i], m, sub_nuc_u8[i]
@@ -340,12 +679,36 @@ def process_one_vol2p5d(path, out_mask3d_dir, out_prev_dir,
     masks_slices = np.zeros((Z, H, W), dtype=np.uint16)
     for i, z in enumerate(keep_z):
         masks_slices[z] = masks_list[i].astype(np.uint16)
+    
+    # --- 3D linking: replace ndi.label with overlap-tracking ---
+    # sub_tracks = link_with_gaps([masks_slices[z] for z in keep_z])
+                                
+    #                             # ,
+    #                             #   min_pix_overlap=40, min_frac_overlap=0.80)
+    
+    # # place back into full Z
+    # track_vol = np.zeros_like(masks_slices, dtype=np.int32)
+    # for i, z in enumerate(keep_z):
+    #     track_vol[z] = sub_tracks[i]
+    tracks_vol, lineage = link_with_gaps([masks_slices[z] for z in keep_z])
+    # place back into full Z
+    track_vol = np.zeros_like(masks_slices, dtype=np.int32)
+    for i, z in enumerate(keep_z):
+        track_vol[z] = tracks_vol[i]
+    
+    # compact to consecutive uint16 IDs
+    uids = np.unique(track_vol)
+    uids = uids[uids > 0]
+    lut = np.zeros(int(uids.max())+1, dtype=np.uint16)
+    lut[uids] = np.arange(1, len(uids)+1, dtype=np.uint16)
+    mask3d = lut[track_vol]
 
-    # --- 3D linking (6-connectivity) ---
-    fg_3d = masks_slices > 0
-    structure = ndi.generate_binary_structure(3, 1)
-    mask3d, _ = ndi.label(fg_3d, structure=structure)
-    mask3d = mask3d.astype(np.uint16)
+
+    # # --- 3D linking (6-connectivity) ---
+    # fg_3d = masks_slices > 0
+    # structure = ndi.generate_binary_structure(3, 1)
+    # mask3d, _ = ndi.label(fg_3d, structure=structure)
+    # mask3d = mask3d.astype(np.uint16)
 
     # --- save preview + mask ---
     stem = Path(path).stem.replace('.ome','')
