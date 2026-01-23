@@ -1,4 +1,4 @@
-# image_analysis_puncta
+# puncta_csat_pipeline
 
 Segmentation and analysis of nuclear puncta to study phase separation–associated proteins from fluorescence microscopy images.
 
