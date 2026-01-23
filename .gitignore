@@ -1,0 +1,28 @@
+# --------------------
+# OS / Editor junk
+# --------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# --------------------
+# Jupyter notebooks
+# --------------------
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+*.nbconvert.ipynb
+
+# --------------------
+# Data & Models directories
+# --------------------
+Data/
+data/
+**/Data/
+**/data/
+
+Models/
+models/
+**/Models/
+**/models/
