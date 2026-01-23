@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-run_cellpose_cyto3.py
+evaluate_nucleus.py
 
 Run Cellpose (cyto3 model) on OME-TIF or TIF/TIFF images to generate masks.
 
@@ -16,12 +16,12 @@ Assumptions:
 - Images can be:
     * OME-TIFF with axes like "TCZYX", "CZYX", "CYX", etc.
     * Regular TIFF with shapes like (Y, X), (Z, Y, X), (Y, X, C), or (C, Y, X).
-- Cytoplasm channel is channel index = 1 (second channel).
+- Nucleus channel is channel index = 2 (third channel).
 - If multiple Z planes exist, we use Z = 0.
 
 Usage examples:
-    python run_cellpose_cyto3.py /path/to/image.ome.tif --outdir masks
-    python run_cellpose_cyto3.py /path/to/folder --outdir masks --gpu
+    python evaluate_nucleus.py --input /path/to/image.ome.tif --outdir masks --gpu --diameter 200
+    python evaluate_nucleus.py --input /path/to/folder --outdir masks --gpu --diameter 200
 """
 
 import os
@@ -37,19 +37,18 @@ from skimage.segmentation import relabel_sequential
 from cellpose import models
 
 
-
 # ----------------- image loading helpers ----------------- #
 
 def load_cyto_plane(path, channel_index=0, z_index=0):
     """
-    Load a single 2D cytoplasm image from an OME-TIFF or regular TIFF.
+    Load a single 2D nucleus image from an OME-TIFF or regular TIFF.
 
     Parameters
     ----------
     path : str or Path
         Path to the image file.
     channel_index : int
-        Index of the cytoplasm channel (0-based).
+        Index of the nucleus channel (0-based).
     z_index : int
         Index of the z-plane to use if multiple Z planes exist.
 
@@ -76,7 +75,7 @@ def load_cyto_plane(path, channel_index=0, z_index=0):
             t_idx = axes.index("T")
             sl[t_idx] = 0
 
-        # Channel: use requested cytoplasm channel
+        # Channel: use requested nucleus channel
         if "C" in axes:
             c_idx = axes.index("C")
             if channel_index >= data.shape[c_idx]:
@@ -316,7 +315,7 @@ def save_mask(mask, out_path):
 def save_triptych(img_norm, masks, out_path):
     """
     Save a triptych image with:
-        [left]   normalized cytoplasm image (grayscale)
+        [left]   normalized nucleus image (grayscale)
         [middle] mask labels (color)
         [right]  overlay of masks on image
 

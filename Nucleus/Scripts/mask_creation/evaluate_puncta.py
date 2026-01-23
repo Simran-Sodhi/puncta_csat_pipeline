@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-run_cellpose_cyto3.py
+evaluate_puncta.py
 
 Run Cellpose (cyto3 model) on OME-TIF or TIF/TIFF images to generate masks.
 
-New features:
 - Automatic LUT-style thresholding/normalization before running Cellpose
   (percentile-based contrast stretch, similar to ImageJ "Auto" LUT behavior).
 - For each image, save:
@@ -16,12 +15,13 @@ Assumptions:
 - Images can be:
     * OME-TIFF with axes like "TCZYX", "CZYX", "CYX", etc.
     * Regular TIFF with shapes like (Y, X), (Z, Y, X), (Y, X, C), or (C, Y, X).
-- Cytoplasm channel is channel index = 1 (second channel).
-- If multiple Z planes exist, we use Z = 0.
+- Puncta channel is channel index = 1 (second channel).
+- If multiple Z planes exist, we use Z = 8.
 
 Usage examples:
-    python run_cellpose_cyto3.py /path/to/image.ome.tif --outdir masks
-    python run_cellpose_cyto3.py /path/to/folder --outdir masks --gpu
+    python evaluate_puncta.py --input /path/to/image.ome.tif --outdir masks --gpu --diameter 20
+    python evaluate_puncta.py --input /path/to/folder --outdir masks --gpu --diameter 20
+
 """
 
 import os
@@ -40,14 +40,14 @@ from cellpose import models
 
 def load_cyto_plane(path, channel_index=2, z_index=0):
     """
-    Load a single 2D cytoplasm image from an OME-TIFF or regular TIFF.
+    Load a single 2D puncta image from an OME-TIFF or regular TIFF.
 
     Parameters
     ----------
     path : str or Path
         Path to the image file.
     channel_index : int
-        Index of the cytoplasm channel (0-based).
+        Index of the puncta channel (0-based).
     z_index : int
         Index of the z-plane to use if multiple Z planes exist.
 
@@ -74,7 +74,7 @@ def load_cyto_plane(path, channel_index=2, z_index=0):
             t_idx = axes.index("T")
             sl[t_idx] = 0
 
-        # Channel: use requested cytoplasm channel
+        # Channel: use requested puncta channel
         if "C" in axes:
             c_idx = axes.index("C")
             if channel_index >= data.shape[c_idx]:
@@ -263,7 +263,7 @@ def save_mask(mask, out_path):
 def save_triptych(img_norm, masks, out_path):
     """
     Save a triptych image with:
-        [left]   normalized cytoplasm image (grayscale)
+        [left]   normalized puncta image (grayscale)
         [middle] mask labels (color)
         [right]  overlay of masks on image
 
@@ -351,7 +351,7 @@ def main():
         "--diameter",
         type=float,
         default=None,
-        help="Approximate cell diameter; if omitted, Cellpose will estimate",
+        help="Approximate puncta diameter; if omitted, Cellpose will estimate",
     )
     parser.add_argument(
         "--batch-size",
@@ -363,13 +363,13 @@ def main():
         "--channel-index",
         type=int,
         default=1,
-        help="Nucleus channel index in the input image (default: 0 = first channel)",
+        help="Puncta channel index in the input image (default: 1 = second channel)",
     )
     parser.add_argument(
         "--z-index",
         type=int,
-        default=5,
-        help="Z-plane index to use when multiple Z planes exist (default: 0)",
+        default=8,
+        help="Z-plane index to use when multiple Z planes exist (default: 8)",
     )
     parser.add_argument(
         "--lut-low",
