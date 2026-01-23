@@ -1,3 +1,7 @@
+"""
+nd2_to_ome_tif.py: This file converts the nd2 file to ome tif files for z = 8 (in this case) and creates such a file for each position/scene
+"""
+
 from aicsimageio import AICSImage
 import tifffile, numpy as np, pathlib, time
 
@@ -5,17 +9,15 @@ import tifffile, numpy as np, pathlib, time
 # INPUT / OUTPUT FOLDERS
 # -------------------------
 
+# Path to nd2 file
 raw_path = pathlib.Path(
     "/Users/simransodhi/Desktop/CMU/Fall 2025/RA Work/image_analysis/Nucleus_Puncta/Raw_Data/2025.11.21_HeLa P9_p936 1ug p893 1ug_Nucleus/2025.11.21_HeLa P9_p936 1ug p893 1ug_Nucleus_001.nd2"
 )
 
-# "/Users/simransodhi/Desktop/CMU/Fall 2025/RA Work/image_analysis/Nucleus_Puncta/Raw_Data/2025.11.21_HeLa P9_p936 1ug p893 1ug_Nucleus_001.nd2"
-
-
 print("Raw path exists:", raw_path.exists())
 print("Raw path:", raw_path)
 
-inp = pathlib.Path("../../Raw_Data/2025.11.21_HeLa P9_p936 1ug p893 1ug_Nucleus/2025.11.21_HeLa P9_p936 1ug p893 1ug_Nucleus_001.nd2")
+inp = pathlib.Path(raw_path)
 out_dir_2d  = pathlib.Path("../../Processed_Data/21_nov_data/Ome_tifs_2D_z8")   # one CYX file per Z plane
 out_dir_2d.mkdir(parents=True, exist_ok=True)
 
