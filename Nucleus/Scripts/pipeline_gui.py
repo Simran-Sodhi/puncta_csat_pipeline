@@ -23,8 +23,52 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
-# Ensure the Scripts directory is on the path for imports
-SCRIPT_DIR = Path(__file__).resolve().parent
+# ------------------------------------------------------------------ #
+#  Locate the Scripts directory (where segmentation_utils.py lives)
+# ------------------------------------------------------------------ #
+# Works when pipeline_gui.py lives inside Nucleus/Scripts/ OR when
+# it has been copied elsewhere.  In the latter case, the user is
+# prompted to select the Scripts folder on first launch.
+
+def _find_scripts_dir():
+    """Return the path to Nucleus/Scripts, or None if not found."""
+    candidate = Path(__file__).resolve().parent
+    if (candidate / "segmentation_utils.py").exists():
+        return candidate
+    # Try one level up (e.g. user put gui in the repo root)
+    for p in [candidate.parent, candidate.parent / "Nucleus" / "Scripts"]:
+        if (p / "segmentation_utils.py").exists():
+            return p
+    return None
+
+SCRIPT_DIR = _find_scripts_dir()
+
+def _ensure_scripts_dir():
+    """Make sure SCRIPT_DIR is set; prompt interactively if needed."""
+    global SCRIPT_DIR
+    if SCRIPT_DIR is not None:
+        return SCRIPT_DIR
+    # Ask the user via a simple dialog before the main window opens
+    import tkinter as _tk
+    from tkinter import filedialog as _fd, messagebox as _mb
+    _root = _tk.Tk()
+    _root.withdraw()
+    _mb.showinfo(
+        "Scripts folder required",
+        "pipeline_gui.py was launched outside the Nucleus/Scripts directory.\n\n"
+        "Please select the 'Nucleus/Scripts' folder that contains\n"
+        "segmentation_utils.py, preprocessing/, etc."
+    )
+    chosen = _fd.askdirectory(title="Select Nucleus/Scripts folder")
+    _root.destroy()
+    if chosen and (Path(chosen) / "segmentation_utils.py").exists():
+        SCRIPT_DIR = Path(chosen).resolve()
+        return SCRIPT_DIR
+    print("[ERROR] Could not locate segmentation_utils.py. "
+          "Please run from Nucleus/Scripts/ or select the correct folder.")
+    sys.exit(1)
+
+SCRIPT_DIR = _ensure_scripts_dir()
 sys.path.insert(0, str(SCRIPT_DIR))
 
 
