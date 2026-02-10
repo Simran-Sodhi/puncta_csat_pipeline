@@ -6,7 +6,8 @@ User-friendly tkinter GUI for the Puncta-CSAT segmentation pipeline.
 
 Provides a step-by-step interface for non-coders to:
   1. Convert ND2 files to OME-TIFF
-  2. Run Cellpose segmentation (nucleus / puncta)
+  2. Run Cellpose segmentation (nucleus / puncta / cytoplasm)
+     - Cytoplasm mode: segments whole cells, then subtracts nucleus masks
   3. Run per-cell intensity & puncta analysis
   4. View results
 
@@ -22,8 +23,52 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
-# Ensure the Scripts directory is on the path for imports
-SCRIPT_DIR = Path(__file__).resolve().parent
+# ------------------------------------------------------------------ #
+#  Locate the Scripts directory (where segmentation_utils.py lives)
+# ------------------------------------------------------------------ #
+# Works when pipeline_gui.py lives inside Nucleus/Scripts/ OR when
+# it has been copied elsewhere.  In the latter case, the user is
+# prompted to select the Scripts folder on first launch.
+
+def _find_scripts_dir():
+    """Return the path to Nucleus/Scripts, or None if not found."""
+    candidate = Path(__file__).resolve().parent
+    if (candidate / "segmentation_utils.py").exists():
+        return candidate
+    # Try one level up (e.g. user put gui in the repo root)
+    for p in [candidate.parent, candidate.parent / "Nucleus" / "Scripts"]:
+        if (p / "segmentation_utils.py").exists():
+            return p
+    return None
+
+SCRIPT_DIR = _find_scripts_dir()
+
+def _ensure_scripts_dir():
+    """Make sure SCRIPT_DIR is set; prompt interactively if needed."""
+    global SCRIPT_DIR
+    if SCRIPT_DIR is not None:
+        return SCRIPT_DIR
+    # Ask the user via a simple dialog before the main window opens
+    import tkinter as _tk
+    from tkinter import filedialog as _fd, messagebox as _mb
+    _root = _tk.Tk()
+    _root.withdraw()
+    _mb.showinfo(
+        "Scripts folder required",
+        "pipeline_gui.py was launched outside the Nucleus/Scripts directory.\n\n"
+        "Please select the 'Nucleus/Scripts' folder that contains\n"
+        "segmentation_utils.py, preprocessing/, etc."
+    )
+    chosen = _fd.askdirectory(title="Select Nucleus/Scripts folder")
+    _root.destroy()
+    if chosen and (Path(chosen) / "segmentation_utils.py").exists():
+        SCRIPT_DIR = Path(chosen).resolve()
+        return SCRIPT_DIR
+    print("[ERROR] Could not locate segmentation_utils.py. "
+          "Please run from Nucleus/Scripts/ or select the correct folder.")
+    sys.exit(1)
+
+SCRIPT_DIR = _ensure_scripts_dir()
 sys.path.insert(0, str(SCRIPT_DIR))
 
 
@@ -180,12 +225,13 @@ class Step1Frame(ttk.LabelFrame):
 
 
 # ------------------------------------------------------------------ #
-#  Step 2 – Cellpose segmentation
+#  Step 2 – Cellpose segmentation (nucleus / puncta / cytoplasm)
 # ------------------------------------------------------------------ #
 
 class Step2Frame(ttk.LabelFrame):
     def __init__(self, parent, log_callback):
-        super().__init__(parent, text="  Step 2: Cellpose Segmentation  ",
+        super().__init__(parent,
+                         text="  Step 2: Cellpose Segmentation  ",
                          padding=12)
         self.log = log_callback
 
@@ -197,7 +243,7 @@ class Step2Frame(ttk.LabelFrame):
         self.out_picker = FolderPicker(self, "Output Masks Directory:")
         self.out_picker.pack(fill="x", pady=2)
 
-        # Mode selector
+        # ---- Mode selector ----
         mode_frame = ttk.Frame(self)
         mode_frame.pack(fill="x", pady=4)
         ttk.Label(mode_frame, text="Mode:", font=(FONT_FAMILY, 10)).pack(
@@ -206,26 +252,29 @@ class Step2Frame(ttk.LabelFrame):
         self.mode_var = tk.StringVar(value="nucleus")
         modes = ttk.Frame(mode_frame)
         modes.pack(side="left", padx=4)
-        ttk.Radiobutton(modes, text="Nucleus", variable=self.mode_var,
-                         value="nucleus", command=self._on_mode_change).pack(side="left", padx=8)
-        ttk.Radiobutton(modes, text="Puncta", variable=self.mode_var,
-                         value="puncta", command=self._on_mode_change).pack(side="left", padx=8)
+        for label, val in [("Nucleus", "nucleus"), ("Puncta", "puncta"),
+                           ("Cytoplasm", "cytoplasm")]:
+            ttk.Radiobutton(modes, text=label, variable=self.mode_var,
+                             value=val,
+                             command=self._on_mode_change).pack(side="left", padx=8)
 
-        # Parameters
+        # ---- Common parameters ----
         param_frame = ttk.Frame(self)
         param_frame.pack(fill="x", pady=4)
 
         self.diameter = NumberEntry(
             param_frame, "Diameter (px):", default=200, dtype=float,
             tooltip="Approximate object diameter in pixels.\n"
-                    "Nucleus ~200, Puncta ~20."
+                    "Nucleus ~200, Puncta ~20,\n"
+                    "Cytoplasm: 0 = auto-estimate."
         )
         self.diameter.pack(side="left", padx=4)
 
         self.channel_idx = NumberEntry(
             param_frame, "Channel:", default=2,
             tooltip="0-based channel index in the image.\n"
-                    "Nucleus typically = 2, Puncta typically = 1."
+                    "Nucleus typically = 2, Puncta = 1,\n"
+                    "Cytoplasm typically = 1."
         )
         self.channel_idx.pack(side="left", padx=4)
 
@@ -253,6 +302,52 @@ class Step2Frame(ttk.LabelFrame):
         ttk.Checkbutton(param_frame2, text="Remove edge objects",
                          variable=self.edges_var).pack(side="left", padx=8)
 
+        # ---- Cytoplasm-specific parameters (shown/hidden) ----
+        self.cyto_frame = ttk.LabelFrame(
+            self,
+            text="  Cytoplasm Options (cell - nucleus = cytoplasm)  ",
+            padding=8,
+        )
+        # Initially hidden; _on_mode_change() manages visibility
+
+        self.nuc_mask_picker = FolderPicker(
+            self.cyto_frame,
+            "Nucleus Masks Folder:",
+            mode="directory",
+        )
+        self.nuc_mask_picker.pack(fill="x", pady=2)
+
+        cyto_params = ttk.Frame(self.cyto_frame)
+        cyto_params.pack(fill="x", pady=4)
+
+        self.nuc_dilate = NumberEntry(
+            cyto_params, "Nucleus dilation (px):", default=0,
+            tooltip="Dilate the nucleus mask by this many pixels\n"
+                    "before subtracting from the cell mask.\n"
+                    "Useful to avoid including peri-nuclear signal.\n"
+                    "Set 0 for no dilation."
+        )
+        self.nuc_dilate.pack(side="left", padx=4)
+
+        self.min_nuc_px = NumberEntry(
+            cyto_params, "Min nuc overlap (px):", default=10,
+            tooltip="Minimum nucleus pixels that must overlap\n"
+                    "a cell for the cell to be kept.\n"
+                    "Cells without enough nuclear overlap\n"
+                    "are removed as orphans."
+        )
+        self.min_nuc_px.pack(side="left", padx=4)
+
+        self.min_overlap_frac = NumberEntry(
+            cyto_params, "Min overlap fraction:", default=0.005,
+            dtype=float,
+            tooltip="Minimum fraction of cell area that must\n"
+                    "overlap with nucleus to keep the cell.\n"
+                    "Default: 0.005 (0.5%)."
+        )
+        self.min_overlap_frac.pack(side="left", padx=4)
+
+        # ---- Run button ----
         self.run_btn = ttk.Button(self, text="Run Segmentation",
                                   command=self._run, style="Accent.TButton")
         self.run_btn.pack(pady=(8, 4))
@@ -268,12 +363,23 @@ class Step2Frame(ttk.LabelFrame):
             self.z_idx.var.set("5")
             self.min_size.var.set("10000")
             self.edges_var.set(True)
-        else:
+            self.cyto_frame.pack_forget()
+        elif mode == "puncta":
             self.diameter.var.set("20")
             self.channel_idx.var.set("1")
             self.z_idx.var.set("8")
             self.min_size.var.set("0")
             self.edges_var.set(False)
+            self.cyto_frame.pack_forget()
+        elif mode == "cytoplasm":
+            self.diameter.var.set("0")  # 0 = auto-estimate
+            self.channel_idx.var.set("1")
+            self.z_idx.var.set("5")
+            self.min_size.var.set("80000")
+            self.edges_var.set(True)
+            # Show cytoplasm options (insert before run button)
+            self.cyto_frame.pack(fill="x", pady=4,
+                                 before=self.run_btn)
 
     def _run(self):
         input_path = self.input_picker.get()
@@ -285,27 +391,61 @@ class Step2Frame(ttk.LabelFrame):
 
         mode = self.mode_var.get()
         diameter = self.diameter.get()
+        # Treat 0 as None (auto-estimate) for diameter
+        if diameter == 0:
+            diameter = None
         channel = self.channel_idx.get()
         z = self.z_idx.get()
         min_sz = self.min_size.get()
         gpu = self.gpu_var.get()
         rm_edges = self.edges_var.get()
 
+        is_cyto = mode == "cytoplasm"
+        nuc_mask_dir = None
+        nuc_dilate_px = 0
+        min_nuc_pixels = 10
+        min_overlap_frac = 0.005
+
+        if is_cyto:
+            nuc_mask_dir = self.nuc_mask_picker.get()
+            if not nuc_mask_dir:
+                messagebox.showwarning(
+                    "Missing input",
+                    "Cytoplasm mode requires a Nucleus Masks Folder.\n"
+                    "Please run nucleus segmentation first, then point\n"
+                    "to the folder containing nucleus mask TIFFs."
+                )
+                return
+            nuc_dilate_px = self.nuc_dilate.get()
+            min_nuc_pixels = self.min_nuc_px.get()
+            min_overlap_frac = self.min_overlap_frac.get()
+
         self.log(f"\n{'='*60}\n"
                  f"Step 2: Cellpose Segmentation ({mode})\n"
                  f"  diameter={diameter}, channel={channel}, z={z}\n"
-                 f"  min_size={min_sz}, gpu={gpu}, remove_edges={rm_edges}\n"
-                 f"{'='*60}")
+                 f"  min_size={min_sz}, gpu={gpu}, remove_edges={rm_edges}")
+        if is_cyto:
+            self.log(f"  nuc_mask_dir={nuc_mask_dir}\n"
+                     f"  nuc_dilate_px={nuc_dilate_px}, "
+                     f"min_nuc_pixels={min_nuc_pixels}, "
+                     f"min_overlap_frac={min_overlap_frac}")
+        self.log(f"{'='*60}")
         self.run_btn.config(state="disabled")
 
         def task():
             try:
                 from segmentation_utils import (
-                    load_image_2d, auto_lut_clip, run_cellpose,
-                    postprocess_mask, save_mask, save_triptych,
+                    load_image_2d, auto_lut_clip, ensure_2d,
+                    run_cellpose, postprocess_mask,
+                    save_mask, save_triptych,
+                    save_cytoplasm_triptych,
                     collect_image_paths,
+                    compute_cytoplasm_mask,
                 )
                 from cellpose import models
+                import numpy as np
+                import tifffile as tiff
+                import re
 
                 image_paths = collect_image_paths(input_path)
                 if not image_paths:
@@ -333,9 +473,56 @@ class Step2Frame(ttk.LabelFrame):
                                                  remove_edges=rm_edges)
 
                         stem = img_path.stem
-                        save_mask(masks, outdir / f"{stem}_cyto3_masks.tif")
-                        save_triptych(img_norm, masks,
-                                      trip_dir / f"{stem}_triptych.png")
+
+                        if is_cyto:
+                            # Find matching nucleus mask
+                            nuc_path = self._find_nuc_mask(
+                                nuc_mask_dir, stem)
+                            if nuc_path is None:
+                                self.log(
+                                    f"    [WARN] No nucleus mask for "
+                                    f"{stem}, saving whole-cell only.")
+                                save_mask(masks,
+                                          outdir / f"{stem}_cell_masks.tif")
+                                save_triptych(
+                                    img_norm, masks,
+                                    trip_dir / f"{stem}_cell_triptych.png")
+                                continue
+
+                            nuc_m = ensure_2d(tiff.imread(nuc_path))
+                            if nuc_m.shape != masks.shape:
+                                self.log(
+                                    f"    [WARN] Shape mismatch: "
+                                    f"cell {masks.shape} vs "
+                                    f"nucleus {nuc_m.shape}, skipping.")
+                                save_mask(masks,
+                                          outdir / f"{stem}_cell_masks.tif")
+                                continue
+
+                            cyto_mask, kept, orphans = \
+                                compute_cytoplasm_mask(
+                                    masks, nuc_m,
+                                    nuc_dilate_px=nuc_dilate_px,
+                                    min_nuc_pixels=min_nuc_pixels,
+                                    min_overlap_frac=min_overlap_frac,
+                                )
+                            self.log(
+                                f"    Kept {len(kept)} cells, "
+                                f"removed {len(orphans)} orphans")
+
+                            save_mask(masks,
+                                      outdir / f"{stem}_cell_masks.tif")
+                            save_mask(cyto_mask,
+                                      outdir / f"{stem}_cyto_masks.tif")
+                            save_cytoplasm_triptych(
+                                img_norm, masks, nuc_m, cyto_mask,
+                                trip_dir / f"{stem}_cyto_triptych.png")
+                        else:
+                            save_mask(masks,
+                                      outdir / f"{stem}_cyto3_masks.tif")
+                            save_triptych(
+                                img_norm, masks,
+                                trip_dir / f"{stem}_triptych.png")
                     except Exception as e:
                         self.log(f"    [ERROR] {e}")
 
@@ -346,6 +533,22 @@ class Step2Frame(ttk.LabelFrame):
                 self.run_btn.config(state="normal")
 
         threading.Thread(target=task, daemon=True).start()
+
+    @staticmethod
+    def _find_nuc_mask(nuc_mask_dir, image_stem):
+        """Find nucleus mask matching an image stem."""
+        import re
+        nuc_dir = Path(nuc_mask_dir)
+        for p in nuc_dir.glob("*.tif"):
+            if image_stem in p.stem or p.stem in image_stem:
+                return p
+        m = re.search(r"(\d+_Z\d+)", image_stem)
+        if m:
+            token = m.group(1)
+            for p in nuc_dir.glob("*.tif"):
+                if token in p.stem:
+                    return p
+        return None
 
 
 # ------------------------------------------------------------------ #
@@ -523,7 +726,7 @@ class PipelineGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Puncta-CSAT Segmentation Pipeline")
-        self.geometry("820x900")
+        self.geometry("820x950")
         self.minsize(700, 700)
         self.configure(bg=BG_COLOR)
 
