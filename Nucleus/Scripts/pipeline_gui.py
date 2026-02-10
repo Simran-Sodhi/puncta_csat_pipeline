@@ -240,6 +240,14 @@ class Step2Frame(ttk.LabelFrame):
                          padding=12)
         self.log = log_callback
 
+        # ---- Channel reference ----
+        ch_info = ttk.Label(
+            self,
+            text="Channels:  0 = DIC (bright-field)    1 = GFP (puncta)    2 = mScarlet (nucleus)",
+            font=(FONT_FAMILY, 9), foreground=SUBTLE_TEXT,
+        )
+        ch_info.pack(anchor="w", padx=4, pady=(0, 4))
+
         self.input_picker = FolderPicker(
             self, "Input Images (folder or file):", mode="directory"
         )
@@ -254,11 +262,11 @@ class Step2Frame(ttk.LabelFrame):
         ttk.Label(mode_frame, text="Mode:", font=(FONT_FAMILY, 10)).pack(
             side="left", padx=4
         )
-        self.mode_var = tk.StringVar(value="nucleus")
+        self.mode_var = tk.StringVar(value="cell")
         modes = ttk.Frame(mode_frame)
         modes.pack(side="left", padx=4)
-        for label, val in [("Nucleus", "nucleus"), ("Puncta", "puncta"),
-                           ("Cytoplasm", "cytoplasm")]:
+        for label, val in [("Cell (DIC)", "cell"), ("Nucleus", "nucleus"),
+                           ("Puncta", "puncta"), ("Cytoplasm", "cytoplasm")]:
             ttk.Radiobutton(modes, text=label, variable=self.mode_var,
                              value=val,
                              command=self._on_mode_change).pack(side="left", padx=8)
@@ -268,23 +276,23 @@ class Step2Frame(ttk.LabelFrame):
         param_frame.pack(fill="x", pady=4)
 
         self.diameter = NumberEntry(
-            param_frame, "Diameter (px):", default=200, dtype=float,
+            param_frame, "Diameter (px):", default=0, dtype=float,
             tooltip="Approximate object diameter in pixels.\n"
-                    "Nucleus ~200, Puncta ~20,\n"
-                    "Cytoplasm: 0 = auto-estimate."
+                    "Cell (DIC): 0 = auto-estimate,\n"
+                    "Nucleus ~200, Puncta ~20."
         )
         self.diameter.pack(side="left", padx=4)
 
         self.channel_idx = NumberEntry(
-            param_frame, "Channel:", default=2,
+            param_frame, "Channel:", default=0,
             tooltip="0-based channel index in the image.\n"
-                    "Nucleus typically = 2, Puncta = 1,\n"
-                    "Cytoplasm typically = 1."
+                    "0 = DIC (cell), 1 = GFP (puncta),\n"
+                    "2 = mScarlet (nucleus)."
         )
         self.channel_idx.pack(side="left", padx=4)
 
         self.z_idx = NumberEntry(
-            param_frame, "Z-index:", default=5,
+            param_frame, "Z-index:", default=0,
             tooltip="Z-plane to use (0-based)."
         )
         self.z_idx.pack(side="left", padx=4)
@@ -293,7 +301,7 @@ class Step2Frame(ttk.LabelFrame):
         param_frame2.pack(fill="x", pady=4)
 
         self.min_size = NumberEntry(
-            param_frame2, "Min object size (px):", default=10000,
+            param_frame2, "Min object size (px):", default=50000,
             tooltip="Objects smaller than this will be removed.\n"
                     "Set 0 to disable."
         )
@@ -306,6 +314,10 @@ class Step2Frame(ttk.LabelFrame):
         self.edges_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(param_frame2, text="Remove edge objects",
                          variable=self.edges_var).pack(side="left", padx=8)
+
+        self.dic_norm_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(param_frame2, text="DIC normalization (CLAHE)",
+                         variable=self.dic_norm_var).pack(side="left", padx=8)
 
         # ---- Cytoplasm-specific parameters (shown/hidden) ----
         self.cyto_frame = ttk.LabelFrame(
@@ -362,26 +374,37 @@ class Step2Frame(ttk.LabelFrame):
 
     def _on_mode_change(self):
         mode = self.mode_var.get()
-        if mode == "nucleus":
+        if mode == "cell":
+            self.diameter.var.set("0")       # auto-estimate for DIC
+            self.channel_idx.var.set("0")    # DIC / bright-field
+            self.z_idx.var.set("0")
+            self.min_size.var.set("50000")
+            self.edges_var.set(True)
+            self.dic_norm_var.set(True)
+            self.cyto_frame.pack_forget()
+        elif mode == "nucleus":
             self.diameter.var.set("200")
-            self.channel_idx.var.set("2")
-            self.z_idx.var.set("5")
+            self.channel_idx.var.set("2")    # mScarlet
+            self.z_idx.var.set("0")
             self.min_size.var.set("10000")
             self.edges_var.set(True)
+            self.dic_norm_var.set(False)
             self.cyto_frame.pack_forget()
         elif mode == "puncta":
             self.diameter.var.set("20")
-            self.channel_idx.var.set("1")
-            self.z_idx.var.set("8")
+            self.channel_idx.var.set("1")    # GFP
+            self.z_idx.var.set("0")
             self.min_size.var.set("0")
             self.edges_var.set(False)
+            self.dic_norm_var.set(False)
             self.cyto_frame.pack_forget()
         elif mode == "cytoplasm":
-            self.diameter.var.set("0")  # 0 = auto-estimate
-            self.channel_idx.var.set("1")
-            self.z_idx.var.set("5")
-            self.min_size.var.set("80000")
+            self.diameter.var.set("0")       # auto-estimate for DIC
+            self.channel_idx.var.set("0")    # DIC / bright-field
+            self.z_idx.var.set("0")
+            self.min_size.var.set("50000")
             self.edges_var.set(True)
+            self.dic_norm_var.set(True)
             # Show cytoplasm options (insert before run button)
             self.cyto_frame.pack(fill="x", pady=4,
                                  before=self.run_btn)
@@ -404,6 +427,7 @@ class Step2Frame(ttk.LabelFrame):
         min_sz = self.min_size.get()
         gpu = self.gpu_var.get()
         rm_edges = self.edges_var.get()
+        use_dic_norm = self.dic_norm_var.get()
 
         is_cyto = mode == "cytoplasm"
         nuc_mask_dir = None
@@ -425,10 +449,12 @@ class Step2Frame(ttk.LabelFrame):
             min_nuc_pixels = self.min_nuc_px.get()
             min_overlap_frac = self.min_overlap_frac.get()
 
+        norm_label = "DIC (CLAHE)" if use_dic_norm else "LUT"
         self.log(f"\n{'='*60}\n"
                  f"Step 2: Cellpose Segmentation ({mode})\n"
                  f"  diameter={diameter}, channel={channel}, z={z}\n"
-                 f"  min_size={min_sz}, gpu={gpu}, remove_edges={rm_edges}")
+                 f"  min_size={min_sz}, gpu={gpu}, remove_edges={rm_edges}\n"
+                 f"  normalization={norm_label}")
         if is_cyto:
             self.log(f"  nuc_mask_dir={nuc_mask_dir}\n"
                      f"  nuc_dilate_px={nuc_dilate_px}, "
@@ -440,7 +466,8 @@ class Step2Frame(ttk.LabelFrame):
         def task():
             try:
                 from segmentation_utils import (
-                    load_image_2d, auto_lut_clip, ensure_2d,
+                    load_image_2d, auto_lut_clip, normalize_dic,
+                    ensure_2d,
                     run_cellpose, postprocess_mask,
                     save_mask, save_triptych,
                     save_cytoplasm_triptych,
@@ -470,7 +497,13 @@ class Step2Frame(ttk.LabelFrame):
                         img2d = load_image_2d(img_path,
                                               channel_index=channel,
                                               z_index=z)
-                        img_norm = auto_lut_clip(img2d)
+
+                        # DIC: CLAHE normalization; fluorescence: LUT
+                        if use_dic_norm:
+                            img_norm = normalize_dic(img2d)
+                        else:
+                            img_norm = auto_lut_clip(img2d)
+
                         masks = run_cellpose(img_norm, model=model,
                                              diameter=diameter)
                         masks = postprocess_mask(masks,

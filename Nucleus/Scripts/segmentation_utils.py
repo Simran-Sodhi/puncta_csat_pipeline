@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import tifffile as tiff
 import matplotlib.pyplot as plt
-from skimage import morphology
+from skimage import morphology, exposure
 from skimage.segmentation import relabel_sequential
 
 
@@ -159,6 +159,42 @@ def percentile_norm(img2d, p_low=1, p_high=99):
     if hi <= lo:
         return np.zeros_like(img2d, dtype=np.float32)
     return np.clip((img2d - lo) / (hi - lo), 0, 1).astype(np.float32)
+
+
+def normalize_dic(img2d, clip_limit=0.02, kernel_size=None):
+    """
+    Normalize a DIC / bright-field image for Cellpose segmentation.
+
+    DIC images have low-contrast cell boundaries with halos and shadows.
+    Standard percentile normalization doesn't work well.  Instead we use
+    CLAHE (Contrast-Limited Adaptive Histogram Equalization) which boosts
+    local contrast around cell edges.
+
+    Parameters
+    ----------
+    img2d : np.ndarray (Y, X)
+        Raw DIC image (any dtype).
+    clip_limit : float
+        CLAHE clip limit (higher = more contrast, default 0.02).
+    kernel_size : int or None
+        CLAHE tile size.  None = automatic (1/8 of image size).
+
+    Returns
+    -------
+    img_norm : np.ndarray (Y, X), float32 in [0, 1]
+    """
+    img = img2d.astype(np.float32)
+    # Percentile clip to remove extreme outliers
+    lo, hi = np.percentile(img, (0.5, 99.5))
+    if hi <= lo:
+        return np.zeros_like(img, dtype=np.float32)
+    img = np.clip(img, lo, hi)
+    img = (img - lo) / (hi - lo)
+    # Apply CLAHE to boost local contrast at cell edges
+    img_clahe = exposure.equalize_adapthist(
+        img, clip_limit=clip_limit, kernel_size=kernel_size,
+    )
+    return img_clahe.astype(np.float32)
 
 
 # ------------------------------------------------------------------ #

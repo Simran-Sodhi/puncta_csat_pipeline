@@ -2,32 +2,32 @@
 """
 evaluate_cellpose.py
 
-Unified Cellpose segmentation script that replaces evaluate_nucleus.py,
-evaluate_puncta.py, and adds cytoplasm support.
+Unified Cellpose segmentation script with four modes:
 
-Supports configurable presets (--mode nucleus | puncta | cytoplasm)
-or fully custom parameters via CLI flags.
+  cell      – whole-cell segmentation on the DIC / bright-field channel (ch 0)
+  nucleus   – nucleus segmentation on the mScarlet channel (ch 2)
+  puncta    – puncta segmentation on the GFP channel (ch 1)
+  cytoplasm – whole-cell on DIC, then subtract pre-existing nucleus masks
 
-Cytoplasm mode:
-  1. Segments whole cells via Cellpose cyto3.
-  2. Subtracts a pre-existing nucleus mask to produce cytoplasm-only masks.
-  Requires --nuc-mask-dir pointing to a folder of nucleus mask TIFFs.
+Channel layout (default):
+    0 = DIC / bright-field
+    1 = GFP  (puncta)
+    2 = mScarlet (nucleus)
 
 Usage examples
 --------------
-    # Nucleus segmentation
+    # Whole-cell segmentation from DIC
+    python evaluate_cellpose.py --mode cell --input /path/to/images --outdir masks --gpu
+
+    # Nucleus segmentation from mScarlet
     python evaluate_cellpose.py --mode nucleus --input /path/to/images --outdir masks --gpu
 
-    # Puncta segmentation
+    # Puncta segmentation from GFP
     python evaluate_cellpose.py --mode puncta --input /path/to/images --outdir masks --gpu
 
-    # Cytoplasm: segment whole cells then subtract nucleus masks
+    # Cytoplasm: DIC cell seg then subtract nucleus masks
     python evaluate_cellpose.py --mode cytoplasm --input /path/to/images --outdir masks --gpu \\
         --nuc-mask-dir /path/to/nucleus_masks
-
-    # Fully custom run
-    python evaluate_cellpose.py --input /path/to/images --outdir masks --gpu \\
-        --diameter 150 --channel-index 0 --z-index 3 --min-size 5000
 """
 
 import sys
@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from segmentation_utils import (
     load_image_2d,
     auto_lut_clip,
+    normalize_dic,
     ensure_2d,
     run_cellpose,
     postprocess_mask,
@@ -56,28 +57,40 @@ import re
 
 
 # -------------------- presets -------------------- #
+# Channel layout:  0 = DIC,  1 = GFP (puncta),  2 = mScarlet (nucleus)
 
 PRESETS = {
+    "cell": {
+        "diameter": None,       # auto-estimate for whole cells on DIC
+        "channel_index": 0,     # DIC / bright-field
+        "z_index": 0,
+        "min_size": 50000,
+        "remove_edges": True,
+        "use_dic_norm": True,
+    },
     "nucleus": {
         "diameter": 200,
-        "channel_index": 2,
-        "z_index": 5,
+        "channel_index": 2,     # mScarlet
+        "z_index": 0,
         "min_size": 10000,
         "remove_edges": True,
+        "use_dic_norm": False,
     },
     "puncta": {
         "diameter": 20,
-        "channel_index": 1,
-        "z_index": 8,
+        "channel_index": 1,     # GFP
+        "z_index": 0,
         "min_size": 0,
         "remove_edges": False,
+        "use_dic_norm": False,
     },
     "cytoplasm": {
-        "diameter": None,   # let Cellpose auto-estimate
-        "channel_index": 1,
-        "z_index": 5,
-        "min_size": 80000,
+        "diameter": None,       # auto-estimate
+        "channel_index": 0,     # DIC for whole-cell segmentation
+        "z_index": 0,
+        "min_size": 50000,
         "remove_edges": True,
+        "use_dic_norm": True,
     },
 }
 
@@ -119,9 +132,9 @@ def build_parser():
     )
     parser.add_argument(
         "--mode",
-        choices=["nucleus", "puncta", "cytoplasm"],
+        choices=["cell", "nucleus", "puncta", "cytoplasm"],
         default=None,
-        help="Load a preset (nucleus, puncta, or cytoplasm). "
+        help="Load a preset (cell, nucleus, puncta, or cytoplasm). "
              "Individual flags override the preset.",
     )
     parser.add_argument(
@@ -138,7 +151,7 @@ def build_parser():
     )
     parser.add_argument(
         "--diameter", type=float, default=None,
-        help="Approximate object diameter in pixels.",
+        help="Approximate object diameter in pixels (0 = auto-estimate).",
     )
     parser.add_argument(
         "--batch-size", type=int, default=1,
@@ -167,6 +180,11 @@ def build_parser():
     parser.add_argument(
         "--remove-edges", action="store_true", default=None,
         help="Remove objects touching the image border.",
+    )
+    parser.add_argument(
+        "--dic-norm", action="store_true", default=None,
+        help="Use DIC/bright-field normalization (CLAHE) instead of "
+             "percentile-based LUT normalization.",
     )
 
     # Cytoplasm-specific arguments
@@ -199,6 +217,8 @@ def resolve_args(args):
     args.min_size = args.min_size if args.min_size is not None else preset.get("min_size", 0)
     if args.remove_edges is None:
         args.remove_edges = preset.get("remove_edges", False)
+    if args.dic_norm is None:
+        args.dic_norm = preset.get("use_dic_norm", False)
     return args
 
 
@@ -216,9 +236,11 @@ def main():
         raise RuntimeError(f"No TIF/TIFF/OME-TIFF images found under {args.input}")
 
     mode_label = args.mode or "custom"
+    norm_label = "DIC (CLAHE)" if args.dic_norm else "LUT"
     print(f"Found {len(image_paths)} image(s). Mode: {mode_label}")
     print(f"  diameter={args.diameter}, channel={args.channel_index}, "
-          f"z={args.z_index}, min_size={args.min_size}, remove_edges={args.remove_edges}")
+          f"z={args.z_index}, min_size={args.min_size}, "
+          f"remove_edges={args.remove_edges}, norm={norm_label}")
     if is_cyto:
         print(f"  nuc_mask_dir={args.nuc_mask_dir}, nuc_dilate_px={args.nuc_dilate_px}, "
               f"min_nuc_pixels={args.min_nuc_pixels}, min_overlap_frac={args.min_overlap_frac}")
@@ -238,11 +260,17 @@ def main():
                 channel_index=args.channel_index,
                 z_index=args.z_index,
             )
-            img_norm = auto_lut_clip(
-                img2d,
-                low_percentile=args.lut_low,
-                high_percentile=args.lut_high,
-            )
+
+            # Normalize: CLAHE for DIC, percentile LUT for fluorescence
+            if args.dic_norm:
+                img_norm = normalize_dic(img2d)
+            else:
+                img_norm = auto_lut_clip(
+                    img2d,
+                    low_percentile=args.lut_low,
+                    high_percentile=args.lut_high,
+                )
+
             masks = run_cellpose(
                 img_norm, model=model,
                 diameter=args.diameter,
@@ -262,7 +290,6 @@ def main():
                 if nuc_path is None:
                     print(f"  [WARN] No nucleus mask found for {stem}, "
                           f"saving whole-cell mask only.")
-                    # Save whole-cell mask as fallback
                     save_mask(masks, outdir / f"{stem}_cell_masks.tif")
                     save_triptych(img_norm, masks,
                                   triptych_dir / f"{stem}_cell_triptych.png")
@@ -283,7 +310,6 @@ def main():
                 )
                 print(f"  Kept {len(kept)} cells, removed {len(orphans)} orphans")
 
-                # Save all three masks
                 save_mask(masks, outdir / f"{stem}_cell_masks.tif")
                 save_mask(cyto_mask, outdir / f"{stem}_cyto_masks.tif")
 
@@ -293,7 +319,7 @@ def main():
                 )
                 print(f"  -> cyto mask: {outdir / f'{stem}_cyto_masks.tif'}")
             else:
-                # Standard mode (nucleus / puncta / custom)
+                # Standard mode (cell / nucleus / puncta / custom)
                 mask_path = outdir / f"{stem}_cyto3_masks.tif"
                 save_mask(masks, mask_path)
                 print(f"  -> mask: {mask_path}")
