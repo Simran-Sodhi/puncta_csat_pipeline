@@ -1,53 +1,73 @@
+#!/usr/bin/env python3
 """
-nd2_to_ome_tif.py: This file converts the nd2 file to ome tif files for z = 8 (in this case) and creates such a file for each position/scene
+nd2_to_ome_tif.py
+
+Convert an ND2 microscopy file to per-scene OME-TIFF files,
+extracting a single Z-plane (configurable via --z-index).
+
+Usage
+-----
+    python nd2_to_ome_tif.py --input /path/to/file.nd2 --outdir /path/to/output --z-index 8
 """
 
+import argparse
+import pathlib
+import time
+
+import numpy as np
+import tifffile
 from aicsimageio import AICSImage
-import tifffile, numpy as np, pathlib, time
 
-# -------------------------
-# INPUT / OUTPUT FOLDERS
-# -------------------------
 
-# Path to nd2 file
-raw_path = pathlib.Path(
-    "/Users/simransodhi/Desktop/CMU/Fall 2025/RA Work/image_analysis/Nucleus_Puncta/Raw_Data/2025.11.21_HeLa P9_p936 1ug p893 1ug_Nucleus/2025.11.21_HeLa P9_p936 1ug p893 1ug_Nucleus_001.nd2"
-)
+def convert_nd2(input_path, output_dir, z_index=8):
+    """
+    Convert all scenes in an ND2 file to individual OME-TIFF files
+    for a single Z-plane.
 
-print("Raw path exists:", raw_path.exists())
-print("Raw path:", raw_path)
+    Parameters
+    ----------
+    input_path : str or pathlib.Path
+        Path to the .nd2 file.
+    output_dir : str or pathlib.Path
+        Directory for output OME-TIFF files.
+    z_index : int
+        Z-plane to extract (0-based).
+    """
+    inp = pathlib.Path(input_path)
+    out_dir = pathlib.Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-inp = pathlib.Path(raw_path)
-out_dir_2d  = pathlib.Path("../../Processed_Data/21_nov_data/Ome_tifs_2D_z8")   # one CYX file per Z plane
-out_dir_2d.mkdir(parents=True, exist_ok=True)
+    if not inp.exists():
+        raise FileNotFoundError(f"Input file not found: {inp}")
 
-img = AICSImage(inp)
-t0 = time.perf_counter()
+    img = AICSImage(inp)
+    n_scenes = len(img.scenes)
+    print(f"Opened {inp.name}: {n_scenes} scene(s)")
 
-for i, s in enumerate(img.scenes):
-    if i % 10 == 0:
-        print("Current Point:", i)
-    img.set_scene(s)
+    t0 = time.perf_counter()
+    exported = 0
 
-    # ---------- READ ----------
-    data = img.get_image_data("CZYX")   # (C, Z, Y, X)
-    data = np.ascontiguousarray(data)
-    px = img.physical_pixel_sizes
-    ch = list(map(str, img.channel_names))  # ensure strings
+    for i, scene in enumerate(img.scenes):
+        img.set_scene(scene)
 
-    C, Z, Y, X = data.shape
+        data = img.get_image_data("CZYX")  # (C, Z, Y, X)
+        data = np.ascontiguousarray(data)
+        px = img.physical_pixel_sizes
+        ch_names = list(map(str, img.channel_names))
 
-    # ---------- WRITE ONE FILE PER Z (axes CYX) ----------
-    for z in range(Z):
-        if z != 8:
+        C, Z, Y, X = data.shape
+
+        if z_index >= Z:
+            print(f"  [WARN] Scene {i} ({scene}): only {Z} z-planes, "
+                  f"skipping (requested z={z_index})")
             continue
-        cyx = data[:, z, :, :]                   # shape (C, Y, X)
-        # slice channel names to the actual C we’re writing
-        ch_this = [{"Name": n} for n in ch[:cyx.shape[0]]]
 
-        out_2d = out_dir_2d / f"{inp.stem}_{s}_Z{z:03d}.ome.tif"
+        cyx = data[:, z_index, :, :]  # (C, Y, X)
+        ch_meta = [{"Name": n} for n in ch_names[:cyx.shape[0]]]
+
+        out_path = out_dir / f"{inp.stem}_{scene}_Z{z_index:03d}.ome.tif"
         tifffile.imwrite(
-            out_2d,
+            str(out_path),
             cyx,
             ome=True,
             imagej=False,
@@ -55,21 +75,47 @@ for i, s in enumerate(img.scenes):
             compression="deflate",
             bigtiff=True,
             metadata={
-                "axes": "CYX",                          # matches (C,Y,X)
-                "Channel": ch_this,                     # length == C
+                "axes": "CYX",
+                "Channel": ch_meta,
                 "PhysicalSizeX": float(px.X) if px.X else None,
                 "PhysicalSizeY": float(px.Y) if px.Y else None,
                 "PhysicalSizeXUnit": "micrometer",
                 "PhysicalSizeYUnit": "micrometer",
             },
         )
+        exported += 1
+        if (i + 1) % 10 == 0 or (i + 1) == n_scenes:
+            print(f"  Processed {i + 1}/{n_scenes} scenes")
 
-elapsed = time.perf_counter() - t0
-print(f"Exported {len(img.scenes)} scene(s) in {elapsed:.2f}s")
+    elapsed = time.perf_counter() - t0
+    print(f"Exported {exported}/{n_scenes} scene(s) in {elapsed:.1f}s -> {out_dir}")
 
-# ------------- QUICK VERIFICATION -------------
-from tifffile import TiffFile
-p_2d = out_dir_2d / f"{inp.stem}_{img.scenes[0]}_Z008.ome.tif"
-with TiffFile(str(p_2d)) as tf:
-    print("2D axes:", tf.series[0].axes)    # CYX
-    print("2D shape:", tf.series[0].shape)  # (C, Y, X)
+    # Quick verification on first exported file
+    first = out_dir / f"{inp.stem}_{img.scenes[0]}_Z{z_index:03d}.ome.tif"
+    if first.exists():
+        with tifffile.TiffFile(str(first)) as tf:
+            print(f"  Verification: axes={tf.series[0].axes}, shape={tf.series[0].shape}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Convert ND2 file to per-scene OME-TIFF (single Z-plane)."
+    )
+    parser.add_argument(
+        "--input", required=True,
+        help="Path to the .nd2 file.",
+    )
+    parser.add_argument(
+        "--outdir", required=True,
+        help="Output directory for OME-TIFF files.",
+    )
+    parser.add_argument(
+        "--z-index", type=int, default=8,
+        help="Z-plane index to extract (default: 8).",
+    )
+    args = parser.parse_args()
+    convert_nd2(args.input, args.outdir, args.z_index)
+
+
+if __name__ == "__main__":
+    main()
