@@ -216,8 +216,13 @@ class Step1Frame(ttk.LabelFrame):
                 from preprocessing.nd2_to_ome_tif import convert_nd2
                 convert_nd2(nd2_path, out_dir, z_index=z)
                 self.log("[DONE] ND2 conversion complete.")
+            except ImportError as exc:
+                self.log(f"[ERROR] Missing dependency: {exc}")
+                self.log("  Install with: pip install aicsimageio")
             except Exception as exc:
+                import traceback
                 self.log(f"[ERROR] {exc}")
+                self.log(traceback.format_exc())
             finally:
                 self.run_btn.config(state="normal")
 
