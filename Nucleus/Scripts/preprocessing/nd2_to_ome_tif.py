@@ -5,9 +5,15 @@ nd2_to_ome_tif.py
 Convert an ND2 microscopy file to per-scene OME-TIFF files,
 extracting a single Z-plane (configurable via --z-index).
 
+Uses the lightweight ``nd2`` package (no aicsimageio / lxml needed).
+
 Usage
 -----
     python nd2_to_ome_tif.py --input /path/to/file.nd2 --outdir /path/to/output --z-index 8
+
+Install
+-------
+    pip install nd2 tifffile numpy
 """
 
 import argparse
@@ -16,13 +22,13 @@ import time
 
 import numpy as np
 import tifffile
-from aicsimageio import AICSImage
+import nd2
 
 
 def convert_nd2(input_path, output_dir, z_index=8):
     """
-    Convert all scenes in an ND2 file to individual OME-TIFF files
-    for a single Z-plane.
+    Convert all positions/scenes in an ND2 file to individual OME-TIFF
+    files for a single Z-plane.
 
     Parameters
     ----------
@@ -40,35 +46,96 @@ def convert_nd2(input_path, output_dir, z_index=8):
     if not inp.exists():
         raise FileNotFoundError(f"Input file not found: {inp}")
 
-    img = AICSImage(inp)
-    n_scenes = len(img.scenes)
-    print(f"Opened {inp.name}: {n_scenes} scene(s)")
+    f = nd2.ND2File(inp)
+    print(f"Opened {inp.name}")
+
+    # Get metadata
+    sizes = f.sizes  # dict like {'P': 96, 'Z': 11, 'C': 3, 'Y': 2044, 'X': 2048}
+    print(f"  Dimensions: {sizes}")
+
+    # Determine axis order and counts
+    n_positions = sizes.get("P", 1)
+    n_z = sizes.get("Z", 1)
+    n_channels = sizes.get("C", 1)
+
+    if z_index >= n_z:
+        raise ValueError(
+            f"z_index={z_index} but file only has {n_z} z-planes (0-{n_z - 1})"
+        )
+
+    # Get channel names
+    ch_names = []
+    if f.metadata and f.metadata.channels:
+        ch_names = [ch.channel.name for ch in f.metadata.channels]
+    if not ch_names:
+        ch_names = [f"Ch{i}" for i in range(n_channels)]
+
+    # Get pixel sizes
+    px_x = px_y = None
+    if f.metadata and f.metadata.channels:
+        vol = f.metadata.channels[0].volume
+        if vol:
+            px_x = vol.axesCalibration[0] if vol.axesCalibration else None
+            px_y = vol.axesCalibration[1] if len(vol.axesCalibration) > 1 else None
+
+    # Read the full data array
+    # nd2 returns data in the order of the axes in f.sizes
+    data = f.asarray()
+    axes_order = list(sizes.keys())
+    print(f"  Array shape: {data.shape}, axes: {''.join(axes_order)}")
 
     t0 = time.perf_counter()
     exported = 0
 
-    for i, scene in enumerate(img.scenes):
-        img.set_scene(scene)
+    for pos_idx in range(n_positions):
+        # Build the indexing tuple based on axis order
+        slicing = []
+        for ax in axes_order:
+            if ax == "P":
+                slicing.append(pos_idx)
+            elif ax == "Z":
+                slicing.append(z_index)
+            elif ax == "C":
+                slicing.append(slice(None))  # keep all channels
+            elif ax in ("Y", "X"):
+                slicing.append(slice(None))  # keep full spatial dims
+            elif ax == "T":
+                slicing.append(0)  # first time point
+            else:
+                slicing.append(0)
 
-        data = img.get_image_data("CZYX")  # (C, Z, Y, X)
-        data = np.ascontiguousarray(data)
-        px = img.physical_pixel_sizes
-        ch_names = list(map(str, img.channel_names))
+        plane = data[tuple(slicing)]  # should be (C, Y, X) or (Y, X)
 
-        C, Z, Y, X = data.shape
+        # Ensure shape is (C, Y, X)
+        if plane.ndim == 2:
+            plane = plane[np.newaxis, :, :]
 
-        if z_index >= Z:
-            print(f"  [WARN] Scene {i} ({scene}): only {Z} z-planes, "
-                  f"skipping (requested z={z_index})")
-            continue
+        plane = np.ascontiguousarray(plane)
+        C = plane.shape[0]
 
-        cyx = data[:, z_index, :, :]  # (C, Y, X)
-        ch_meta = [{"Name": n} for n in ch_names[:cyx.shape[0]]]
+        # Scene/position name
+        if n_positions > 1:
+            # Try to get position name from experiment metadata
+            scene_name = f"P{pos_idx:04d}"
+            if hasattr(f, 'experiment') and f.experiment:
+                try:
+                    loops = f.experiment
+                    for loop in loops:
+                        if hasattr(loop, 'parameters') and hasattr(loop.parameters, 'points'):
+                            pts = loop.parameters.points
+                            if pos_idx < len(pts):
+                                scene_name = pts[pos_idx].name or scene_name
+                except Exception:
+                    pass
+        else:
+            scene_name = "single"
 
-        out_path = out_dir / f"{inp.stem}_{scene}_Z{z_index:03d}.ome.tif"
+        ch_meta = [{"Name": n} for n in ch_names[:C]]
+
+        out_path = out_dir / f"{inp.stem}_{scene_name}_Z{z_index:03d}.ome.tif"
         tifffile.imwrite(
             str(out_path),
-            cyx,
+            plane,
             ome=True,
             imagej=False,
             photometric="minisblack",
@@ -77,23 +144,25 @@ def convert_nd2(input_path, output_dir, z_index=8):
             metadata={
                 "axes": "CYX",
                 "Channel": ch_meta,
-                "PhysicalSizeX": float(px.X) if px.X else None,
-                "PhysicalSizeY": float(px.Y) if px.Y else None,
+                "PhysicalSizeX": float(px_x) if px_x else None,
+                "PhysicalSizeY": float(px_y) if px_y else None,
                 "PhysicalSizeXUnit": "micrometer",
                 "PhysicalSizeYUnit": "micrometer",
             },
         )
         exported += 1
-        if (i + 1) % 10 == 0 or (i + 1) == n_scenes:
-            print(f"  Processed {i + 1}/{n_scenes} scenes")
+        if (pos_idx + 1) % 10 == 0 or (pos_idx + 1) == n_positions:
+            print(f"  Processed {pos_idx + 1}/{n_positions} positions")
+
+    f.close()
 
     elapsed = time.perf_counter() - t0
-    print(f"Exported {exported}/{n_scenes} scene(s) in {elapsed:.1f}s -> {out_dir}")
+    print(f"Exported {exported}/{n_positions} position(s) in {elapsed:.1f}s -> {out_dir}")
 
     # Quick verification on first exported file
-    first = out_dir / f"{inp.stem}_{img.scenes[0]}_Z{z_index:03d}.ome.tif"
-    if first.exists():
-        with tifffile.TiffFile(str(first)) as tf:
+    first_files = sorted(out_dir.glob(f"{inp.stem}_*_Z{z_index:03d}.ome.tif"))
+    if first_files:
+        with tifffile.TiffFile(str(first_files[0])) as tf:
             print(f"  Verification: axes={tf.series[0].axes}, shape={tf.series[0].shape}")
 
 

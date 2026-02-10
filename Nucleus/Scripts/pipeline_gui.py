@@ -218,7 +218,7 @@ class Step1Frame(ttk.LabelFrame):
                 self.log("[DONE] ND2 conversion complete.")
             except ImportError as exc:
                 self.log(f"[ERROR] Missing dependency: {exc}")
-                self.log("  Install with: pip install aicsimageio")
+                self.log("  Install with: python -m pip install nd2 tifffile numpy")
             except Exception as exc:
                 import traceback
                 self.log(f"[ERROR] {exc}")
