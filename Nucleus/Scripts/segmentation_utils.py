@@ -203,6 +203,112 @@ def postprocess_mask(masks, min_size=0, remove_edges=False):
 
 
 # ------------------------------------------------------------------ #
+#  Cytoplasm mask via subtraction
+# ------------------------------------------------------------------ #
+
+def compute_cytoplasm_mask(cell_mask, nuc_mask, nuc_dilate_px=0,
+                           min_nuc_pixels=10, min_overlap_frac=0.005):
+    """
+    Derive a cytoplasm-only label mask by subtracting nucleus from whole-cell.
+
+    Parameters
+    ----------
+    cell_mask : np.ndarray (Y, X)
+        Whole-cell label mask (from Cellpose cyto3).
+    nuc_mask : np.ndarray (Y, X)
+        Nucleus label mask.
+    nuc_dilate_px : int
+        Pixels to dilate the nucleus before subtraction (default 0).
+    min_nuc_pixels : int
+        Minimum nucleus pixels overlapping a cell to keep it (default 10).
+    min_overlap_frac : float
+        Minimum fraction of cell area that must overlap with nucleus
+        to keep the cell (default 0.005 = 0.5%).
+
+    Returns
+    -------
+    cyto_labels : np.ndarray (Y, X)
+        Cytoplasm-only label mask (consecutively labelled).
+    kept_labels : list[int]
+        Original cell labels that were kept.
+    orphan_labels : list[int]
+        Original cell labels removed (insufficient nuclear overlap).
+    """
+    cell = cell_mask.astype(np.int32, copy=True)
+    nuc_binary = nuc_mask > 0
+
+    # Optional nucleus dilation
+    if nuc_dilate_px > 0:
+        se = morphology.disk(nuc_dilate_px)
+        nuc_binary = morphology.dilation(nuc_binary, se)
+
+    # Subtract nucleus region from whole-cell mask
+    cyto = cell.copy()
+    cyto[nuc_binary] = 0
+
+    # Filter out cells without sufficient nuclear overlap
+    unique_labels = np.unique(cell)
+    unique_labels = unique_labels[unique_labels != 0]
+
+    kept, orphans = [], []
+    for lab in unique_labels:
+        cell_pixels = cell == lab
+        n_cell = int(cell_pixels.sum())
+        if n_cell == 0:
+            continue
+        n_overlap = int(np.logical_and(cell_pixels, nuc_mask > 0).sum())
+        frac = n_overlap / n_cell
+        if n_overlap >= min_nuc_pixels and frac >= min_overlap_frac:
+            kept.append(int(lab))
+        else:
+            orphans.append(int(lab))
+            cyto[cell == lab] = 0
+
+    # Relabel consecutively
+    cyto_labels, _, _ = relabel_sequential(cyto)
+    return cyto_labels.astype(np.int32), kept, orphans
+
+
+def save_cytoplasm_triptych(img_norm, cell_mask, nuc_mask, cyto_mask, out_path):
+    """
+    Save a 4-panel QC image for cytoplasm extraction:
+      [0] Image (LUT-normalized)
+      [1] Whole-cell mask
+      [2] Nucleus mask
+      [3] Cytoplasm-only mask
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    cmap = plt.cm.get_cmap("tab20").copy()
+    cmap.set_bad(color="black")
+
+    axes[0].imshow(img_norm, cmap="gray")
+    axes[0].set_title("Image (LUT)")
+    axes[0].axis("off")
+
+    cell_m = np.ma.masked_where(cell_mask == 0, cell_mask)
+    axes[1].imshow(cell_m, cmap=cmap)
+    axes[1].set_title("Whole-cell mask")
+    axes[1].axis("off")
+
+    nuc_m = np.ma.masked_where(nuc_mask == 0, nuc_mask)
+    axes[2].imshow(nuc_m, cmap=cmap)
+    axes[2].set_title("Nucleus mask")
+    axes[2].axis("off")
+
+    cyto_m = np.ma.masked_where(cyto_mask == 0, cyto_mask)
+    axes[3].imshow(cyto_m, cmap=cmap)
+    axes[3].set_title("Cytoplasm only")
+    axes[3].axis("off")
+
+    plt.tight_layout()
+    fig.savefig(str(out_path), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+# ------------------------------------------------------------------ #
 #  Cellpose runner
 # ------------------------------------------------------------------ #
 
