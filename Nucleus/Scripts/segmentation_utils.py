@@ -404,7 +404,10 @@ def run_cellpose(img2d, model, diameter=None, batch_size=1, normalize=True):
     if "channels" in eval_params:
         kwargs["channels"] = [0, 0]
 
-    masks, _flows, _styles, _diams = model.eval(img2d, **kwargs)
+    # Cellpose 4 returns 3 values (masks, flows, styles);
+    # Cellpose 3 returns 4 values (masks, flows, styles, diams).
+    result = model.eval(img2d, **kwargs)
+    masks = result[0]
     return masks
 
 
