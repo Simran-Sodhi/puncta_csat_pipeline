@@ -42,6 +42,7 @@ from segmentation_utils import (
     auto_lut_clip,
     normalize_dic,
     ensure_2d,
+    load_cellpose_model,
     run_cellpose,
     postprocess_mask,
     save_mask,
@@ -50,7 +51,6 @@ from segmentation_utils import (
     collect_image_paths,
     compute_cytoplasm_mask,
 )
-from cellpose import models
 import numpy as np
 import tifffile as tiff
 import re
@@ -245,7 +245,7 @@ def main():
         print(f"  nuc_mask_dir={args.nuc_mask_dir}, nuc_dilate_px={args.nuc_dilate_px}, "
               f"min_nuc_pixels={args.min_nuc_pixels}, min_overlap_frac={args.min_overlap_frac}")
 
-    model = models.Cellpose(gpu=args.gpu, model_type="cyto3")
+    model = load_cellpose_model(gpu=args.gpu, model_type="cyto3")
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)

@@ -345,6 +345,37 @@ def save_cytoplasm_triptych(img_norm, cell_mask, nuc_mask, cyto_mask, out_path):
 
 
 # ------------------------------------------------------------------ #
+#  Cellpose model loader
+# ------------------------------------------------------------------ #
+
+def load_cellpose_model(gpu=False, model_type="cyto3"):
+    """
+    Load a Cellpose model, compatible with both Cellpose 3 and 4.
+
+    Cellpose 4 removed ``models.Cellpose`` and uses
+    ``models.CellposeModel(pretrained_model=...)`` instead.
+    """
+    from cellpose import models
+
+    # Cellpose 4+: use CellposeModel with pretrained_model
+    if hasattr(models, "CellposeModel"):
+        try:
+            return models.CellposeModel(gpu=gpu, pretrained_model=model_type)
+        except TypeError:
+            # Fallback: older CellposeModel signature
+            return models.CellposeModel(gpu=gpu, model_type=model_type)
+
+    # Cellpose 3: use Cellpose class
+    if hasattr(models, "Cellpose"):
+        return models.Cellpose(gpu=gpu, model_type=model_type)
+
+    raise ImportError(
+        "Cannot find Cellpose model class. "
+        "Please install cellpose >= 3.0: pip install cellpose"
+    )
+
+
+# ------------------------------------------------------------------ #
 #  Cellpose runner
 # ------------------------------------------------------------------ #
 
@@ -352,6 +383,7 @@ def run_cellpose(img2d, model, diameter=None, batch_size=1, normalize=True):
     """
     Run a pre-initialised Cellpose model on a 2D image.
 
+    Compatible with Cellpose 3 (channels param) and 4 (no channels).
     Returns the label mask (Y, X).
     """
     if img2d.ndim == 3 and img2d.shape[-1] == 1:
@@ -359,13 +391,20 @@ def run_cellpose(img2d, model, diameter=None, batch_size=1, normalize=True):
     if img2d.ndim != 2:
         raise ValueError(f"Expected 2D image, got shape {img2d.shape}")
 
-    masks, _flows, _styles, _diams = model.eval(
-        img2d,
+    # Cellpose 4 removed the channels parameter
+    import inspect
+    eval_params = inspect.signature(model.eval).parameters
+
+    kwargs = dict(
         diameter=diameter,
-        channels=[0, 0],
         batch_size=batch_size,
         normalize=normalize,
     )
+    # Only pass channels if the model.eval() accepts it (Cellpose 3)
+    if "channels" in eval_params:
+        kwargs["channels"] = [0, 0]
+
+    masks, _flows, _styles, _diams = model.eval(img2d, **kwargs)
     return masks
 
 

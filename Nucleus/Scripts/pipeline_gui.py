@@ -468,13 +468,13 @@ class Step2Frame(ttk.LabelFrame):
                 from segmentation_utils import (
                     load_image_2d, auto_lut_clip, normalize_dic,
                     ensure_2d,
-                    run_cellpose, postprocess_mask,
+                    load_cellpose_model, run_cellpose,
+                    postprocess_mask,
                     save_mask, save_triptych,
                     save_cytoplasm_triptych,
                     collect_image_paths,
                     compute_cytoplasm_mask,
                 )
-                from cellpose import models
                 import numpy as np
                 import tifffile as tiff
                 import re
@@ -485,7 +485,7 @@ class Step2Frame(ttk.LabelFrame):
                     return
 
                 self.log(f"Found {len(image_paths)} image(s). Loading model...")
-                model = models.Cellpose(gpu=gpu, model_type="cyto3")
+                model = load_cellpose_model(gpu=gpu, model_type="cyto3")
                 outdir = Path(out_dir)
                 outdir.mkdir(parents=True, exist_ok=True)
                 trip_dir = outdir / "triptychs"
