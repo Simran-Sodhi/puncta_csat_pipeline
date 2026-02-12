@@ -32,7 +32,7 @@ def process_folder(src: Path, dst: Path, dry_run: bool = False):
             continue
         name = p.name
         # Accept common OME-TIFF extensions
-        if not name.lower().endswith(('.ome.tif', '.ome.tiff','.ome.tifs')):
+        if not name.lower().endswith(('.tif', '.tiff', '.ome.tif', '.ome.tiff')):
             continue
         if is_target_z(name):
             rel = p.relative_to(src)

@@ -29,27 +29,40 @@ for i, s in enumerate(img.scenes):
         if z != 5:
             continue
         cyx = data[:, z, :, :]                   # shape (C, Y, X)
-        # slice channel names to the actual C we’re writing
-        ch_this = [{"Name": n} for n in ch[:cyx.shape[0]]]
+        ch_this = ch[:cyx.shape[0]]
 
-        out_2d = out_dir_2d / f"{inp.stem}_{s}_Z{z:03d}.ome.tif"
+        # Build description with channel and resolution info
+        desc_lines = [
+            f"axes=CYX",
+            f"channels={','.join(ch_this)}",
+        ]
+        if px.X:
+            desc_lines.append(f"PhysicalSizeX={float(px.X):.6f}")
+        if px.Y:
+            desc_lines.append(f"PhysicalSizeY={float(px.Y):.6f}")
+        desc_lines.append("PhysicalSizeUnit=micrometer")
+        description = "\n".join(desc_lines)
+
+        # Build resolution kwargs
+        resolution_kwargs = {}
+        if px.X and px.Y:
+            # TIFF resolution unit 3 = CENTIMETER; store pixels per cm
+            resolution_kwargs["resolution"] = (1e4 / float(px.X), 1e4 / float(px.Y))
+            resolution_kwargs["resolutionunit"] = 3
+
+        out_2d = out_dir_2d / f"{inp.stem}_{s}_Z{z:03d}.tif"
         tifffile.imwrite(
             out_2d,
             cyx,
-            ome=True,
-            imagej=False,
+            imagej=True,
             photometric="minisblack",
             compression="deflate",
             bigtiff=True,
             metadata={
-                "axes": "CYX",                          # matches (C,Y,X)
-                "Channel": ch_this,                     # length == C
-                "PhysicalSizeX": float(px.X) if px.X else None,
-                "PhysicalSizeY": float(px.Y) if px.Y else None,
-                "PhysicalSizeXUnit": "micrometer",
-                "PhysicalSizeYUnit": "micrometer",
-                # NOTE: no Plane[], no PhysicalSizeZ for CYX files  ### IMPORTANT
+                "axes": "CYX",
             },
+            description=description,
+            **resolution_kwargs,
         )
 
 elapsed = time.perf_counter() - t0
@@ -57,7 +70,11 @@ print(f"Exported {len(img.scenes)} scene(s) in {elapsed:.2f}s")
 
 # ------------- QUICK VERIFICATION -------------
 from tifffile import TiffFile
-p_2d = out_dir_2d / f"{inp.stem}_{img.scenes[0]}_Z005.ome.tif"
+p_2d = out_dir_2d / f"{inp.stem}_{img.scenes[0]}_Z005.tif"
 with TiffFile(str(p_2d)) as tf:
     print("2D axes:", tf.series[0].axes)    # CYX
     print("2D shape:", tf.series[0].shape)  # (C, Y, X)
+    page = tf.pages[0]
+    if "XResolution" in page.tags:
+        xr = page.tags["XResolution"].value
+        print(f"XResolution tag: {xr[0]}/{xr[1]} pixels/cm")
