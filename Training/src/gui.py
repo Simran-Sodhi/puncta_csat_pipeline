@@ -8,14 +8,14 @@ Provides tabs for:
   -- Analysis Workflow --
   1. ND2 Conversion   — Convert ND2 files to OME-TIFF
   2. Segmentation     — Run Cellpose (nucleus / puncta / cell / cytoplasm)
+                        with model selection, channel & normalization controls
   3. Analysis         — Per-cell intensity & puncta analysis
 
   -- Training Workflow --
-  4. Preprocessing    — Generate draft masks for training data
-  5. File Renaming    — Rename images/masks to pipeline convention
-  6. Configuration    — Edit training parameters from YAML configs
-  7. Training         — Launch and monitor model training
-  8. Evaluation       — Run inference and view results
+  4. File Renaming    — Rename images/masks to pipeline convention
+  5. Configuration    — Edit training parameters from YAML configs
+  6. Training         — Launch and monitor model training
+  7. Evaluation       — Run inference and view results
 """
 
 import logging
@@ -123,7 +123,6 @@ class SegmentationGUI(tk.Tk):
         self.tab_analysis = ttk.Frame(self.notebook)
 
         # -- Training workflow tabs --
-        self.tab_preprocess = ttk.Frame(self.notebook)
         self.tab_rename = ttk.Frame(self.notebook)
         self.tab_config = ttk.Frame(self.notebook)
         self.tab_train = ttk.Frame(self.notebook)
@@ -132,7 +131,6 @@ class SegmentationGUI(tk.Tk):
         self.notebook.add(self.tab_nd2, text="  ND2 Conversion  ")
         self.notebook.add(self.tab_segmentation, text="  Segmentation  ")
         self.notebook.add(self.tab_analysis, text="  Analysis  ")
-        self.notebook.add(self.tab_preprocess, text="  Preprocessing  ")
         self.notebook.add(self.tab_rename, text="  File Renaming  ")
         self.notebook.add(self.tab_config, text="  Configuration  ")
         self.notebook.add(self.tab_train, text="  Training  ")
@@ -141,7 +139,6 @@ class SegmentationGUI(tk.Tk):
         self._build_nd2_tab()
         self._build_segmentation_tab()
         self._build_analysis_tab()
-        self._build_preprocess_tab()
         self._build_rename_tab()
         self._build_config_tab()
         self._build_train_tab()
@@ -263,23 +260,57 @@ class SegmentationGUI(tk.Tk):
             self._nd2_log_append("[DONE] ND2 conversion complete.")
 
     # ==================================================================
-    # TAB: SEGMENTATION (nucleus / puncta / cell / cytoplasm)
+    # TAB: SEGMENTATION (unified: nucleus / puncta / cell / cytoplasm)
+    #   Merges old Segmentation + Preprocessing into one tab with:
+    #   - Mode presets (cell/nucleus/puncta/cytoplasm)
+    #   - Model selector (cpsam / custom / BioImage.io)
+    #   - Channel & normalization settings
+    #   - Cellpose parameters (diameter, flow, cellprob)
+    #   - Cytoplasm subtraction options
+    #   - Progress, results table, log
     # ==================================================================
     def _build_segmentation_tab(self):
         tab = self.tab_segmentation
 
+        # Use a canvas + scrollbar so the tab is scrollable
+        canvas = tk.Canvas(tab, highlightthickness=0)
+        sb = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=canvas.yview)
+        self.seg_body = ttk.Frame(canvas)
+        self.seg_body.bind(
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=self.seg_body, anchor=tk.NW)
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Mouse-wheel scrolling
+        def _on_scroll(event):
+            if event.num == 4:
+                canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                canvas.yview_scroll(1, "units")
+            else:
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_scroll)
+        canvas.bind_all("<Button-4>", _on_scroll)
+        canvas.bind_all("<Button-5>", _on_scroll)
+
+        body = self.seg_body
+
         ch_info = ttk.Label(
-            tab,
-            text="Channels:  0 = DIC (bright-field)    1 = GFP (puncta)    2 = mScarlet (nucleus)",
+            body,
+            text="Channels:  0 = DIC (bright-field)    1 = GFP/mEGFP (puncta)    "
+                 "2 = mScarlet (nucleus)    3 = miRFPnano3",
             foreground="gray",
         )
         ch_info.pack(anchor=tk.W, padx=10, pady=(10, 5))
 
-        # Input / Output
-        io_frame = ttk.LabelFrame(tab, text="Input / Output", padding=10)
+        # ---- Input / Output ----
+        io_frame = ttk.LabelFrame(body, text="Input / Output", padding=10)
         io_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        ttk.Label(io_frame, text="Input Images (folder):").grid(row=0, column=0, sticky=tk.W, pady=2)
+        ttk.Label(io_frame, text="Image Directory:").grid(row=0, column=0, sticky=tk.W, pady=2)
         self.seg_input_dir = tk.StringVar()
         ttk.Entry(io_frame, textvariable=self.seg_input_dir, width=55).grid(
             row=0, column=1, padx=5, pady=2
@@ -297,8 +328,8 @@ class SegmentationGUI(tk.Tk):
             row=1, column=2, pady=2
         )
 
-        # Mode selector
-        mode_frame = ttk.LabelFrame(tab, text="Segmentation Mode", padding=10)
+        # ---- Mode selector ----
+        mode_frame = ttk.LabelFrame(body, text="Segmentation Mode", padding=10)
         mode_frame.pack(fill=tk.X, padx=10, pady=5)
 
         self.seg_mode_var = tk.StringVar(value="cell")
@@ -309,26 +340,120 @@ class SegmentationGUI(tk.Tk):
             ttk.Radiobutton(modes_row, text=label, variable=self.seg_mode_var,
                             value=val, command=self._seg_on_mode_change).pack(side=tk.LEFT, padx=8)
 
-        # Parameters
-        param_frame = ttk.LabelFrame(tab, text="Parameters", padding=10)
-        param_frame.pack(fill=tk.X, padx=10, pady=5)
+        # ---- Channel & Normalization ----
+        norm_frame = ttk.LabelFrame(body, text="Channel & Normalization", padding=10)
+        norm_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        row0 = ttk.Frame(param_frame)
+        # Segment channel with label
+        ttk.Label(norm_frame, text="Segment Channel:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.seg_channel = tk.IntVar(value=0)
+        seg_combo = ttk.Combobox(
+            norm_frame, textvariable=self.seg_channel, values=[0, 1, 2, 3],
+            width=5, state="readonly",
+        )
+        seg_combo.grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
+        self.seg_ch_label = tk.StringVar(value="DIC")
+        ttk.Label(norm_frame, textvariable=self.seg_ch_label, foreground="gray").grid(
+            row=0, column=2, sticky=tk.W, padx=5
+        )
+        seg_combo.bind("<<ComboboxSelected>>", self._seg_update_channel_labels)
+
+        # Nuclear channel (for dual-channel input)
+        ttk.Label(norm_frame, text="Nuclear Channel:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.seg_nuc_channel = tk.IntVar(value=0)
+        nuc_combo = ttk.Combobox(
+            norm_frame, textvariable=self.seg_nuc_channel, values=[0, 1, 2, 3],
+            width=5, state="readonly",
+        )
+        nuc_combo.grid(row=1, column=1, padx=5, pady=2, sticky=tk.W)
+        self.seg_nuc_label = tk.StringVar(value="None (grayscale)")
+        ttk.Label(norm_frame, textvariable=self.seg_nuc_label, foreground="gray").grid(
+            row=1, column=2, sticky=tk.W, padx=5
+        )
+        nuc_combo.bind("<<ComboboxSelected>>", self._seg_update_channel_labels)
+
+        # Percentile range
+        ttk.Label(norm_frame, text="Normalization Percentile:").grid(row=2, column=0, sticky=tk.W, pady=2)
+        pct_frame = ttk.Frame(norm_frame)
+        pct_frame.grid(row=2, column=1, columnspan=2, sticky=tk.W, padx=5)
+        ttk.Label(pct_frame, text="Low:").pack(side=tk.LEFT)
+        self.seg_lower_pct = tk.DoubleVar(value=1.0)
+        ttk.Entry(pct_frame, textvariable=self.seg_lower_pct, width=6).pack(side=tk.LEFT, padx=(2, 10))
+        ttk.Label(pct_frame, text="High:").pack(side=tk.LEFT)
+        self.seg_upper_pct = tk.DoubleVar(value=99.0)
+        ttk.Entry(pct_frame, textvariable=self.seg_upper_pct, width=6).pack(side=tk.LEFT, padx=2)
+
+        # DIC tile blocksize
+        ttk.Label(norm_frame, text="DIC Tile Blocksize:").grid(row=3, column=0, sticky=tk.W, pady=2)
+        self.seg_tile_bs = tk.IntVar(value=128)
+        ttk.Entry(norm_frame, textvariable=self.seg_tile_bs, width=8).grid(
+            row=3, column=1, padx=5, pady=2, sticky=tk.W
+        )
+        ttk.Label(norm_frame, text="(0 = global, >0 = tile-based for uneven illumination)",
+                  foreground="gray").grid(row=3, column=2, sticky=tk.W, padx=5)
+
+        # Z-slice
+        ttk.Label(norm_frame, text="Z-Slice:").grid(row=4, column=0, sticky=tk.W, pady=2)
+        z_frame = ttk.Frame(norm_frame)
+        z_frame.grid(row=4, column=1, columnspan=2, sticky=tk.W, padx=5)
+        self.seg_z_idx = tk.StringVar(value="0")
+        ttk.Entry(z_frame, textvariable=self.seg_z_idx, width=6).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(z_frame, text="(0-indexed)", foreground="gray").pack(side=tk.LEFT)
+
+        # Invert DIC + DIC normalization checkboxes
+        chk_frame = ttk.Frame(norm_frame)
+        chk_frame.grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=2)
+
+        self.seg_dic_norm_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(chk_frame, text="DIC normalization (CLAHE)",
+                        variable=self.seg_dic_norm_var).pack(side=tk.LEFT, padx=(0, 15))
+
+        self.seg_invert_dic = tk.BooleanVar(value=False)
+        ttk.Checkbutton(chk_frame, text="Invert DIC (cells dark on bright background)",
+                        variable=self.seg_invert_dic).pack(side=tk.LEFT)
+
+        # ---- Model Selection ----
+        model_frame = ttk.LabelFrame(body, text="Model", padding=10)
+        model_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(model_frame, text="Model:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.seg_model_var = tk.StringVar(value="cyto3 (default)")
+        seg_model_combo = ttk.Combobox(
+            model_frame, textvariable=self.seg_model_var,
+            values=["cyto3 (default)", "cpsam", "Custom model...", "BioImage.io model..."],
+            width=22, state="readonly",
+        )
+        seg_model_combo.grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
+        seg_model_combo.bind("<<ComboboxSelected>>", self._seg_on_model_changed)
+
+        self.seg_custom_model = tk.StringVar()
+        self.seg_model_entry = ttk.Entry(model_frame, textvariable=self.seg_custom_model, width=35)
+        self.seg_model_entry.grid(row=0, column=2, padx=5, pady=2)
+        self.seg_model_entry.config(state=tk.DISABLED)
+        self.seg_model_btn = ttk.Button(model_frame, text="Browse...", command=self._seg_browse_model)
+        self.seg_model_btn.grid(row=0, column=3, pady=2)
+        self.seg_model_btn.config(state=tk.DISABLED)
+
+        # ---- Cellpose Parameters ----
+        cp_frame = ttk.LabelFrame(body, text="Cellpose Parameters", padding=10)
+        cp_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        row0 = ttk.Frame(cp_frame)
         row0.pack(fill=tk.X, pady=2)
 
         ttk.Label(row0, text="Diameter (px):").pack(side=tk.LEFT, padx=(0, 5))
-        self.seg_diameter = tk.StringVar(value="0")
+        self.seg_diameter = tk.StringVar(value="auto")
         ttk.Entry(row0, textvariable=self.seg_diameter, width=8).pack(side=tk.LEFT, padx=(0, 15))
 
-        ttk.Label(row0, text="Channel:").pack(side=tk.LEFT, padx=(0, 5))
-        self.seg_channel = tk.IntVar(value=0)
-        ttk.Entry(row0, textvariable=self.seg_channel, width=5).pack(side=tk.LEFT, padx=(0, 15))
+        ttk.Label(row0, text="Flow Threshold:").pack(side=tk.LEFT, padx=(0, 5))
+        self.seg_flow_thr = tk.DoubleVar(value=0.4)
+        ttk.Entry(row0, textvariable=self.seg_flow_thr, width=8).pack(side=tk.LEFT, padx=(0, 15))
 
-        ttk.Label(row0, text="Z-index:").pack(side=tk.LEFT, padx=(0, 5))
-        self.seg_z_idx = tk.IntVar(value=0)
-        ttk.Entry(row0, textvariable=self.seg_z_idx, width=5).pack(side=tk.LEFT)
+        ttk.Label(row0, text="Cell Prob Threshold:").pack(side=tk.LEFT, padx=(0, 5))
+        self.seg_cellprob_thr = tk.DoubleVar(value=0.0)
+        ttk.Entry(row0, textvariable=self.seg_cellprob_thr, width=8).pack(side=tk.LEFT)
 
-        row1 = ttk.Frame(param_frame)
+        row1 = ttk.Frame(cp_frame)
         row1.pack(fill=tk.X, pady=2)
 
         ttk.Label(row1, text="Min object size (px):").pack(side=tk.LEFT, padx=(0, 5))
@@ -341,11 +466,8 @@ class SegmentationGUI(tk.Tk):
         self.seg_edges_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row1, text="Remove edge objects", variable=self.seg_edges_var).pack(side=tk.LEFT, padx=8)
 
-        self.seg_dic_norm_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row1, text="DIC normalization (CLAHE)", variable=self.seg_dic_norm_var).pack(side=tk.LEFT, padx=8)
-
-        # Cytoplasm-specific options (shown/hidden)
-        self.seg_cyto_frame = ttk.LabelFrame(tab, text="Cytoplasm Options (cell - nucleus = cytoplasm)", padding=10)
+        # ---- Cytoplasm-specific options (shown/hidden) ----
+        self.seg_cyto_frame = ttk.LabelFrame(body, text="Cytoplasm Options (cell - nucleus = cytoplasm)", padding=10)
 
         ttk.Label(self.seg_cyto_frame, text="Nucleus Masks Folder:").grid(row=0, column=0, sticky=tk.W, pady=2)
         self.seg_nuc_mask_dir = tk.StringVar()
@@ -370,31 +492,74 @@ class SegmentationGUI(tk.Tk):
         self.seg_min_overlap_frac = tk.DoubleVar(value=0.005)
         ttk.Entry(cyto_params, textvariable=self.seg_min_overlap_frac, width=8).pack(side=tk.LEFT)
 
-        # Run button
-        btn_frame = ttk.Frame(tab)
+        # ---- Buttons ----
+        btn_frame = ttk.Frame(body)
         btn_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Button(btn_frame, text="Preview Channels", command=self._seg_preview_channels).pack(
+            side=tk.LEFT, padx=5
+        )
+        ttk.Button(btn_frame, text="Expand ND2 Positions", command=self._seg_expand_nd2).pack(
+            side=tk.LEFT, padx=5
+        )
         self.btn_seg_run = ttk.Button(btn_frame, text="Run Segmentation", command=self._seg_run)
         self.btn_seg_run.pack(side=tk.LEFT, padx=5)
 
+        # Progress
+        self.seg_progress = ttk.Progressbar(body, mode="determinate")
+        self.seg_progress.pack(fill=tk.X, padx=10, pady=5)
+
         self.seg_status = tk.StringVar(value="Ready")
-        ttk.Label(tab, textvariable=self.seg_status).pack(padx=10, anchor=tk.W)
+        ttk.Label(body, textvariable=self.seg_status).pack(padx=10, anchor=tk.W)
+
+        # Results table
+        result_frame = ttk.LabelFrame(body, text="Results", padding=5)
+        result_frame.pack(fill=tk.X, padx=10, pady=(5, 5))
+
+        columns = ("filename", "objects", "status")
+        self.seg_tree = ttk.Treeview(
+            result_frame, columns=columns, show="headings", height=6
+        )
+        self.seg_tree.heading("filename", text="Filename")
+        self.seg_tree.heading("objects", text="Objects Found")
+        self.seg_tree.heading("status", text="Status")
+        self.seg_tree.column("filename", width=350)
+        self.seg_tree.column("objects", width=120, anchor=tk.CENTER)
+        self.seg_tree.column("status", width=120, anchor=tk.CENTER)
+
+        seg_tree_scroll = ttk.Scrollbar(result_frame, orient=tk.VERTICAL, command=self.seg_tree.yview)
+        self.seg_tree.configure(yscrollcommand=seg_tree_scroll.set)
+        self.seg_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        seg_tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
         # Log
-        log_frame = ttk.LabelFrame(tab, text="Log", padding=5)
-        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
+        log_frame = ttk.LabelFrame(body, text="Log", padding=5)
+        log_frame.pack(fill=tk.X, padx=10, pady=(5, 10))
         self.seg_log = scrolledtext.ScrolledText(
-            log_frame, wrap=tk.WORD, height=10, state=tk.DISABLED, font=("Courier", 9)
+            log_frame, wrap=tk.WORD, height=8, state=tk.DISABLED, font=("Courier", 9)
         )
         self.seg_log.pack(fill=tk.BOTH, expand=True)
 
         # Apply initial mode presets
         self._seg_on_mode_change()
 
+    _CHANNEL_NAMES = {0: "DIC", 1: "mEGFP", 2: "mScarlet", 3: "miRFPnano3"}
+
+    def _seg_update_channel_labels(self, event=None):
+        seg = self.seg_channel.get()
+        nuc = self.seg_nuc_channel.get()
+        self.seg_ch_label.set(self._CHANNEL_NAMES.get(seg, f"Channel {seg}"))
+        if nuc == 0:
+            self.seg_nuc_label.set("None (grayscale)")
+        else:
+            self.seg_nuc_label.set(self._CHANNEL_NAMES.get(nuc, f"Channel {nuc}"))
+
     def _seg_on_mode_change(self):
         mode = self.seg_mode_var.get()
         if mode == "cell":
-            self.seg_diameter.set("0")
+            self.seg_diameter.set("auto")
             self.seg_channel.set(0)
+            self.seg_nuc_channel.set(0)
             self.seg_min_size.set(50000)
             self.seg_edges_var.set(True)
             self.seg_dic_norm_var.set(True)
@@ -402,6 +567,7 @@ class SegmentationGUI(tk.Tk):
         elif mode == "nucleus":
             self.seg_diameter.set("200")
             self.seg_channel.set(2)
+            self.seg_nuc_channel.set(0)
             self.seg_min_size.set(10000)
             self.seg_edges_var.set(True)
             self.seg_dic_norm_var.set(False)
@@ -409,23 +575,140 @@ class SegmentationGUI(tk.Tk):
         elif mode == "puncta":
             self.seg_diameter.set("20")
             self.seg_channel.set(1)
+            self.seg_nuc_channel.set(0)
             self.seg_min_size.set(0)
             self.seg_edges_var.set(False)
             self.seg_dic_norm_var.set(False)
             self.seg_cyto_frame.pack_forget()
         elif mode == "cytoplasm":
-            self.seg_diameter.set("0")
+            self.seg_diameter.set("auto")
             self.seg_channel.set(0)
+            self.seg_nuc_channel.set(0)
             self.seg_min_size.set(50000)
             self.seg_edges_var.set(True)
             self.seg_dic_norm_var.set(True)
             self.seg_cyto_frame.pack(fill=tk.X, padx=10, pady=5, before=self.btn_seg_run.master)
+        self._seg_update_channel_labels()
+
+    def _seg_on_model_changed(self, event=None):
+        choice = self.seg_model_var.get()
+        if choice in ("Custom model...", "BioImage.io model..."):
+            self.seg_model_entry.config(state=tk.NORMAL)
+            self.seg_model_btn.config(state=tk.NORMAL)
+            if choice == "BioImage.io model...":
+                self.seg_custom_model.set("bioimage.io:")
+            else:
+                self.seg_custom_model.set("")
+        else:
+            self.seg_model_entry.config(state=tk.DISABLED)
+            self.seg_model_btn.config(state=tk.DISABLED)
+            self.seg_custom_model.set("")
+
+    def _seg_browse_model(self):
+        if self.seg_model_var.get() == "BioImage.io model...":
+            path = filedialog.askopenfilename(
+                title="Select BioImage.io Model (rdf.yaml / .zip)",
+                initialdir=str(PROJECT_ROOT / "models"),
+                filetypes=[("BioImage.io", "*.yaml *.yml *.zip"), ("All", "*.*")],
+            )
+        else:
+            path = filedialog.askopenfilename(
+                title="Select Cellpose Model",
+                initialdir=str(PROJECT_ROOT / "models"),
+            )
+        if path:
+            self.seg_custom_model.set(path)
 
     def _seg_log_append(self, msg):
         self.seg_log.config(state=tk.NORMAL)
         self.seg_log.insert(tk.END, msg + "\n")
         self.seg_log.see(tk.END)
         self.seg_log.config(state=tk.DISABLED)
+
+    def _seg_log_append_q(self, msg):
+        """Thread-safe log append via queue."""
+        self.log_queue.put(f"__SEG_LOG__{msg}")
+
+    def _seg_preview_channels(self):
+        """Save and open a channel preview for the first image."""
+        img_dir = self.seg_input_dir.get()
+        if not img_dir:
+            messagebox.showwarning("Missing", "Select an image directory first.")
+            return
+
+        from preprocess import save_channel_preview
+        import glob as _glob
+
+        extensions = ("*.tif", "*.tiff", "*.png", "*.jpg", "*.nd2")
+        files = []
+        for ext in extensions:
+            files.extend(_glob.glob(os.path.join(img_dir, ext)))
+        files = sorted(files)
+
+        if not files:
+            messagebox.showinfo("Empty", "No images found in the directory.")
+            return
+
+        preview_dir = str(PROJECT_ROOT / "results" / "channel_previews")
+        z_val = self.seg_z_idx.get().strip()
+        z_slice = int(z_val) if z_val else None
+
+        try:
+            path = save_channel_preview(
+                files[0], preview_dir,
+                lower_percentile=self.seg_lower_pct.get(),
+                upper_percentile=self.seg_upper_pct.get(),
+                tile_blocksize_dic=self.seg_tile_bs.get(),
+                z_slice=z_slice,
+            )
+            self.seg_status.set(f"Channel preview saved: {path}")
+            messagebox.showinfo(
+                "Preview Saved",
+                f"Channel preview for {Path(files[0]).name} saved to:\n{path}\n\n"
+                "Open this file to inspect channel quality and normalization.",
+            )
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to generate preview:\n{e}")
+
+    def _seg_expand_nd2(self):
+        """Expand multi-position .nd2 files in the image directory into TIFFs."""
+        img_dir = self.seg_input_dir.get()
+        if not img_dir:
+            messagebox.showwarning("Missing", "Select an image directory first.")
+            return
+
+        import glob as _glob
+        nd2_files = sorted(_glob.glob(os.path.join(img_dir, "*.nd2")))
+        if not nd2_files:
+            messagebox.showinfo("No ND2", "No .nd2 files found in the directory.")
+            return
+
+        from data_preparation import expand_nd2_positions, get_nd2_info
+
+        output_dir = os.path.join(img_dir, "_nd2_expanded")
+        total_saved = []
+        multi_pos_count = 0
+
+        for nd2_file in nd2_files:
+            try:
+                info = get_nd2_info(nd2_file)
+                n_pos = info["n_positions"]
+                if n_pos > 1:
+                    multi_pos_count += 1
+                    logger.info(f"Expanding {Path(nd2_file).name}: {n_pos} positions")
+                saved = expand_nd2_positions(nd2_file, output_dir)
+                total_saved.extend(saved)
+            except Exception as e:
+                logger.error(f"Failed to expand {Path(nd2_file).name}: {e}")
+                messagebox.showerror("ND2 Error", f"Failed to expand {Path(nd2_file).name}:\n{e}")
+
+        if total_saved:
+            messagebox.showinfo(
+                "ND2 Expanded",
+                f"Processed {len(nd2_files)} ND2 file(s) ({multi_pos_count} multi-position).\n"
+                f"Saved {len(total_saved)} individual TIFFs to:\n{output_dir}",
+            )
+            self.seg_status.set(f"Expanded {len(nd2_files)} ND2 -> {len(total_saved)} TIFFs")
 
     @staticmethod
     def _find_nuc_mask(nuc_mask_dir, image_stem):
@@ -443,6 +726,15 @@ class SegmentationGUI(tk.Tk):
                     return p
         return None
 
+    def _seg_get_model_type(self):
+        """Return the model type/path string based on the model selector."""
+        choice = self.seg_model_var.get()
+        if choice == "cpsam":
+            return "cpsam"
+        if choice in ("Custom model...", "BioImage.io model..."):
+            return self.seg_custom_model.get() or "cyto3"
+        return "cyto3"
+
     def _seg_run(self):
         input_path = self.seg_input_dir.get()
         out_dir = self.seg_out_dir.get()
@@ -458,14 +750,16 @@ class SegmentationGUI(tk.Tk):
             return
 
         mode = self.seg_mode_var.get()
-        diam_str = self.seg_diameter.get().strip()
-        diameter = None if diam_str in ("0", "", "auto") else float(diam_str)
+        diam_str = self.seg_diameter.get().strip().lower()
+        diameter = None if diam_str in ("0", "", "auto", "none") else float(diam_str)
         channel = self.seg_channel.get()
-        z = self.seg_z_idx.get()
+        z_val = self.seg_z_idx.get().strip()
+        z = int(z_val) if z_val else 0
         min_sz = self.seg_min_size.get()
         gpu = self.seg_gpu_var.get()
         rm_edges = self.seg_edges_var.get()
         use_dic_norm = self.seg_dic_norm_var.get()
+        model_type = self._seg_get_model_type()
 
         is_cyto = mode == "cytoplasm"
         nuc_mask_dir = None
@@ -488,10 +782,12 @@ class SegmentationGUI(tk.Tk):
 
         norm_label = "DIC (CLAHE)" if use_dic_norm else "LUT"
         self._seg_log_append(
-            f"Segmentation ({mode}): diameter={diameter}, channel={channel}, "
-            f"z={z}, min_size={min_sz}, norm={norm_label}"
+            f"Segmentation ({mode}): model={model_type}, diameter={diameter}, "
+            f"channel={channel}, z={z}, min_size={min_sz}, norm={norm_label}"
         )
         self.btn_seg_run.config(state=tk.DISABLED)
+        self.seg_tree.delete(*self.seg_tree.get_children())
+        self.seg_progress.config(mode="determinate", value=0)
         self.seg_status.set(f"Running {mode} segmentation...")
 
         def task():
@@ -514,15 +810,20 @@ class SegmentationGUI(tk.Tk):
                     self.log_queue.put("__SEG_ERROR__No TIFF images found.")
                     return
 
-                self._seg_log_append_q(f"Found {len(image_paths)} image(s). Loading model...")
-                model = load_cellpose_model(gpu=gpu, model_type="cyto3")
+                self._seg_log_append_q(f"Found {len(image_paths)} image(s). Loading model ({model_type})...")
+                model = load_cellpose_model(gpu=gpu, model_type=model_type)
                 outdir = Path(out_dir)
                 outdir.mkdir(parents=True, exist_ok=True)
                 trip_dir = outdir / "triptychs"
                 trip_dir.mkdir(parents=True, exist_ok=True)
+                total = len(image_paths)
 
                 for i, img_path in enumerate(image_paths, 1):
-                    self._seg_log_append_q(f"  [{i}/{len(image_paths)}] {img_path.name}")
+                    self._seg_log_append_q(f"  [{i}/{total}] {img_path.name}")
+                    pct = int(100 * i / total)
+                    self.log_queue.put(f"__SEG_PROGRESS__{pct}")
+                    n_objects = -1
+
                     try:
                         img2d = load_image_2d(img_path, channel_index=channel, z_index=z)
                         if use_dic_norm:
@@ -532,6 +833,7 @@ class SegmentationGUI(tk.Tk):
 
                         masks = run_cellpose(img_norm, model=model, diameter=diameter)
                         masks = postprocess_mask(masks, min_size=min_sz, remove_edges=rm_edges)
+                        n_objects = int(masks.max())
                         stem = img_path.stem
 
                         if is_cyto:
@@ -540,34 +842,37 @@ class SegmentationGUI(tk.Tk):
                                 self._seg_log_append_q(f"    [WARN] No nucleus mask for {stem}")
                                 save_mask(masks, outdir / f"{stem}_cell_masks.tif")
                                 save_triptych(img_norm, masks, trip_dir / f"{stem}_cell_triptych.png")
-                                continue
-
-                            nuc_m = ensure_2d(tiff_io.imread(str(nuc_path)))
-                            if nuc_m.shape != masks.shape:
-                                self._seg_log_append_q(f"    [WARN] Shape mismatch, skipping cyto")
-                                save_mask(masks, outdir / f"{stem}_cell_masks.tif")
-                                continue
-
-                            cyto_mask, kept, orphans = compute_cytoplasm_mask(
-                                masks, nuc_m,
-                                nuc_dilate_px=nuc_dilate_px,
-                                min_nuc_pixels=min_nuc_pixels,
-                                min_overlap_frac=min_overlap_frac,
-                            )
-                            self._seg_log_append_q(
-                                f"    Kept {len(kept)} cells, removed {len(orphans)} orphans"
-                            )
-                            save_mask(masks, outdir / f"{stem}_cell_masks.tif")
-                            save_mask(cyto_mask, outdir / f"{stem}_cyto_masks.tif")
-                            save_cytoplasm_triptych(
-                                img_norm, masks, nuc_m, cyto_mask,
-                                trip_dir / f"{stem}_cyto_triptych.png"
-                            )
+                            else:
+                                nuc_m = ensure_2d(tiff_io.imread(str(nuc_path)))
+                                if nuc_m.shape != masks.shape:
+                                    self._seg_log_append_q(f"    [WARN] Shape mismatch, skipping cyto")
+                                    save_mask(masks, outdir / f"{stem}_cell_masks.tif")
+                                else:
+                                    cyto_mask, kept, orphans = compute_cytoplasm_mask(
+                                        masks, nuc_m,
+                                        nuc_dilate_px=nuc_dilate_px,
+                                        min_nuc_pixels=min_nuc_pixels,
+                                        min_overlap_frac=min_overlap_frac,
+                                    )
+                                    self._seg_log_append_q(
+                                        f"    Kept {len(kept)} cells, removed {len(orphans)} orphans"
+                                    )
+                                    save_mask(masks, outdir / f"{stem}_cell_masks.tif")
+                                    save_mask(cyto_mask, outdir / f"{stem}_cyto_masks.tif")
+                                    save_cytoplasm_triptych(
+                                        img_norm, masks, nuc_m, cyto_mask,
+                                        trip_dir / f"{stem}_cyto_triptych.png"
+                                    )
                         else:
                             save_mask(masks, outdir / f"{stem}_cyto3_masks.tif")
                             save_triptych(img_norm, masks, trip_dir / f"{stem}_triptych.png")
+
+                        status = "OK" if n_objects > 0 else "No signal"
                     except Exception as e:
                         self._seg_log_append_q(f"    [ERROR] {e}")
+                        status = "FAILED"
+
+                    self.log_queue.put(f"__SEG_RESULT__{img_path.name}||{n_objects}||{status}")
 
                 self.log_queue.put("__SEG_DONE__")
             except Exception as exc:
@@ -575,12 +880,9 @@ class SegmentationGUI(tk.Tk):
 
         threading.Thread(target=task, daemon=True).start()
 
-    def _seg_log_append_q(self, msg):
-        """Thread-safe log append via queue."""
-        self.log_queue.put(f"__SEG_LOG__{msg}")
-
     def _on_seg_finished(self, error=None):
         self.btn_seg_run.config(state=tk.NORMAL)
+        self.seg_progress.config(value=100)
         if error:
             self.seg_status.set(f"Error: {str(error)[:80]}")
             self._seg_log_append(f"[ERROR] {error}")
@@ -779,485 +1081,6 @@ class SegmentationGUI(tk.Tk):
         d = filedialog.askdirectory()
         if d:
             string_var.set(d)
-
-    # ==================================================================
-    # TAB: PREPROCESSING (draft masks)
-    # ==================================================================
-    def _build_preprocess_tab(self):
-        tab = self.tab_preprocess
-
-        # ---- Input / Output ----
-        io_frame = ttk.LabelFrame(tab, text="Directories", padding=10)
-        io_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
-
-        ttk.Label(io_frame, text="Image Directory:").grid(
-            row=0, column=0, sticky=tk.W, pady=2
-        )
-        self.pp_img_dir = tk.StringVar()
-        ttk.Entry(io_frame, textvariable=self.pp_img_dir, width=55).grid(
-            row=0, column=1, padx=5, pady=2
-        )
-        ttk.Button(io_frame, text="Browse...", command=self._pp_browse_img).grid(
-            row=0, column=2, pady=2
-        )
-
-        ttk.Label(io_frame, text="Mask Output Directory:").grid(
-            row=1, column=0, sticky=tk.W, pady=2
-        )
-        self.pp_out_dir = tk.StringVar(
-            value=str(PROJECT_ROOT / "data" / "draft_masks")
-        )
-        ttk.Entry(io_frame, textvariable=self.pp_out_dir, width=55).grid(
-            row=1, column=1, padx=5, pady=2
-        )
-        ttk.Button(io_frame, text="Browse...", command=self._pp_browse_out).grid(
-            row=1, column=2, pady=2
-        )
-
-        # ---- Channel & Normalization Settings ----
-        settings_frame = ttk.LabelFrame(tab, text="Channel & Normalization", padding=10)
-        settings_frame.pack(fill=tk.X, padx=10, pady=5)
-
-        # Segment channel
-        ttk.Label(settings_frame, text="Segment Channel:").grid(
-            row=0, column=0, sticky=tk.W, pady=2
-        )
-        self.pp_seg_channel = tk.IntVar(value=0)
-        seg_combo = ttk.Combobox(
-            settings_frame,
-            textvariable=self.pp_seg_channel,
-            values=[0, 1, 2, 3],
-            width=5,
-            state="readonly",
-        )
-        seg_combo.grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
-        self.pp_seg_label = tk.StringVar(value="DIC")
-        ttk.Label(settings_frame, textvariable=self.pp_seg_label, foreground="gray").grid(
-            row=0, column=2, sticky=tk.W, padx=5
-        )
-        seg_combo.bind("<<ComboboxSelected>>", self._pp_update_channel_labels)
-
-        # Nuclear channel
-        ttk.Label(settings_frame, text="Nuclear Channel:").grid(
-            row=1, column=0, sticky=tk.W, pady=2
-        )
-        self.pp_nuc_channel = tk.IntVar(value=0)
-        nuc_combo = ttk.Combobox(
-            settings_frame,
-            textvariable=self.pp_nuc_channel,
-            values=[0, 1, 2, 3],
-            width=5,
-            state="readonly",
-        )
-        nuc_combo.grid(row=1, column=1, padx=5, pady=2, sticky=tk.W)
-        self.pp_nuc_label = tk.StringVar(value="None (grayscale)")
-        ttk.Label(settings_frame, textvariable=self.pp_nuc_label, foreground="gray").grid(
-            row=1, column=2, sticky=tk.W, padx=5
-        )
-        nuc_combo.bind("<<ComboboxSelected>>", self._pp_update_channel_labels)
-
-        # Percentile range
-        ttk.Label(settings_frame, text="Normalization Percentile:").grid(
-            row=2, column=0, sticky=tk.W, pady=2
-        )
-        pct_frame = ttk.Frame(settings_frame)
-        pct_frame.grid(row=2, column=1, columnspan=2, sticky=tk.W, padx=5)
-        ttk.Label(pct_frame, text="Low:").pack(side=tk.LEFT)
-        self.pp_lower_pct = tk.DoubleVar(value=1.0)
-        ttk.Entry(pct_frame, textvariable=self.pp_lower_pct, width=6).pack(
-            side=tk.LEFT, padx=(2, 10)
-        )
-        ttk.Label(pct_frame, text="High:").pack(side=tk.LEFT)
-        self.pp_upper_pct = tk.DoubleVar(value=99.0)
-        ttk.Entry(pct_frame, textvariable=self.pp_upper_pct, width=6).pack(
-            side=tk.LEFT, padx=2
-        )
-
-        # Tile normalization
-        ttk.Label(settings_frame, text="DIC Tile Blocksize:").grid(
-            row=3, column=0, sticky=tk.W, pady=2
-        )
-        self.pp_tile_bs = tk.IntVar(value=128)
-        ttk.Entry(settings_frame, textvariable=self.pp_tile_bs, width=8).grid(
-            row=3, column=1, padx=5, pady=2, sticky=tk.W
-        )
-        ttk.Label(
-            settings_frame,
-            text="(0 = global normalization, >0 = tile-based for uneven illumination)",
-            foreground="gray",
-        ).grid(row=3, column=2, sticky=tk.W, padx=5)
-
-        # Z-slice for ND2 Z-stacks
-        ttk.Label(settings_frame, text="Z-Slice (ND2):").grid(
-            row=4, column=0, sticky=tk.W, pady=2
-        )
-        z_frame = ttk.Frame(settings_frame)
-        z_frame.grid(row=4, column=1, columnspan=2, sticky=tk.W, padx=5)
-        self.pp_z_slice = tk.StringVar(value="0")
-        ttk.Entry(z_frame, textvariable=self.pp_z_slice, width=6).pack(
-            side=tk.LEFT, padx=(0, 10)
-        )
-        ttk.Label(
-            z_frame,
-            text="(0-indexed Z-slice for Z-stack .nd2 files)",
-            foreground="gray",
-        ).pack(side=tk.LEFT)
-
-        # Invert DIC
-        self.pp_invert_dic = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            settings_frame,
-            text="Invert DIC (cells dark on bright background)",
-            variable=self.pp_invert_dic,
-        ).grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=2)
-
-        # ---- Cellpose Settings ----
-        cp_frame = ttk.LabelFrame(tab, text="Cellpose Settings", padding=10)
-        cp_frame.pack(fill=tk.X, padx=10, pady=5)
-
-        # Model
-        ttk.Label(cp_frame, text="Model:").grid(row=0, column=0, sticky=tk.W, pady=2)
-        self.pp_model_var = tk.StringVar(value="cpsam (default)")
-        pp_model_combo = ttk.Combobox(
-            cp_frame,
-            textvariable=self.pp_model_var,
-            values=["cpsam (default)", "Custom model...", "BioImage.io model..."],
-            width=22,
-            state="readonly",
-        )
-        pp_model_combo.grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
-        pp_model_combo.bind("<<ComboboxSelected>>", self._pp_on_model_changed)
-
-        self.pp_custom_model = tk.StringVar()
-        self.pp_model_entry = ttk.Entry(
-            cp_frame, textvariable=self.pp_custom_model, width=35
-        )
-        self.pp_model_entry.grid(row=0, column=2, padx=5, pady=2)
-        self.pp_model_entry.config(state=tk.DISABLED)
-        self.pp_model_btn = ttk.Button(
-            cp_frame, text="Browse...", command=self._pp_browse_model
-        )
-        self.pp_model_btn.grid(row=0, column=3, pady=2)
-        self.pp_model_btn.config(state=tk.DISABLED)
-
-        # Diameter
-        ttk.Label(cp_frame, text="Diameter:").grid(row=1, column=0, sticky=tk.W, pady=2)
-        self.pp_diameter = tk.StringVar(value="auto")
-        ttk.Entry(cp_frame, textvariable=self.pp_diameter, width=10).grid(
-            row=1, column=1, padx=5, pady=2, sticky=tk.W
-        )
-        ttk.Label(cp_frame, text="(pixels, or 'auto')", foreground="gray").grid(
-            row=1, column=2, sticky=tk.W, padx=5
-        )
-
-        # Flow threshold
-        ttk.Label(cp_frame, text="Flow Threshold:").grid(row=2, column=0, sticky=tk.W, pady=2)
-        self.pp_flow_thr = tk.DoubleVar(value=0.4)
-        ttk.Entry(cp_frame, textvariable=self.pp_flow_thr, width=10).grid(
-            row=2, column=1, padx=5, pady=2, sticky=tk.W
-        )
-
-        # Cell prob threshold
-        ttk.Label(cp_frame, text="Cell Prob Threshold:").grid(row=3, column=0, sticky=tk.W, pady=2)
-        self.pp_cellprob_thr = tk.DoubleVar(value=0.0)
-        ttk.Entry(cp_frame, textvariable=self.pp_cellprob_thr, width=10).grid(
-            row=3, column=1, padx=5, pady=2, sticky=tk.W
-        )
-
-        # ---- Buttons ----
-        btn_frame = ttk.Frame(tab)
-        btn_frame.pack(fill=tk.X, padx=10, pady=5)
-
-        ttk.Button(
-            btn_frame, text="Preview Channels", command=self._pp_preview_channels
-        ).pack(side=tk.LEFT, padx=5)
-
-        ttk.Button(
-            btn_frame, text="Expand ND2 Positions", command=self._pp_expand_nd2
-        ).pack(side=tk.LEFT, padx=5)
-
-        self.btn_pp_run = ttk.Button(
-            btn_frame, text="Generate Masks", command=self._pp_generate
-        )
-        self.btn_pp_run.pack(side=tk.LEFT, padx=5)
-
-        # Progress
-        self.pp_progress = ttk.Progressbar(tab, mode="determinate")
-        self.pp_progress.pack(fill=tk.X, padx=10, pady=5)
-
-        self.pp_status = tk.StringVar(value="Ready")
-        ttk.Label(tab, textvariable=self.pp_status).pack(padx=10, anchor=tk.W)
-
-        # Results table
-        result_frame = ttk.LabelFrame(tab, text="Results", padding=5)
-        result_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
-
-        columns = ("filename", "objects", "status")
-        self.pp_tree = ttk.Treeview(
-            result_frame, columns=columns, show="headings", height=8
-        )
-        self.pp_tree.heading("filename", text="Filename")
-        self.pp_tree.heading("objects", text="Objects Found")
-        self.pp_tree.heading("status", text="Status")
-        self.pp_tree.column("filename", width=350)
-        self.pp_tree.column("objects", width=120, anchor=tk.CENTER)
-        self.pp_tree.column("status", width=120, anchor=tk.CENTER)
-
-        pp_scroll = ttk.Scrollbar(
-            result_frame, orient=tk.VERTICAL, command=self.pp_tree.yview
-        )
-        self.pp_tree.configure(yscrollcommand=pp_scroll.set)
-        self.pp_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        pp_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-
-    def _pp_browse_img(self):
-        d = filedialog.askdirectory(title="Select Image Directory")
-        if d:
-            self.pp_img_dir.set(d)
-
-    def _pp_browse_out(self):
-        d = filedialog.askdirectory(title="Select Mask Output Directory")
-        if d:
-            self.pp_out_dir.set(d)
-
-    def _pp_on_model_changed(self, event=None):
-        choice = self.pp_model_var.get()
-        if choice == "Custom model...":
-            self.pp_model_entry.config(state=tk.NORMAL)
-            self.pp_model_btn.config(state=tk.NORMAL)
-            self.pp_custom_model.set("")
-        elif choice == "BioImage.io model...":
-            self.pp_model_entry.config(state=tk.NORMAL)
-            self.pp_model_btn.config(state=tk.NORMAL)
-            self.pp_custom_model.set("bioimage.io:")
-        else:
-            self.pp_model_entry.config(state=tk.DISABLED)
-            self.pp_model_btn.config(state=tk.DISABLED)
-            self.pp_custom_model.set("")
-
-    def _pp_browse_model(self):
-        if self.pp_model_var.get() == "BioImage.io model...":
-            path = filedialog.askopenfilename(
-                title="Select BioImage.io Model (rdf.yaml / .zip)",
-                initialdir=str(PROJECT_ROOT / "models"),
-                filetypes=[
-                    ("BioImage.io", "*.yaml *.yml *.zip"),
-                    ("All", "*.*"),
-                ],
-            )
-        else:
-            path = filedialog.askopenfilename(
-                title="Select Cellpose Model",
-                initialdir=str(PROJECT_ROOT / "models"),
-            )
-        if path:
-            self.pp_custom_model.set(path)
-
-    _CHANNEL_NAMES = {0: "DIC", 1: "mEGFP", 2: "mScarlet", 3: "miRFPnano3"}
-
-    def _pp_update_channel_labels(self, event=None):
-        seg = self.pp_seg_channel.get()
-        nuc = self.pp_nuc_channel.get()
-        self.pp_seg_label.set(self._CHANNEL_NAMES.get(seg, f"Channel {seg}"))
-        if nuc == 0:
-            self.pp_nuc_label.set("None (grayscale)")
-        else:
-            self.pp_nuc_label.set(self._CHANNEL_NAMES.get(nuc, f"Channel {nuc}"))
-
-    def _pp_preview_channels(self):
-        """Save and open a channel preview for the first image."""
-        img_dir = self.pp_img_dir.get()
-        if not img_dir:
-            messagebox.showwarning("Missing", "Select an image directory first.")
-            return
-
-        from preprocess import save_channel_preview
-        import glob as _glob
-
-        extensions = ("*.tif", "*.tiff", "*.png", "*.jpg", "*.nd2")
-        files = []
-        for ext in extensions:
-            files.extend(_glob.glob(os.path.join(img_dir, ext)))
-        files = sorted(files)
-
-        if not files:
-            messagebox.showinfo("Empty", "No images found in the directory.")
-            return
-
-        preview_dir = str(PROJECT_ROOT / "results" / "channel_previews")
-        z_val = self.pp_z_slice.get().strip()
-        z_slice = int(z_val) if z_val else None
-
-        try:
-            path = save_channel_preview(
-                files[0],
-                preview_dir,
-                lower_percentile=self.pp_lower_pct.get(),
-                upper_percentile=self.pp_upper_pct.get(),
-                tile_blocksize_dic=self.pp_tile_bs.get(),
-                z_slice=z_slice,
-            )
-            self.pp_status.set(f"Channel preview saved: {path}")
-            logger.info(f"Channel preview saved to {path}")
-            messagebox.showinfo(
-                "Preview Saved",
-                f"Channel preview for {Path(files[0]).name} saved to:\n{path}\n\n"
-                "Open this file to inspect channel quality and normalization.",
-            )
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to generate preview:\n{e}")
-            logger.exception("Channel preview failed")
-
-    def _pp_expand_nd2(self):
-        """Expand multi-position .nd2 files in the image directory into TIFFs."""
-        img_dir = self.pp_img_dir.get()
-        if not img_dir:
-            messagebox.showwarning("Missing", "Select an image directory first.")
-            return
-
-        import glob as _glob
-        nd2_files = sorted(_glob.glob(os.path.join(img_dir, "*.nd2")))
-        if not nd2_files:
-            messagebox.showinfo("No ND2", "No .nd2 files found in the directory.")
-            return
-
-        from data_preparation import expand_nd2_positions, get_nd2_info
-
-        output_dir = os.path.join(img_dir, "_nd2_expanded")
-        total_saved = []
-        multi_pos_count = 0
-
-        for nd2_file in nd2_files:
-            try:
-                info = get_nd2_info(nd2_file)
-                n_pos = info["n_positions"]
-                if n_pos > 1:
-                    multi_pos_count += 1
-                    logger.info(
-                        f"Expanding {Path(nd2_file).name}: "
-                        f"{n_pos} positions, shape={info['shape']}"
-                    )
-                saved = expand_nd2_positions(nd2_file, output_dir)
-                total_saved.extend(saved)
-            except Exception as e:
-                logger.error(f"Failed to expand {Path(nd2_file).name}: {e}")
-                messagebox.showerror(
-                    "ND2 Error",
-                    f"Failed to expand {Path(nd2_file).name}:\n{e}",
-                )
-
-        if total_saved:
-            messagebox.showinfo(
-                "ND2 Expanded",
-                f"Processed {len(nd2_files)} ND2 file(s) "
-                f"({multi_pos_count} multi-position).\n"
-                f"Saved {len(total_saved)} individual TIFFs to:\n{output_dir}\n\n"
-                "You can now use this directory as the image input, or the "
-                "pipeline will auto-expand during mask generation.",
-            )
-            self.pp_status.set(
-                f"Expanded {len(nd2_files)} ND2 -> {len(total_saved)} TIFFs"
-            )
-
-    def _pp_generate(self):
-        """Generate draft masks in a background thread."""
-        img_dir = self.pp_img_dir.get()
-        out_dir = self.pp_out_dir.get()
-        if not img_dir:
-            messagebox.showwarning("Missing", "Select an image directory.")
-            return
-
-        self.btn_pp_run.config(state=tk.DISABLED)
-        self.pp_tree.delete(*self.pp_tree.get_children())
-        self.pp_progress.config(mode="determinate", value=0)
-        self.pp_status.set("Generating masks...")
-
-        # Parse diameter
-        diam_str = self.pp_diameter.get().strip().lower()
-        diameter = None if diam_str in ("auto", "none", "") else float(diam_str)
-
-        # Parse Z-slice
-        z_val = self.pp_z_slice.get().strip()
-        z_slice = int(z_val) if z_val else None
-
-        # Parse model (supports local paths and BioImage.io identifiers)
-        model_path = None
-        if self.pp_model_var.get() in ("Custom model...", "BioImage.io model..."):
-            model_path = self.pp_custom_model.get() or None
-
-        def progress_cb(current, total, filename):
-            if total > 0:
-                pct = int(100 * current / total)
-                # Use thread-safe queue to update GUI
-                self.log_queue.put(f"__PP_PROGRESS__{pct}||{current}/{total}: {filename}")
-
-        def worker():
-            try:
-                from preprocess import generate_masks
-                results = generate_masks(
-                    image_dir=img_dir,
-                    output_dir=out_dir,
-                    segment_channel=self.pp_seg_channel.get(),
-                    nuclear_channel=self.pp_nuc_channel.get(),
-                    model_path=model_path,
-                    diameter=diameter,
-                    flow_threshold=self.pp_flow_thr.get(),
-                    cellprob_threshold=self.pp_cellprob_thr.get(),
-                    lower_percentile=self.pp_lower_pct.get(),
-                    upper_percentile=self.pp_upper_pct.get(),
-                    tile_blocksize_dic=self.pp_tile_bs.get(),
-                    invert_dic=self.pp_invert_dic.get(),
-                    use_gpu=True,
-                    z_slice=z_slice,
-                    progress_callback=progress_cb,
-                )
-                # Encode results for the GUI thread
-                encoded = "|".join(f"{name},{n}" for name, n in results)
-                self.log_queue.put(f"__PP_DONE__{encoded}")
-            except Exception as e:
-                logger.exception("Mask generation failed")
-                self.log_queue.put(f"__PP_ERROR__{e}")
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_pp_finished(self, results_str: str | None = None, error: str | None = None):
-        self.btn_pp_run.config(state=tk.NORMAL)
-        self.pp_progress.config(value=100)
-
-        if error:
-            self.pp_status.set(f"Error: {error}")
-            messagebox.showerror("Preprocessing Error", str(error))
-            return
-
-        if results_str:
-            entries = results_str.split("|")
-            total_objects = 0
-            for entry in entries:
-                if not entry:
-                    continue
-                name, n_str = entry.rsplit(",", 1)
-                n = int(n_str)
-                if n < 0:
-                    status = "FAILED"
-                elif n == 0:
-                    status = "No signal"
-                else:
-                    status = "OK"
-                    total_objects += n
-                self.pp_tree.insert("", tk.END, values=(name, n if n >= 0 else "-", status))
-
-            self.pp_status.set(
-                f"Done: {len(entries)} images processed, {total_objects} total objects. "
-                f"Masks saved to: {self.pp_out_dir.get()}"
-            )
-            messagebox.showinfo(
-                "Preprocessing Complete",
-                f"Generated draft masks for {len(entries)} images.\n"
-                f"Total objects detected: {total_objects}\n\n"
-                f"Masks saved to:\n{self.pp_out_dir.get()}\n\n"
-                "Review and curate the masks manually, then use the\n"
-                "File Renaming tab to prepare them for training.",
-            )
 
     # ==================================================================
     # TAB 1: FILE RENAMING
@@ -2187,6 +2010,16 @@ class SegmentationGUI(tk.Tk):
             if msg.startswith("__SEG_LOG__"):
                 self._seg_log_append(msg[len("__SEG_LOG__"):])
                 continue
+            if msg.startswith("__SEG_PROGRESS__"):
+                pct = int(msg[len("__SEG_PROGRESS__"):])
+                self.seg_progress.config(value=pct)
+                continue
+            if msg.startswith("__SEG_RESULT__"):
+                payload = msg[len("__SEG_RESULT__"):]
+                name, n_str, status = payload.split("||", 2)
+                n = int(n_str)
+                self.seg_tree.insert("", tk.END, values=(name, n if n >= 0 else "-", status))
+                continue
 
             # -- Analysis --
             if msg.startswith("__ANA_DONE__"):
@@ -2212,19 +2045,6 @@ class SegmentationGUI(tk.Tk):
                 self._on_eval_finished(error=msg[len("__EVAL_ERROR__"):])
                 continue
 
-            # -- Preprocessing --
-            if msg.startswith("__PP_PROGRESS__"):
-                payload = msg[len("__PP_PROGRESS__"):]
-                pct_str, status_text = payload.split("||", 1)
-                self.pp_progress.config(value=int(pct_str))
-                self.pp_status.set(status_text)
-                continue
-            if msg.startswith("__PP_DONE__"):
-                self._on_pp_finished(results_str=msg[len("__PP_DONE__"):])
-                continue
-            if msg.startswith("__PP_ERROR__"):
-                self._on_pp_finished(error=msg[len("__PP_ERROR__"):])
-                continue
 
             # Append to training log
             self.train_log.config(state=tk.NORMAL)
@@ -2246,9 +2066,10 @@ class SegmentationGUI(tk.Tk):
             "Analysis Workflow:\n"
             "  - ND2 to OME-TIFF conversion\n"
             "  - Cellpose segmentation (nucleus / puncta / cell / cytoplasm)\n"
+            "    with model selection (cyto3 / cpsam / custom / BioImage.io)\n"
+            "    and channel & normalization controls\n"
             "  - Per-cell intensity & puncta analysis\n\n"
             "Training Workflow:\n"
-            "  - Draft mask generation & curation\n"
             "  - Cellpose model fine-tuning (DIC / fluorescence)\n"
             "  - Model evaluation with metrics\n\n"
             f"Nucleus/Scripts: {nuc_status}\n"
