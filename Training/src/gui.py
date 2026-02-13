@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """
-Tkinter GUI for the Cellpose Segmentation Training Pipeline.
+Unified GUI for the Puncta-CSAT Segmentation Pipeline.
+
+Combines Training workflow and Analysis workflow in a single interface.
 
 Provides tabs for:
-  1. File Renaming  — Rename images/masks to pipeline convention
-  2. Configuration  — Edit training parameters from YAML configs
-  3. Training       — Launch and monitor model training
-  4. Evaluation     — Run inference and view results
+  -- Analysis Workflow --
+  1. ND2 Conversion   — Convert ND2 files to OME-TIFF
+  2. Segmentation     — Run Cellpose (nucleus / puncta / cell / cytoplasm)
+  3. Analysis         — Per-cell intensity & puncta analysis
+
+  -- Training Workflow --
+  4. Preprocessing    — Generate draft masks for training data
+  5. File Renaming    — Rename images/masks to pipeline convention
+  6. Configuration    — Edit training parameters from YAML configs
+  7. Training         — Launch and monitor model training
+  8. Evaluation       — Run inference and view results
 """
 
 import logging
@@ -24,6 +33,25 @@ import yaml
 SRC_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SRC_DIR.parent
 sys.path.insert(0, str(SRC_DIR))
+
+# ------------------------------------------------------------------ #
+#  Locate Nucleus/Scripts directory for analysis modules
+# ------------------------------------------------------------------ #
+def _find_nucleus_scripts_dir():
+    """Return the path to Nucleus/Scripts, searching common locations."""
+    candidates = [
+        PROJECT_ROOT.parent / "Nucleus" / "Scripts",       # Segmentation/Nucleus/Scripts
+        SRC_DIR.parent.parent / "Nucleus" / "Scripts",     # alternate
+        Path(__file__).resolve().parent.parent.parent / "Nucleus" / "Scripts",
+    ]
+    for p in candidates:
+        if (p / "segmentation_utils.py").exists():
+            return p.resolve()
+    return None
+
+NUCLEUS_SCRIPTS_DIR = _find_nucleus_scripts_dir()
+if NUCLEUS_SCRIPTS_DIR is not None:
+    sys.path.insert(0, str(NUCLEUS_SCRIPTS_DIR))
 
 from rename_files import (
     list_image_files,
@@ -52,9 +80,9 @@ class QueueHandler(logging.Handler):
 class SegmentationGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Cellpose Segmentation Pipeline")
-        self.geometry("960x720")
-        self.minsize(800, 600)
+        self.title("Puncta-CSAT Segmentation Pipeline")
+        self.geometry("980x800")
+        self.minsize(800, 650)
 
         # Thread-safe log queue
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -89,18 +117,30 @@ class SegmentationGUI(tk.Tk):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
+        # -- Analysis workflow tabs --
+        self.tab_nd2 = ttk.Frame(self.notebook)
+        self.tab_segmentation = ttk.Frame(self.notebook)
+        self.tab_analysis = ttk.Frame(self.notebook)
+
+        # -- Training workflow tabs --
         self.tab_preprocess = ttk.Frame(self.notebook)
         self.tab_rename = ttk.Frame(self.notebook)
         self.tab_config = ttk.Frame(self.notebook)
         self.tab_train = ttk.Frame(self.notebook)
         self.tab_eval = ttk.Frame(self.notebook)
 
+        self.notebook.add(self.tab_nd2, text="  ND2 Conversion  ")
+        self.notebook.add(self.tab_segmentation, text="  Segmentation  ")
+        self.notebook.add(self.tab_analysis, text="  Analysis  ")
         self.notebook.add(self.tab_preprocess, text="  Preprocessing  ")
         self.notebook.add(self.tab_rename, text="  File Renaming  ")
         self.notebook.add(self.tab_config, text="  Configuration  ")
         self.notebook.add(self.tab_train, text="  Training  ")
         self.notebook.add(self.tab_eval, text="  Evaluation  ")
 
+        self._build_nd2_tab()
+        self._build_segmentation_tab()
+        self._build_analysis_tab()
         self._build_preprocess_tab()
         self._build_rename_tab()
         self._build_config_tab()
@@ -108,7 +148,640 @@ class SegmentationGUI(tk.Tk):
         self._build_eval_tab()
 
     # ==================================================================
-    # TAB 0: PREPROCESSING
+    # TAB: ND2 CONVERSION
+    # ==================================================================
+    def _build_nd2_tab(self):
+        tab = self.tab_nd2
+
+        info = ttk.Label(
+            tab,
+            text="Convert ND2 microscopy files to per-position OME-TIFF, "
+                 "extracting a single Z-plane.",
+            foreground="gray",
+        )
+        info.pack(anchor=tk.W, padx=10, pady=(10, 5))
+
+        io_frame = ttk.LabelFrame(tab, text="Input / Output", padding=10)
+        io_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(io_frame, text="ND2 File:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.nd2_file_var = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.nd2_file_var, width=55).grid(
+            row=0, column=1, padx=5, pady=2
+        )
+        ttk.Button(io_frame, text="Browse...", command=self._nd2_browse_file).grid(
+            row=0, column=2, pady=2
+        )
+
+        ttk.Label(io_frame, text="Output Directory:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.nd2_out_dir = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.nd2_out_dir, width=55).grid(
+            row=1, column=1, padx=5, pady=2
+        )
+        ttk.Button(io_frame, text="Browse...", command=self._nd2_browse_out).grid(
+            row=1, column=2, pady=2
+        )
+
+        param_frame = ttk.LabelFrame(tab, text="Parameters", padding=10)
+        param_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(param_frame, text="Z-plane index:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.nd2_z_index = tk.IntVar(value=8)
+        ttk.Entry(param_frame, textvariable=self.nd2_z_index, width=8).grid(
+            row=0, column=1, padx=5, pady=2, sticky=tk.W
+        )
+        ttk.Label(param_frame, text="(0-based index of Z-plane to extract)", foreground="gray").grid(
+            row=0, column=2, sticky=tk.W, padx=5
+        )
+
+        btn_frame = ttk.Frame(tab)
+        btn_frame.pack(fill=tk.X, padx=10, pady=10)
+        self.btn_nd2_run = ttk.Button(btn_frame, text="Convert", command=self._nd2_run)
+        self.btn_nd2_run.pack(side=tk.LEFT, padx=5)
+
+        self.nd2_status = tk.StringVar(value="Ready")
+        ttk.Label(tab, textvariable=self.nd2_status).pack(padx=10, anchor=tk.W)
+
+        # Log for ND2 tab
+        log_frame = ttk.LabelFrame(tab, text="Log", padding=5)
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
+        self.nd2_log = scrolledtext.ScrolledText(
+            log_frame, wrap=tk.WORD, height=12, state=tk.DISABLED, font=("Courier", 9)
+        )
+        self.nd2_log.pack(fill=tk.BOTH, expand=True)
+
+    def _nd2_browse_file(self):
+        path = filedialog.askopenfilename(
+            title="Select ND2 File",
+            filetypes=[("ND2 files", "*.nd2"), ("All files", "*.*")],
+        )
+        if path:
+            self.nd2_file_var.set(path)
+
+    def _nd2_browse_out(self):
+        d = filedialog.askdirectory(title="Select Output Directory")
+        if d:
+            self.nd2_out_dir.set(d)
+
+    def _nd2_run(self):
+        nd2_path = self.nd2_file_var.get()
+        out_dir = self.nd2_out_dir.get()
+        if not nd2_path or not out_dir:
+            messagebox.showwarning("Missing input", "Select both the ND2 file and output directory.")
+            return
+        z = self.nd2_z_index.get()
+        self.btn_nd2_run.config(state=tk.DISABLED)
+        self.nd2_status.set(f"Converting (z={z})...")
+        self._nd2_log_append(f"Converting ND2 -> OME-TIFF  (z={z})")
+
+        def task():
+            try:
+                from preprocessing.nd2_to_ome_tif import convert_nd2
+                convert_nd2(nd2_path, out_dir, z_index=z)
+                self.log_queue.put("__ND2_DONE__")
+            except ImportError as exc:
+                self.log_queue.put(f"__ND2_ERROR__Missing dependency: {exc}\n  pip install nd2 tifffile numpy")
+            except Exception as exc:
+                import traceback
+                self.log_queue.put(f"__ND2_ERROR__{exc}\n{traceback.format_exc()}")
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _nd2_log_append(self, msg):
+        self.nd2_log.config(state=tk.NORMAL)
+        self.nd2_log.insert(tk.END, msg + "\n")
+        self.nd2_log.see(tk.END)
+        self.nd2_log.config(state=tk.DISABLED)
+
+    def _on_nd2_finished(self, error=None):
+        self.btn_nd2_run.config(state=tk.NORMAL)
+        if error:
+            self.nd2_status.set(f"Error: {error[:80]}")
+            self._nd2_log_append(f"[ERROR] {error}")
+        else:
+            self.nd2_status.set("Conversion complete")
+            self._nd2_log_append("[DONE] ND2 conversion complete.")
+
+    # ==================================================================
+    # TAB: SEGMENTATION (nucleus / puncta / cell / cytoplasm)
+    # ==================================================================
+    def _build_segmentation_tab(self):
+        tab = self.tab_segmentation
+
+        ch_info = ttk.Label(
+            tab,
+            text="Channels:  0 = DIC (bright-field)    1 = GFP (puncta)    2 = mScarlet (nucleus)",
+            foreground="gray",
+        )
+        ch_info.pack(anchor=tk.W, padx=10, pady=(10, 5))
+
+        # Input / Output
+        io_frame = ttk.LabelFrame(tab, text="Input / Output", padding=10)
+        io_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(io_frame, text="Input Images (folder):").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.seg_input_dir = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.seg_input_dir, width=55).grid(
+            row=0, column=1, padx=5, pady=2
+        )
+        ttk.Button(io_frame, text="Browse...", command=lambda: self._browse_dir(self.seg_input_dir)).grid(
+            row=0, column=2, pady=2
+        )
+
+        ttk.Label(io_frame, text="Output Masks Directory:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.seg_out_dir = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.seg_out_dir, width=55).grid(
+            row=1, column=1, padx=5, pady=2
+        )
+        ttk.Button(io_frame, text="Browse...", command=lambda: self._browse_dir(self.seg_out_dir)).grid(
+            row=1, column=2, pady=2
+        )
+
+        # Mode selector
+        mode_frame = ttk.LabelFrame(tab, text="Segmentation Mode", padding=10)
+        mode_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        self.seg_mode_var = tk.StringVar(value="cell")
+        modes_row = ttk.Frame(mode_frame)
+        modes_row.pack(fill=tk.X)
+        for label, val in [("Cell (DIC)", "cell"), ("Nucleus", "nucleus"),
+                           ("Puncta", "puncta"), ("Cytoplasm", "cytoplasm")]:
+            ttk.Radiobutton(modes_row, text=label, variable=self.seg_mode_var,
+                            value=val, command=self._seg_on_mode_change).pack(side=tk.LEFT, padx=8)
+
+        # Parameters
+        param_frame = ttk.LabelFrame(tab, text="Parameters", padding=10)
+        param_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        row0 = ttk.Frame(param_frame)
+        row0.pack(fill=tk.X, pady=2)
+
+        ttk.Label(row0, text="Diameter (px):").pack(side=tk.LEFT, padx=(0, 5))
+        self.seg_diameter = tk.StringVar(value="0")
+        ttk.Entry(row0, textvariable=self.seg_diameter, width=8).pack(side=tk.LEFT, padx=(0, 15))
+
+        ttk.Label(row0, text="Channel:").pack(side=tk.LEFT, padx=(0, 5))
+        self.seg_channel = tk.IntVar(value=0)
+        ttk.Entry(row0, textvariable=self.seg_channel, width=5).pack(side=tk.LEFT, padx=(0, 15))
+
+        ttk.Label(row0, text="Z-index:").pack(side=tk.LEFT, padx=(0, 5))
+        self.seg_z_idx = tk.IntVar(value=0)
+        ttk.Entry(row0, textvariable=self.seg_z_idx, width=5).pack(side=tk.LEFT)
+
+        row1 = ttk.Frame(param_frame)
+        row1.pack(fill=tk.X, pady=2)
+
+        ttk.Label(row1, text="Min object size (px):").pack(side=tk.LEFT, padx=(0, 5))
+        self.seg_min_size = tk.IntVar(value=50000)
+        ttk.Entry(row1, textvariable=self.seg_min_size, width=10).pack(side=tk.LEFT, padx=(0, 15))
+
+        self.seg_gpu_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row1, text="Use GPU", variable=self.seg_gpu_var).pack(side=tk.LEFT, padx=8)
+
+        self.seg_edges_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row1, text="Remove edge objects", variable=self.seg_edges_var).pack(side=tk.LEFT, padx=8)
+
+        self.seg_dic_norm_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row1, text="DIC normalization (CLAHE)", variable=self.seg_dic_norm_var).pack(side=tk.LEFT, padx=8)
+
+        # Cytoplasm-specific options (shown/hidden)
+        self.seg_cyto_frame = ttk.LabelFrame(tab, text="Cytoplasm Options (cell - nucleus = cytoplasm)", padding=10)
+
+        ttk.Label(self.seg_cyto_frame, text="Nucleus Masks Folder:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.seg_nuc_mask_dir = tk.StringVar()
+        ttk.Entry(self.seg_cyto_frame, textvariable=self.seg_nuc_mask_dir, width=45).grid(
+            row=0, column=1, padx=5, pady=2
+        )
+        ttk.Button(self.seg_cyto_frame, text="Browse...",
+                    command=lambda: self._browse_dir(self.seg_nuc_mask_dir)).grid(row=0, column=2, pady=2)
+
+        cyto_params = ttk.Frame(self.seg_cyto_frame)
+        cyto_params.grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=5)
+
+        ttk.Label(cyto_params, text="Nuc dilation (px):").pack(side=tk.LEFT, padx=(0, 5))
+        self.seg_nuc_dilate = tk.IntVar(value=0)
+        ttk.Entry(cyto_params, textvariable=self.seg_nuc_dilate, width=6).pack(side=tk.LEFT, padx=(0, 15))
+
+        ttk.Label(cyto_params, text="Min nuc overlap (px):").pack(side=tk.LEFT, padx=(0, 5))
+        self.seg_min_nuc_px = tk.IntVar(value=10)
+        ttk.Entry(cyto_params, textvariable=self.seg_min_nuc_px, width=6).pack(side=tk.LEFT, padx=(0, 15))
+
+        ttk.Label(cyto_params, text="Min overlap frac:").pack(side=tk.LEFT, padx=(0, 5))
+        self.seg_min_overlap_frac = tk.DoubleVar(value=0.005)
+        ttk.Entry(cyto_params, textvariable=self.seg_min_overlap_frac, width=8).pack(side=tk.LEFT)
+
+        # Run button
+        btn_frame = ttk.Frame(tab)
+        btn_frame.pack(fill=tk.X, padx=10, pady=5)
+        self.btn_seg_run = ttk.Button(btn_frame, text="Run Segmentation", command=self._seg_run)
+        self.btn_seg_run.pack(side=tk.LEFT, padx=5)
+
+        self.seg_status = tk.StringVar(value="Ready")
+        ttk.Label(tab, textvariable=self.seg_status).pack(padx=10, anchor=tk.W)
+
+        # Log
+        log_frame = ttk.LabelFrame(tab, text="Log", padding=5)
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
+        self.seg_log = scrolledtext.ScrolledText(
+            log_frame, wrap=tk.WORD, height=10, state=tk.DISABLED, font=("Courier", 9)
+        )
+        self.seg_log.pack(fill=tk.BOTH, expand=True)
+
+        # Apply initial mode presets
+        self._seg_on_mode_change()
+
+    def _seg_on_mode_change(self):
+        mode = self.seg_mode_var.get()
+        if mode == "cell":
+            self.seg_diameter.set("0")
+            self.seg_channel.set(0)
+            self.seg_min_size.set(50000)
+            self.seg_edges_var.set(True)
+            self.seg_dic_norm_var.set(True)
+            self.seg_cyto_frame.pack_forget()
+        elif mode == "nucleus":
+            self.seg_diameter.set("200")
+            self.seg_channel.set(2)
+            self.seg_min_size.set(10000)
+            self.seg_edges_var.set(True)
+            self.seg_dic_norm_var.set(False)
+            self.seg_cyto_frame.pack_forget()
+        elif mode == "puncta":
+            self.seg_diameter.set("20")
+            self.seg_channel.set(1)
+            self.seg_min_size.set(0)
+            self.seg_edges_var.set(False)
+            self.seg_dic_norm_var.set(False)
+            self.seg_cyto_frame.pack_forget()
+        elif mode == "cytoplasm":
+            self.seg_diameter.set("0")
+            self.seg_channel.set(0)
+            self.seg_min_size.set(50000)
+            self.seg_edges_var.set(True)
+            self.seg_dic_norm_var.set(True)
+            self.seg_cyto_frame.pack(fill=tk.X, padx=10, pady=5, before=self.btn_seg_run.master)
+
+    def _seg_log_append(self, msg):
+        self.seg_log.config(state=tk.NORMAL)
+        self.seg_log.insert(tk.END, msg + "\n")
+        self.seg_log.see(tk.END)
+        self.seg_log.config(state=tk.DISABLED)
+
+    @staticmethod
+    def _find_nuc_mask(nuc_mask_dir, image_stem):
+        """Find nucleus mask matching an image stem."""
+        import re
+        nuc_dir = Path(nuc_mask_dir)
+        for p in nuc_dir.glob("*.tif"):
+            if image_stem in p.stem or p.stem in image_stem:
+                return p
+        m = re.search(r"(\d+_Z\d+)", image_stem)
+        if m:
+            token = m.group(1)
+            for p in nuc_dir.glob("*.tif"):
+                if token in p.stem:
+                    return p
+        return None
+
+    def _seg_run(self):
+        input_path = self.seg_input_dir.get()
+        out_dir = self.seg_out_dir.get()
+        if not input_path or not out_dir:
+            messagebox.showwarning("Missing input", "Select input images and output directory.")
+            return
+        if NUCLEUS_SCRIPTS_DIR is None:
+            messagebox.showerror(
+                "Nucleus/Scripts not found",
+                "Cannot find Nucleus/Scripts/segmentation_utils.py.\n"
+                "Make sure the Nucleus/ folder is in the repository root."
+            )
+            return
+
+        mode = self.seg_mode_var.get()
+        diam_str = self.seg_diameter.get().strip()
+        diameter = None if diam_str in ("0", "", "auto") else float(diam_str)
+        channel = self.seg_channel.get()
+        z = self.seg_z_idx.get()
+        min_sz = self.seg_min_size.get()
+        gpu = self.seg_gpu_var.get()
+        rm_edges = self.seg_edges_var.get()
+        use_dic_norm = self.seg_dic_norm_var.get()
+
+        is_cyto = mode == "cytoplasm"
+        nuc_mask_dir = None
+        nuc_dilate_px = 0
+        min_nuc_pixels = 10
+        min_overlap_frac = 0.005
+
+        if is_cyto:
+            nuc_mask_dir = self.seg_nuc_mask_dir.get()
+            if not nuc_mask_dir:
+                messagebox.showwarning(
+                    "Missing input",
+                    "Cytoplasm mode requires a Nucleus Masks Folder.\n"
+                    "Run nucleus segmentation first."
+                )
+                return
+            nuc_dilate_px = self.seg_nuc_dilate.get()
+            min_nuc_pixels = self.seg_min_nuc_px.get()
+            min_overlap_frac = self.seg_min_overlap_frac.get()
+
+        norm_label = "DIC (CLAHE)" if use_dic_norm else "LUT"
+        self._seg_log_append(
+            f"Segmentation ({mode}): diameter={diameter}, channel={channel}, "
+            f"z={z}, min_size={min_sz}, norm={norm_label}"
+        )
+        self.btn_seg_run.config(state=tk.DISABLED)
+        self.seg_status.set(f"Running {mode} segmentation...")
+
+        def task():
+            try:
+                from segmentation_utils import (
+                    load_image_2d, auto_lut_clip, normalize_dic,
+                    ensure_2d,
+                    load_cellpose_model, run_cellpose,
+                    postprocess_mask,
+                    save_mask, save_triptych,
+                    save_cytoplasm_triptych,
+                    collect_image_paths,
+                    compute_cytoplasm_mask,
+                )
+                import numpy as np
+                import tifffile as tiff_io
+
+                image_paths = collect_image_paths(input_path)
+                if not image_paths:
+                    self.log_queue.put("__SEG_ERROR__No TIFF images found.")
+                    return
+
+                self._seg_log_append_q(f"Found {len(image_paths)} image(s). Loading model...")
+                model = load_cellpose_model(gpu=gpu, model_type="cyto3")
+                outdir = Path(out_dir)
+                outdir.mkdir(parents=True, exist_ok=True)
+                trip_dir = outdir / "triptychs"
+                trip_dir.mkdir(parents=True, exist_ok=True)
+
+                for i, img_path in enumerate(image_paths, 1):
+                    self._seg_log_append_q(f"  [{i}/{len(image_paths)}] {img_path.name}")
+                    try:
+                        img2d = load_image_2d(img_path, channel_index=channel, z_index=z)
+                        if use_dic_norm:
+                            img_norm = normalize_dic(img2d)
+                        else:
+                            img_norm = auto_lut_clip(img2d)
+
+                        masks = run_cellpose(img_norm, model=model, diameter=diameter)
+                        masks = postprocess_mask(masks, min_size=min_sz, remove_edges=rm_edges)
+                        stem = img_path.stem
+
+                        if is_cyto:
+                            nuc_path = self._find_nuc_mask(nuc_mask_dir, stem)
+                            if nuc_path is None:
+                                self._seg_log_append_q(f"    [WARN] No nucleus mask for {stem}")
+                                save_mask(masks, outdir / f"{stem}_cell_masks.tif")
+                                save_triptych(img_norm, masks, trip_dir / f"{stem}_cell_triptych.png")
+                                continue
+
+                            nuc_m = ensure_2d(tiff_io.imread(str(nuc_path)))
+                            if nuc_m.shape != masks.shape:
+                                self._seg_log_append_q(f"    [WARN] Shape mismatch, skipping cyto")
+                                save_mask(masks, outdir / f"{stem}_cell_masks.tif")
+                                continue
+
+                            cyto_mask, kept, orphans = compute_cytoplasm_mask(
+                                masks, nuc_m,
+                                nuc_dilate_px=nuc_dilate_px,
+                                min_nuc_pixels=min_nuc_pixels,
+                                min_overlap_frac=min_overlap_frac,
+                            )
+                            self._seg_log_append_q(
+                                f"    Kept {len(kept)} cells, removed {len(orphans)} orphans"
+                            )
+                            save_mask(masks, outdir / f"{stem}_cell_masks.tif")
+                            save_mask(cyto_mask, outdir / f"{stem}_cyto_masks.tif")
+                            save_cytoplasm_triptych(
+                                img_norm, masks, nuc_m, cyto_mask,
+                                trip_dir / f"{stem}_cyto_triptych.png"
+                            )
+                        else:
+                            save_mask(masks, outdir / f"{stem}_cyto3_masks.tif")
+                            save_triptych(img_norm, masks, trip_dir / f"{stem}_triptych.png")
+                    except Exception as e:
+                        self._seg_log_append_q(f"    [ERROR] {e}")
+
+                self.log_queue.put("__SEG_DONE__")
+            except Exception as exc:
+                self.log_queue.put(f"__SEG_ERROR__{exc}")
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _seg_log_append_q(self, msg):
+        """Thread-safe log append via queue."""
+        self.log_queue.put(f"__SEG_LOG__{msg}")
+
+    def _on_seg_finished(self, error=None):
+        self.btn_seg_run.config(state=tk.NORMAL)
+        if error:
+            self.seg_status.set(f"Error: {str(error)[:80]}")
+            self._seg_log_append(f"[ERROR] {error}")
+        else:
+            self.seg_status.set("Segmentation complete")
+            self._seg_log_append("[DONE] Segmentation complete.")
+
+    # ==================================================================
+    # TAB: INTENSITY & PUNCTA ANALYSIS
+    # ==================================================================
+    def _build_analysis_tab(self):
+        tab = self.tab_analysis
+
+        info = ttk.Label(
+            tab,
+            text="Per-nucleus intensity measurement and puncta detection analysis.",
+            foreground="gray",
+        )
+        info.pack(anchor=tk.W, padx=10, pady=(10, 5))
+
+        # Inputs
+        io_frame = ttk.LabelFrame(tab, text="Input Directories", padding=10)
+        io_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(io_frame, text="Nucleus Masks Folder:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.ana_nuc_dir = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.ana_nuc_dir, width=50).grid(row=0, column=1, padx=5, pady=2)
+        ttk.Button(io_frame, text="Browse...", command=lambda: self._browse_dir(self.ana_nuc_dir)).grid(
+            row=0, column=2, pady=2
+        )
+
+        ttk.Label(io_frame, text="Puncta Masks Folder:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.ana_puncta_dir = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.ana_puncta_dir, width=50).grid(row=1, column=1, padx=5, pady=2)
+        ttk.Button(io_frame, text="Browse...", command=lambda: self._browse_dir(self.ana_puncta_dir)).grid(
+            row=1, column=2, pady=2
+        )
+
+        ttk.Label(io_frame, text="Raw OME-TIFF Images Folder:").grid(row=2, column=0, sticky=tk.W, pady=2)
+        self.ana_intensity_dir = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.ana_intensity_dir, width=50).grid(row=2, column=1, padx=5, pady=2)
+        ttk.Button(io_frame, text="Browse...", command=lambda: self._browse_dir(self.ana_intensity_dir)).grid(
+            row=2, column=2, pady=2
+        )
+
+        # Output
+        out_frame = ttk.LabelFrame(tab, text="Output", padding=10)
+        out_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(out_frame, text="Output CSV File:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.ana_csv_path = tk.StringVar()
+        ttk.Entry(out_frame, textvariable=self.ana_csv_path, width=50).grid(row=0, column=1, padx=5, pady=2)
+        ttk.Button(out_frame, text="Browse...", command=self._ana_browse_csv).grid(
+            row=0, column=2, pady=2
+        )
+
+        ttk.Label(out_frame, text="Triptych Output Folder:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.ana_trip_dir = tk.StringVar()
+        ttk.Entry(out_frame, textvariable=self.ana_trip_dir, width=50).grid(row=1, column=1, padx=5, pady=2)
+        ttk.Button(out_frame, text="Browse...", command=lambda: self._browse_dir(self.ana_trip_dir)).grid(
+            row=1, column=2, pady=2
+        )
+
+        # Parameters
+        param_frame = ttk.LabelFrame(tab, text="Parameters", padding=10)
+        param_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        row0 = ttk.Frame(param_frame)
+        row0.pack(fill=tk.X, pady=2)
+
+        ttk.Label(row0, text="Nucleus channel:").pack(side=tk.LEFT, padx=(0, 5))
+        self.ana_int_ch = tk.IntVar(value=2)
+        ttk.Entry(row0, textvariable=self.ana_int_ch, width=5).pack(side=tk.LEFT, padx=(0, 15))
+
+        ttk.Label(row0, text="Puncta channel:").pack(side=tk.LEFT, padx=(0, 5))
+        self.ana_pun_ch = tk.IntVar(value=1)
+        ttk.Entry(row0, textvariable=self.ana_pun_ch, width=5).pack(side=tk.LEFT, padx=(0, 15))
+
+        ttk.Label(row0, text="Min puncta area:").pack(side=tk.LEFT, padx=(0, 5))
+        self.ana_min_area = tk.IntVar(value=5)
+        ttk.Entry(row0, textvariable=self.ana_min_area, width=5).pack(side=tk.LEFT, padx=(0, 15))
+
+        ttk.Label(row0, text="Open radius:").pack(side=tk.LEFT, padx=(0, 5))
+        self.ana_open_radius = tk.IntVar(value=1)
+        ttk.Entry(row0, textvariable=self.ana_open_radius, width=5).pack(side=tk.LEFT)
+
+        row1 = ttk.Frame(param_frame)
+        row1.pack(fill=tk.X, pady=2)
+
+        self.ana_trip_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row1, text="Generate QC triptychs", variable=self.ana_trip_var).pack(
+            side=tk.LEFT, padx=8
+        )
+
+        # Run button
+        btn_frame = ttk.Frame(tab)
+        btn_frame.pack(fill=tk.X, padx=10, pady=5)
+        self.btn_ana_run = ttk.Button(btn_frame, text="Run Analysis", command=self._ana_run)
+        self.btn_ana_run.pack(side=tk.LEFT, padx=5)
+
+        self.ana_status = tk.StringVar(value="Ready")
+        ttk.Label(tab, textvariable=self.ana_status).pack(padx=10, anchor=tk.W)
+
+        # Log
+        log_frame = ttk.LabelFrame(tab, text="Log", padding=5)
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
+        self.ana_log = scrolledtext.ScrolledText(
+            log_frame, wrap=tk.WORD, height=8, state=tk.DISABLED, font=("Courier", 9)
+        )
+        self.ana_log.pack(fill=tk.BOTH, expand=True)
+
+    def _ana_browse_csv(self):
+        path = filedialog.asksaveasfilename(
+            title="Save CSV As",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            defaultextension=".csv",
+        )
+        if path:
+            self.ana_csv_path.set(path)
+
+    def _ana_log_append(self, msg):
+        self.ana_log.config(state=tk.NORMAL)
+        self.ana_log.insert(tk.END, msg + "\n")
+        self.ana_log.see(tk.END)
+        self.ana_log.config(state=tk.DISABLED)
+
+    def _ana_run(self):
+        nuc = self.ana_nuc_dir.get()
+        puncta = self.ana_puncta_dir.get()
+        intensity = self.ana_intensity_dir.get()
+        csv_path = self.ana_csv_path.get()
+
+        if not all([nuc, puncta, intensity, csv_path]):
+            messagebox.showwarning(
+                "Missing input",
+                "Please fill in all required fields:\n"
+                "- Nucleus masks folder\n"
+                "- Puncta masks folder\n"
+                "- Raw images folder\n"
+                "- Output CSV path"
+            )
+            return
+        if NUCLEUS_SCRIPTS_DIR is None:
+            messagebox.showerror(
+                "Nucleus/Scripts not found",
+                "Cannot find Nucleus/Scripts/.\n"
+                "Make sure the Nucleus/ folder is in the repository root."
+            )
+            return
+
+        int_ch = self.ana_int_ch.get()
+        pun_ch = self.ana_pun_ch.get()
+        min_a = self.ana_min_area.get()
+        open_r = self.ana_open_radius.get()
+        trip = self.ana_trip_var.get()
+        trip_dir = self.ana_trip_dir.get() or None
+
+        self._ana_log_append(f"Analysis: nuc_ch={int_ch}, puncta_ch={pun_ch}, min_area={min_a}")
+        self.btn_ana_run.config(state=tk.DISABLED)
+        self.ana_status.set("Running analysis...")
+
+        def task():
+            try:
+                from puncta_detection.mean_intensity_and_puncta import main as run_analysis
+                run_analysis(
+                    nuc_dir=nuc,
+                    puncta_dir=puncta,
+                    intensity_dir=intensity,
+                    out_csv=csv_path,
+                    min_puncta_area=min_a,
+                    puncta_open_radius=open_r,
+                    make_triptychs=trip,
+                    triptych_out_dir=trip_dir,
+                    intensity_channel=int_ch,
+                    puncta_channel=pun_ch,
+                )
+                self.log_queue.put(f"__ANA_DONE__{csv_path}")
+            except Exception as exc:
+                self.log_queue.put(f"__ANA_ERROR__{exc}")
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _on_ana_finished(self, csv_path=None, error=None):
+        self.btn_ana_run.config(state=tk.NORMAL)
+        if error:
+            self.ana_status.set(f"Error: {str(error)[:80]}")
+            self._ana_log_append(f"[ERROR] {error}")
+        else:
+            self.ana_status.set("Analysis complete")
+            self._ana_log_append(f"[DONE] Analysis complete. CSV: {csv_path}")
+
+    # ==================================================================
+    # Helper: generic directory browse
+    # ==================================================================
+    def _browse_dir(self, string_var):
+        d = filedialog.askdirectory()
+        if d:
+            string_var.set(d)
+
+    # ==================================================================
+    # TAB: PREPROCESSING (draft masks)
     # ==================================================================
     def _build_preprocess_tab(self):
         tab = self.tab_preprocess
@@ -1495,18 +2168,51 @@ class SegmentationGUI(tk.Tk):
                 break
 
             # Check for control messages
+
+            # -- ND2 Conversion --
+            if msg == "__ND2_DONE__":
+                self._on_nd2_finished()
+                continue
+            if msg.startswith("__ND2_ERROR__"):
+                self._on_nd2_finished(error=msg[len("__ND2_ERROR__"):])
+                continue
+
+            # -- Segmentation --
+            if msg == "__SEG_DONE__":
+                self._on_seg_finished()
+                continue
+            if msg.startswith("__SEG_ERROR__"):
+                self._on_seg_finished(error=msg[len("__SEG_ERROR__"):])
+                continue
+            if msg.startswith("__SEG_LOG__"):
+                self._seg_log_append(msg[len("__SEG_LOG__"):])
+                continue
+
+            # -- Analysis --
+            if msg.startswith("__ANA_DONE__"):
+                self._on_ana_finished(csv_path=msg[len("__ANA_DONE__"):])
+                continue
+            if msg.startswith("__ANA_ERROR__"):
+                self._on_ana_finished(error=msg[len("__ANA_ERROR__"):])
+                continue
+
+            # -- Training --
             if msg == "__TRAINING_DONE__":
                 self._on_training_finished()
                 continue
             if msg.startswith("__TRAINING_ERROR__"):
                 self._on_training_finished(error=msg[len("__TRAINING_ERROR__"):])
                 continue
+
+            # -- Evaluation --
             if msg.startswith("__EVAL_DONE__"):
                 self._on_eval_finished(message=msg[len("__EVAL_DONE__"):])
                 continue
             if msg.startswith("__EVAL_ERROR__"):
                 self._on_eval_finished(error=msg[len("__EVAL_ERROR__"):])
                 continue
+
+            # -- Preprocessing --
             if msg.startswith("__PP_PROGRESS__"):
                 payload = msg[len("__PP_PROGRESS__"):]
                 pct_str, status_text = payload.split("||", 1)
@@ -1532,14 +2238,21 @@ class SegmentationGUI(tk.Tk):
     # MISC
     # ==================================================================
     def _show_about(self):
+        nuc_status = f"Found: {NUCLEUS_SCRIPTS_DIR}" if NUCLEUS_SCRIPTS_DIR else "NOT FOUND"
         messagebox.showinfo(
             "About",
-            "Cellpose Segmentation Pipeline GUI\n\n"
-            "BiaPy-inspired workflow for training Cellpose models.\n\n"
-            "Tasks:\n"
-            "  - DIC Brightfield Whole-Cell Segmentation\n"
-            "  - Fluorescence Nucleus Segmentation\n\n"
-            "Built with Cellpose 4 (cpsam) + tkinter",
+            "Puncta-CSAT Segmentation Pipeline\n\n"
+            "Unified GUI for analysis and training workflows.\n\n"
+            "Analysis Workflow:\n"
+            "  - ND2 to OME-TIFF conversion\n"
+            "  - Cellpose segmentation (nucleus / puncta / cell / cytoplasm)\n"
+            "  - Per-cell intensity & puncta analysis\n\n"
+            "Training Workflow:\n"
+            "  - Draft mask generation & curation\n"
+            "  - Cellpose model fine-tuning (DIC / fluorescence)\n"
+            "  - Model evaluation with metrics\n\n"
+            f"Nucleus/Scripts: {nuc_status}\n"
+            "Built with Cellpose + tkinter",
         )
 
 
