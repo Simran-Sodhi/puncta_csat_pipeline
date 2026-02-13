@@ -5,7 +5,7 @@ pipeline_gui.py
 User-friendly tkinter GUI for the Puncta-CSAT segmentation pipeline.
 
 Provides a step-by-step interface for non-coders to:
-  1. Convert ND2 files to TIFF (single Z-plane, preserving channels & resolution)
+  1. Convert ND2 files to OME-TIFF
   2. Run Cellpose segmentation (nucleus / puncta / cytoplasm)
      - Cytoplasm mode: segments whole cells, then subtracts nucleus masks
   3. Run per-cell intensity & puncta analysis
@@ -175,7 +175,7 @@ class NumberEntry(ttk.Frame):
 
 class Step1Frame(ttk.LabelFrame):
     def __init__(self, parent, log_callback):
-        super().__init__(parent, text="  Step 1: Convert ND2 to TIFF  ",
+        super().__init__(parent, text="  Step 1: Convert ND2 to OME-TIFF  ",
                          padding=12)
         self.log = log_callback
 
@@ -208,14 +208,14 @@ class Step1Frame(ttk.LabelFrame):
                                    "Please select both the ND2 file and output directory.")
             return
         z = self.z_index.get()
-        self.log(f"\n{'='*60}\nStep 1: Converting ND2 -> TIFF  (z={z})\n{'='*60}")
+        self.log(f"\n{'='*60}\nStep 1: Converting ND2 -> OME-TIFF  (z={z})\n{'='*60}")
         self.run_btn.config(state="disabled")
 
         def task():
             try:
                 from preprocessing.nd2_to_ome_tif import convert_nd2
                 convert_nd2(nd2_path, out_dir, z_index=z)
-                self.log("[DONE] ND2 to TIFF conversion complete.")
+                self.log("[DONE] ND2 conversion complete.")
             except ImportError as exc:
                 self.log(f"[ERROR] Missing dependency: {exc}")
                 self.log("  Install with: python -m pip install nd2 tifffile numpy")
@@ -605,7 +605,7 @@ class Step3Frame(ttk.LabelFrame):
         self.puncta_picker = FolderPicker(self, "Puncta Masks Folder:")
         self.puncta_picker.pack(fill="x", pady=2)
 
-        self.intensity_picker = FolderPicker(self, "Raw TIFF Images Folder:")
+        self.intensity_picker = FolderPicker(self, "Raw OME-TIFF Images Folder:")
         self.intensity_picker.pack(fill="x", pady=2)
 
         self.csv_picker = FolderPicker(
@@ -814,7 +814,7 @@ class PipelineGUI(tk.Tk):
         ).pack(side="left", padx=16, pady=12)
         tk.Label(
             header,
-            text="Cellpose + TIFF",
+            text="Cellpose + OME-TIFF",
             bg=HEADER_BG, fg=SUBTLE_TEXT,
             font=(FONT_FAMILY, 10),
         ).pack(side="right", padx=16)

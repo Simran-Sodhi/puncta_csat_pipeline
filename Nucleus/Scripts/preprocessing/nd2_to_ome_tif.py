@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """
-nd2_to_tif.py
+nd2_to_ome_tif.py
 
-Convert an ND2 microscopy file to per-scene TIFF files,
+Convert an ND2 microscopy file to per-scene OME-TIFF files,
 extracting a single Z-plane (configurable via --z-index).
-
-Preserves channel names and pixel resolution (micrometers)
-in the TIFF metadata and resolution tags.
 
 Uses the lightweight ``nd2`` package (no aicsimageio / lxml needed).
 
 Usage
 -----
-    python nd2_to_tif.py --input /path/to/file.nd2 --outdir /path/to/output --z-index 8
+    python nd2_to_ome_tif.py --input /path/to/file.nd2 --outdir /path/to/output --z-index 8
 
 Install
 -------
@@ -30,19 +27,15 @@ import nd2
 
 def convert_nd2(input_path, output_dir, z_index=8):
     """
-    Convert all positions/scenes in an ND2 file to individual TIFF
+    Convert all positions/scenes in an ND2 file to individual OME-TIFF
     files for a single Z-plane.
-
-    Channel names are stored in the ImageDescription tag and pixel
-    resolution is stored in the TIFF resolution tags (pixels per
-    micrometer).
 
     Parameters
     ----------
     input_path : str or pathlib.Path
         Path to the .nd2 file.
     output_dir : str or pathlib.Path
-        Directory for output TIFF files.
+        Directory for output OME-TIFF files.
     z_index : int
         Z-plane to extract (0-based).
     """
@@ -77,22 +70,13 @@ def convert_nd2(input_path, output_dir, z_index=8):
     if not ch_names:
         ch_names = [f"Ch{i}" for i in range(n_channels)]
 
-    # Get pixel sizes (in micrometers)
+    # Get pixel sizes
     px_x = px_y = None
     if f.metadata and f.metadata.channels:
         vol = f.metadata.channels[0].volume
         if vol:
             px_x = vol.axesCalibration[0] if vol.axesCalibration else None
             px_y = vol.axesCalibration[1] if len(vol.axesCalibration) > 1 else None
-
-    # Build resolution kwargs for tifffile
-    resolution_kwargs = {}
-    if px_x and px_y:
-        # TIFF resolution tag stores pixels-per-unit; unit=MICROMETER
-        resolution_kwargs["resolution"] = (1.0 / px_x, 1.0 / px_y)
-        resolution_kwargs["resolutionunit"] = 3  # 3 = CENTIMETER in TIFF spec
-        # Store as pixels per centimeter (TIFF doesn't have micrometer unit)
-        resolution_kwargs["resolution"] = (1e4 / px_x, 1e4 / px_y)
 
     # Read the full data array
     # nd2 returns data in the order of the axes in f.sizes
@@ -131,6 +115,7 @@ def convert_nd2(input_path, output_dir, z_index=8):
 
         # Scene/position name
         if n_positions > 1:
+            # Try to get position name from experiment metadata
             scene_name = f"P{pos_idx:04d}"
             if hasattr(f, 'experiment') and f.experiment:
                 try:
@@ -145,31 +130,25 @@ def convert_nd2(input_path, output_dir, z_index=8):
         else:
             scene_name = "single"
 
-        # Build description string with channel and resolution info
-        desc_lines = [
-            f"axes=CYX",
-            f"channels={','.join(ch_names[:C])}",
-        ]
-        if px_x is not None:
-            desc_lines.append(f"PhysicalSizeX={float(px_x):.6f}")
-        if px_y is not None:
-            desc_lines.append(f"PhysicalSizeY={float(px_y):.6f}")
-        desc_lines.append("PhysicalSizeUnit=micrometer")
-        description = "\n".join(desc_lines)
+        ch_meta = [{"Name": n} for n in ch_names[:C]]
 
-        out_path = out_dir / f"{inp.stem}_{scene_name}_Z{z_index:03d}.tif"
+        out_path = out_dir / f"{inp.stem}_{scene_name}_Z{z_index:03d}.ome.tif"
         tifffile.imwrite(
             str(out_path),
             plane,
-            imagej=True,
+            ome=True,
+            imagej=False,
             photometric="minisblack",
             compression="deflate",
             bigtiff=True,
             metadata={
                 "axes": "CYX",
+                "Channel": ch_meta,
+                "PhysicalSizeX": float(px_x) if px_x else None,
+                "PhysicalSizeY": float(px_y) if px_y else None,
+                "PhysicalSizeXUnit": "micrometer",
+                "PhysicalSizeYUnit": "micrometer",
             },
-            description=description,
-            **resolution_kwargs,
         )
         exported += 1
         if (pos_idx + 1) % 10 == 0 or (pos_idx + 1) == n_positions:
@@ -181,22 +160,15 @@ def convert_nd2(input_path, output_dir, z_index=8):
     print(f"Exported {exported}/{n_positions} position(s) in {elapsed:.1f}s -> {out_dir}")
 
     # Quick verification on first exported file
-    first_files = sorted(out_dir.glob(f"{inp.stem}_*_Z{z_index:03d}.tif"))
+    first_files = sorted(out_dir.glob(f"{inp.stem}_*_Z{z_index:03d}.ome.tif"))
     if first_files:
         with tifffile.TiffFile(str(first_files[0])) as tf:
-            s0 = tf.series[0]
-            print(f"  Verification: axes={s0.axes}, shape={s0.shape}")
-            # Show resolution if available
-            page = tf.pages[0]
-            tags = page.tags
-            if "XResolution" in tags:
-                xr = tags["XResolution"].value
-                print(f"  XResolution tag: {xr[0]}/{xr[1]} pixels/cm")
+            print(f"  Verification: axes={tf.series[0].axes}, shape={tf.series[0].shape}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert ND2 file to per-scene TIFF (single Z-plane)."
+        description="Convert ND2 file to per-scene OME-TIFF (single Z-plane)."
     )
     parser.add_argument(
         "--input", required=True,
@@ -204,7 +176,7 @@ def main():
     )
     parser.add_argument(
         "--outdir", required=True,
-        help="Output directory for TIFF files.",
+        help="Output directory for OME-TIFF files.",
     )
     parser.add_argument(
         "--z-index", type=int, default=8,
