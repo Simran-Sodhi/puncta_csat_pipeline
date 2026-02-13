@@ -1,0 +1,79 @@
+# =============================================================================
+# BiaPy-style configuration: DIC Brightfield Whole-Cell Segmentation
+# Uses Cellpose as the segmentation backend
+# =============================================================================
+
+SYSTEM:
+  NUM_GPUS: 1
+  NUM_CPUS: 4
+  SEED: 42
+
+PROBLEM:
+  TYPE: SEMANTIC_SEG
+  NDIM: 2D
+  DESCRIPTION: "DIC brightfield whole-cell segmentation using Cellpose"
+
+DATA:
+  TRAIN:
+    PATH: "data/train/dic_raw"
+    MASK_PATH: "data/train/dic_labels"
+    IMAGE_FILTER: "_img"
+    MASK_FILTER: "_masks"
+  TEST:
+    PATH: "data/test/dic_raw"
+    MASK_PATH: "data/test/dic_labels"
+    IMAGE_FILTER: "_img"
+    MASK_FILTER: "_masks"
+  PATCH_SIZE: [256, 256]
+  CHANNELS: [0, 0]
+  Z_SLICE: null
+  NORMALIZE: true
+
+AUGMENTATION:
+  ENABLE: true
+  RANDOM_FLIP: true
+  RANDOM_ROTATION:
+    ENABLE: true
+    DEGREES: 180
+  ELASTIC_DEFORM:
+    ENABLE: true
+    ALPHA: [20, 40]
+    SIGMA: [5, 7]
+  GAUSSIAN_NOISE:
+    ENABLE: true
+    MEAN: 0.0
+    STD: 0.05
+  BRIGHTNESS_CONTRAST:
+    ENABLE: true
+    BRIGHTNESS_RANGE: [-0.1, 0.1]
+    CONTRAST_RANGE: [0.9, 1.1]
+
+MODEL:
+  BACKEND: "cellpose"
+  PRETRAINED_MODEL: null
+  ARCHITECTURE: "cpsam"
+
+TRAIN:
+  ENABLE: true
+  EPOCHS: 100
+  LEARNING_RATE: 0.00001
+  WEIGHT_DECAY: 0.1
+  BATCH_SIZE: 1
+  OPTIMIZER: "adam"
+  SAVE_EVERY: 25
+  MIN_TRAIN_MASKS: 5
+
+INFERENCE:
+  ENABLE: true
+  DIAMETER: null
+  FLOW_THRESHOLD: 0.4
+  CELLPROB_THRESHOLD: 0.0
+  NORMALIZE:
+    TILE_NORM_BLOCKSIZE: 128
+  AUGMENT: false
+  RESAMPLE: true
+
+PATHS:
+  MODEL_DIR: "models"
+  RESULT_DIR: "results/dic_wholecell"
+  MODEL_NAME: "cellpose_dic_wholecell"
