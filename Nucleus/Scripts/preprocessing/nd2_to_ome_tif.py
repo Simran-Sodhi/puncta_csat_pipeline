@@ -5,11 +5,16 @@ nd2_to_ome_tif.py
 Convert an ND2 microscopy file to per-scene OME-TIFF files,
 extracting a single Z-plane (configurable via --z-index).
 
+Optionally splits each channel into a separate folder with
+single-channel TIFFs that are compatible with Cellpose GUI
+for training, manual curation, and evaluation.
+
 Uses the lightweight ``nd2`` package (no aicsimageio / lxml needed).
 
 Usage
 -----
     python nd2_to_ome_tif.py --input /path/to/file.nd2 --outdir /path/to/output --z-index 8
+    python nd2_to_ome_tif.py --input /path/to/file.nd2 --outdir /path/to/output --split-channels
 
 Install
 -------
@@ -25,10 +30,16 @@ import tifffile
 import nd2
 
 
-def convert_nd2(input_path, output_dir, z_index=8):
+def convert_nd2(input_path, output_dir, z_index=8, split_channels=False):
     """
     Convert all positions/scenes in an ND2 file to individual OME-TIFF
     files for a single Z-plane.
+
+    When *split_channels* is True, each channel is additionally saved as
+    a single-channel 16-bit TIFF inside a ``<ChannelName>/`` subfolder.
+    These single-channel images retain the original intensity values and
+    can be opened directly in the Cellpose GUI for training, manual
+    curation, and evaluation.
 
     Parameters
     ----------
@@ -38,6 +49,9 @@ def convert_nd2(input_path, output_dir, z_index=8):
         Directory for output OME-TIFF files.
     z_index : int
         Z-plane to extract (0-based).
+    split_channels : bool
+        If True, also save per-channel single-channel TIFFs in
+        ``<output_dir>/<ChannelName>/`` folders.
     """
     inp = pathlib.Path(input_path)
     out_dir = pathlib.Path(output_dir)
@@ -77,6 +91,17 @@ def convert_nd2(input_path, output_dir, z_index=8):
         if vol:
             px_x = vol.axesCalibration[0] if vol.axesCalibration else None
             px_y = vol.axesCalibration[1] if len(vol.axesCalibration) > 1 else None
+
+    # Create per-channel subdirectories if splitting
+    ch_dirs = {}
+    if split_channels:
+        for ch_idx, ch_name in enumerate(ch_names[:n_channels]):
+            # Sanitise channel name for folder (replace spaces, slashes)
+            safe_name = ch_name.replace("/", "_").replace("\\", "_").replace(" ", "_")
+            ch_dir = out_dir / safe_name
+            ch_dir.mkdir(parents=True, exist_ok=True)
+            ch_dirs[ch_idx] = ch_dir
+        print(f"  Splitting {n_channels} channels: {ch_names[:n_channels]}")
 
     # Read the full data array
     # nd2 returns data in the order of the axes in f.sizes
@@ -132,6 +157,7 @@ def convert_nd2(input_path, output_dir, z_index=8):
 
         ch_meta = [{"Name": n} for n in ch_names[:C]]
 
+        # Save multi-channel OME-TIFF (always)
         out_path = out_dir / f"{inp.stem}_{scene_name}_Z{z_index:03d}.ome.tif"
         tifffile.imwrite(
             str(out_path),
@@ -150,6 +176,28 @@ def convert_nd2(input_path, output_dir, z_index=8):
                 "PhysicalSizeYUnit": "micrometer",
             },
         )
+
+        # Save per-channel single-channel TIFFs
+        if split_channels:
+            for ch_idx in range(C):
+                if ch_idx not in ch_dirs:
+                    continue
+                ch_data = plane[ch_idx]  # (Y, X), original dtype/intensity
+                ch_out = ch_dirs[ch_idx] / f"{inp.stem}_{scene_name}_Z{z_index:03d}.tif"
+                tifffile.imwrite(
+                    str(ch_out),
+                    np.ascontiguousarray(ch_data),
+                    photometric="minisblack",
+                    compression="deflate",
+                    metadata={
+                        "axes": "YX",
+                        "PhysicalSizeX": float(px_x) if px_x else None,
+                        "PhysicalSizeY": float(px_y) if px_y else None,
+                        "PhysicalSizeXUnit": "micrometer",
+                        "PhysicalSizeYUnit": "micrometer",
+                    },
+                )
+
         exported += 1
         if (pos_idx + 1) % 10 == 0 or (pos_idx + 1) == n_positions:
             print(f"  Processed {pos_idx + 1}/{n_positions} positions")
@@ -158,6 +206,11 @@ def convert_nd2(input_path, output_dir, z_index=8):
 
     elapsed = time.perf_counter() - t0
     print(f"Exported {exported}/{n_positions} position(s) in {elapsed:.1f}s -> {out_dir}")
+
+    if split_channels:
+        for ch_idx, ch_dir in ch_dirs.items():
+            n_files = len(list(ch_dir.glob("*.tif")))
+            print(f"  Channel '{ch_names[ch_idx]}' -> {ch_dir.name}/ ({n_files} files)")
 
     # Quick verification on first exported file
     first_files = sorted(out_dir.glob(f"{inp.stem}_*_Z{z_index:03d}.ome.tif"))
@@ -182,8 +235,12 @@ def main():
         "--z-index", type=int, default=8,
         help="Z-plane index to extract (default: 8).",
     )
+    parser.add_argument(
+        "--split-channels", action="store_true",
+        help="Also save each channel as single-channel TIFFs in per-channel folders.",
+    )
     args = parser.parse_args()
-    convert_nd2(args.input, args.outdir, args.z_index)
+    convert_nd2(args.input, args.outdir, args.z_index, split_channels=args.split_channels)
 
 
 if __name__ == "__main__":

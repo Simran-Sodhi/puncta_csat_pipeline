@@ -153,7 +153,9 @@ class SegmentationGUI(tk.Tk):
         info = ttk.Label(
             tab,
             text="Convert ND2 microscopy files to per-position OME-TIFF, "
-                 "extracting a single Z-plane.",
+                 "extracting a single Z-plane.\n"
+                 "Split channels creates per-channel folders with single-channel "
+                 "TIFFs for Cellpose GUI, training, and analysis.",
             foreground="gray",
         )
         info.pack(anchor=tk.W, padx=10, pady=(10, 5))
@@ -191,6 +193,18 @@ class SegmentationGUI(tk.Tk):
             row=0, column=2, sticky=tk.W, padx=5
         )
 
+        self.nd2_split_channels = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            param_frame, text="Split channels into separate folders",
+            variable=self.nd2_split_channels,
+        ).grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=2)
+        ttk.Label(
+            param_frame,
+            text="Creates DIC/, mEGFP/, mScarlet/, etc. folders with single-channel TIFFs\n"
+                 "compatible with Cellpose GUI for training, curation, and evaluation.",
+            foreground="gray",
+        ).grid(row=2, column=0, columnspan=3, sticky=tk.W, padx=20, pady=(0, 2))
+
         btn_frame = ttk.Frame(tab)
         btn_frame.pack(fill=tk.X, padx=10, pady=10)
         self.btn_nd2_run = ttk.Button(btn_frame, text="Convert", command=self._nd2_run)
@@ -227,14 +241,16 @@ class SegmentationGUI(tk.Tk):
             messagebox.showwarning("Missing input", "Select both the ND2 file and output directory.")
             return
         z = self.nd2_z_index.get()
+        split_ch = self.nd2_split_channels.get()
         self.btn_nd2_run.config(state=tk.DISABLED)
-        self.nd2_status.set(f"Converting (z={z})...")
-        self._nd2_log_append(f"Converting ND2 -> OME-TIFF  (z={z})")
+        mode_str = "OME-TIFF + split channels" if split_ch else "OME-TIFF"
+        self.nd2_status.set(f"Converting (z={z}, {mode_str})...")
+        self._nd2_log_append(f"Converting ND2 -> {mode_str}  (z={z})")
 
         def task():
             try:
                 from preprocessing.nd2_to_ome_tif import convert_nd2
-                convert_nd2(nd2_path, out_dir, z_index=z)
+                convert_nd2(nd2_path, out_dir, z_index=z, split_channels=split_ch)
                 self.log_queue.put("__ND2_DONE__")
             except ImportError as exc:
                 self.log_queue.put(f"__ND2_ERROR__Missing dependency: {exc}\n  pip install nd2 tifffile numpy")

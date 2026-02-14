@@ -46,7 +46,7 @@ def parse_location(path: Path) -> str:
     Extract an image location token from the file path.
 
     Tries XYPos patterns first, then generic digit_Z patterns,
-    then falls back to filename stem.
+    then falls back to filename stem (stripping common mask suffixes).
     """
     s = str(path)
     m = re.search(r"XYPos[/\\]([^.]*)\.ome", s)
@@ -55,20 +55,38 @@ def parse_location(path: Path) -> str:
     m = re.search(r"(\d+_Z\d+)", s)
     if m:
         return m.group(1)
-    return path.stem
+    stem = path.stem
+    # Strip Cellpose _seg suffix and common mask suffixes
+    for suffix in ("_seg", "_cyto3_masks", "_cell_masks", "_cyto_masks", "_masks"):
+        if stem.endswith(suffix):
+            stem = stem[:-len(suffix)]
+            break
+    return stem
 
 
 def build_location_map(root: Path, kind: str) -> dict:
-    """Build {location_token: Path} for all .tif files under *root*."""
+    """Build {location_token: Path} for all .tif/.npy files under *root*.
+
+    Supports both plain TIFF masks and Cellpose ``_seg.npy`` files.
+    When both exist for the same location, ``_seg.npy`` takes priority
+    (these may contain manually curated masks edited in Cellpose GUI).
+    """
     mapping = {}
-    for p in root.rglob("*.tif"):
-        loc = parse_location(p)
-        if loc in mapping:
-            print(f"[WARN] {kind}: duplicate location '{loc}'")
-            print(f"       existing -> {mapping[loc]}")
-            print(f"       new      -> {p}")
-        else:
-            mapping[loc] = p
+    for ext in ("*.tif", "*_seg.npy"):
+        for p in root.rglob(ext):
+            loc = parse_location(p)
+            if loc in mapping:
+                # _seg.npy takes priority over .tif
+                if p.suffix == ".npy" and mapping[loc].suffix != ".npy":
+                    mapping[loc] = p
+                elif p.suffix == ".npy" or mapping[loc].suffix == ".npy":
+                    pass  # keep existing npy
+                else:
+                    print(f"[WARN] {kind}: duplicate location '{loc}'")
+                    print(f"       existing -> {mapping[loc]}")
+                    print(f"       new      -> {p}")
+            else:
+                mapping[loc] = p
     print(f"[INFO] {kind}: indexed {len(mapping)} locations from {root}")
     return mapping
 
@@ -83,6 +101,15 @@ def get_labels(mask: np.ndarray) -> np.ndarray:
     if len(vals) <= 2 and 0 in vals:
         return measure.label(mask > 0, connectivity=1)
     return mask.astype(int)
+
+
+def _load_mask_2d(path: Path) -> np.ndarray:
+    """Load a 2D mask from a .tif or Cellpose _seg.npy file."""
+    path = Path(path)
+    if path.suffix == ".npy":
+        dat = np.load(str(path), allow_pickle=True).item()
+        return ensure_2d(np.asarray(dat["masks"]))
+    return ensure_2d(tiff.imread(path))
 
 
 def load_intensity_image(path: Path, channel: int) -> np.ndarray:
@@ -188,7 +215,9 @@ def main(
     intensity_map = build_location_map(intensity_dir, "intensity")
     rows = []
 
-    nuc_files = sorted(nuc_dir.glob("*.tif"))
+    nuc_files = sorted(
+        list(nuc_dir.glob("*.tif")) + list(nuc_dir.glob("*_seg.npy"))
+    )
     print(f"[INFO] Processing {len(nuc_files)} nucleus mask file(s)")
 
     for idx, cyto_path in enumerate(nuc_files, 1):
@@ -204,9 +233,9 @@ def main(
             print(f"[WARN] No intensity file for location '{location}', skipping")
             continue
 
-        # Load data
-        nucleus = ensure_2d(tiff.imread(cyto_path))
-        puncta = ensure_2d(tiff.imread(puncta_path))
+        # Load data (supports .tif and Cellpose _seg.npy)
+        nucleus = _load_mask_2d(cyto_path)
+        puncta = _load_mask_2d(puncta_path)
         img = load_intensity_image(intensity_path, channel=intensity_channel)
         img_puncta = load_intensity_image(intensity_path, channel=puncta_channel)
 
