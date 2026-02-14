@@ -348,26 +348,112 @@ def save_cytoplasm_triptych(img_norm, cell_mask, nuc_mask, cyto_mask, out_path):
 #  Cellpose model loader
 # ------------------------------------------------------------------ #
 
+def _resolve_bioimageio_weights(source):
+    """
+    Resolve a BioImage.io model descriptor (rdf.yaml, .zip, or resource ID)
+    to a local PyTorch weights path that Cellpose can load.
+
+    Parameters
+    ----------
+    source : str
+        Path to rdf.yaml / bioimageio.yaml / .zip, or a ``bioimage.io:<id>`` URI.
+
+    Returns
+    -------
+    weights_path : str
+        Path to the PyTorch state-dict file.
+    """
+    try:
+        from bioimageio.spec import load_description
+    except ImportError:
+        raise ImportError(
+            "The 'bioimageio.spec' package is required to load BioImage.io "
+            "models.  Install it with:  pip install 'bioimageio.core'"
+        )
+
+    model_descr = load_description(source)
+    weights = getattr(model_descr, "weights", None)
+    if weights is None:
+        raise ValueError(f"BioImage.io model '{source}' has no weights field.")
+
+    pt_weights = getattr(weights, "pytorch_state_dict", None)
+    if pt_weights is None:
+        available = getattr(weights, "available_formats", [])
+        raise ValueError(
+            f"BioImage.io model '{source}' has no pytorch_state_dict weights. "
+            f"Available weight formats: {available}"
+        )
+
+    return str(pt_weights.source)
+
+
+def _resolve_model_spec(model_spec):
+    """
+    Resolve a model specification to a value Cellpose understands.
+
+    Handles:
+    - Built-in model names (cyto3, cpsam, etc.) -- returned as-is.
+    - ``bioimage.io:<resource-id>`` URIs.
+    - Paths to BioImage.io descriptors (rdf.yaml, bioimageio.yaml, .zip).
+    - Paths to regular Cellpose model files -- returned as-is.
+    """
+    if model_spec is None:
+        return None
+
+    spec = str(model_spec).strip()
+
+    # Explicit BioImage.io URI
+    if spec.startswith("bioimage.io:"):
+        return _resolve_bioimageio_weights(spec[len("bioimage.io:"):])
+
+    spec_path = Path(spec)
+
+    # Check if it's a BioImage.io descriptor file
+    if spec_path.is_file() and spec_path.suffix.lower() in (".yaml", ".yml", ".zip"):
+        name = spec_path.name.lower()
+        if name in ("rdf.yaml", "bioimageio.yaml") or name.endswith(".zip"):
+            return _resolve_bioimageio_weights(str(spec_path))
+        # For other YAML files, peek inside for BioImage.io format markers
+        if spec_path.suffix.lower() in (".yaml", ".yml"):
+            try:
+                with open(spec_path) as fh:
+                    header = fh.read(512)
+                if "format_version" in header and "weights" in header:
+                    return _resolve_bioimageio_weights(str(spec_path))
+            except Exception:
+                pass
+
+    return spec
+
+
 def load_cellpose_model(gpu=False, model_type="cyto3"):
     """
     Load a Cellpose model, compatible with both Cellpose 3 and 4.
+
+    Supports:
+    - Built-in Cellpose model names (``cyto3``, ``cpsam``, etc.)
+    - Custom Cellpose model file paths
+    - BioImage.io models (rdf.yaml, bioimageio.yaml, .zip, or
+      ``bioimage.io:<id>`` URIs)
 
     Cellpose 4 removed ``models.Cellpose`` and uses
     ``models.CellposeModel(pretrained_model=...)`` instead.
     """
     from cellpose import models
 
+    resolved = _resolve_model_spec(model_type)
+
     # Cellpose 4+: use CellposeModel with pretrained_model
     if hasattr(models, "CellposeModel"):
         try:
-            return models.CellposeModel(gpu=gpu, pretrained_model=model_type)
+            return models.CellposeModel(gpu=gpu, pretrained_model=resolved)
         except TypeError:
             # Fallback: older CellposeModel signature
-            return models.CellposeModel(gpu=gpu, model_type=model_type)
+            return models.CellposeModel(gpu=gpu, model_type=resolved)
 
     # Cellpose 3: use Cellpose class
     if hasattr(models, "Cellpose"):
-        return models.Cellpose(gpu=gpu, model_type=model_type)
+        return models.Cellpose(gpu=gpu, model_type=resolved)
 
     raise ImportError(
         "Cannot find Cellpose model class. "
