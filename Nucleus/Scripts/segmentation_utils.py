@@ -470,7 +470,8 @@ def run_cellpose(img2d, model, diameter=None, batch_size=1, normalize=True):
     Run a pre-initialised Cellpose model on a 2D image.
 
     Compatible with Cellpose 3 (channels param) and 4 (no channels).
-    Returns the label mask (Y, X).
+    Returns (masks, flows) where masks is (Y, X) label array and
+    flows is the list of flow arrays from Cellpose.
     """
     if img2d.ndim == 3 and img2d.shape[-1] == 1:
         img2d = img2d[:, :, 0]
@@ -494,7 +495,8 @@ def run_cellpose(img2d, model, diameter=None, batch_size=1, normalize=True):
     # Cellpose 3 returns 4 values (masks, flows, styles, diams).
     result = model.eval(img2d, **kwargs)
     masks = result[0]
-    return masks
+    flows = result[1] if len(result) > 1 else []
+    return masks, flows
 
 
 # ------------------------------------------------------------------ #
@@ -506,6 +508,74 @@ def save_mask(mask, out_path):
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tiff.imwrite(str(out_path), mask.astype(np.uint16))
+
+
+def load_mask(path):
+    """
+    Load a mask from a ``.tif`` or Cellpose ``_seg.npy`` file.
+
+    For ``_seg.npy`` files, extracts the ``masks`` array from the
+    dictionary. This allows downstream analysis to use masks that
+    have been manually edited in the Cellpose GUI.
+
+    Returns
+    -------
+    mask : np.ndarray (Y, X)
+    """
+    path = Path(path)
+    if path.suffix == ".npy":
+        dat = np.load(str(path), allow_pickle=True).item()
+        return np.asarray(dat["masks"])
+    return tiff.imread(str(path))
+
+
+def save_seg_npy(img, masks, flows, filename, out_dir, diameter=None):
+    """
+    Save a Cellpose-compatible ``_seg.npy`` file for manual curation.
+
+    The saved file can be opened in the Cellpose GUI for mask editing.
+    The GUI looks for ``<imagename>_seg.npy`` alongside the image file.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        The 2D image that was segmented (normalized, float32 or uint8).
+    masks : np.ndarray (Y, X)
+        Integer label mask.
+    flows : list
+        Flow arrays returned by ``model.eval()``.
+    filename : str or Path
+        Original image filename (used as the stem for the .npy file).
+    out_dir : str or Path
+        Directory in which to save the ``_seg.npy`` file.
+    diameter : float or None
+        Estimated cell diameter (optional).
+    """
+    from cellpose.utils import outlines_list
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    stem = Path(filename).stem
+
+    # Build outlines from masks
+    outlines = outlines_list(masks)
+
+    n_cells = int(masks.max()) if masks.max() > 0 else 0
+    dat = {
+        "img": img,
+        "masks": masks.astype(np.uint16),
+        "outlines": outlines,
+        "flows": flows,
+        "ismanual": np.zeros(n_cells, dtype=bool),
+        "filename": str(filename),
+        "est_diam": diameter if diameter else 0,
+        "chan_choose": [0, 0],
+    }
+
+    npy_path = out_dir / f"{stem}_seg.npy"
+    np.save(str(npy_path), dat)
+    return npy_path
 
 
 def collect_image_paths(input_path):

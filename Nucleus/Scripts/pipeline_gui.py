@@ -504,7 +504,7 @@ class Step2Frame(ttk.LabelFrame):
                         else:
                             img_norm = auto_lut_clip(img2d)
 
-                        masks = run_cellpose(img_norm, model=model,
+                        masks, _flows = run_cellpose(img_norm, model=model,
                                              diameter=diameter)
                         masks = postprocess_mask(masks,
                                                  min_size=min_sz,

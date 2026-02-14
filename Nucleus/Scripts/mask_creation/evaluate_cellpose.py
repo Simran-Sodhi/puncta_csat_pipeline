@@ -271,7 +271,7 @@ def main():
                     high_percentile=args.lut_high,
                 )
 
-            masks = run_cellpose(
+            masks, _flows = run_cellpose(
                 img_norm, model=model,
                 diameter=args.diameter,
                 batch_size=args.batch_size,
