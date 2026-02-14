@@ -857,7 +857,8 @@ class SegmentationGUI(tk.Tk):
                             img_norm = auto_lut_clip(img2d)
 
                         masks, flows = run_cellpose(img_norm, model=model, diameter=diameter)
-                        masks = postprocess_mask(masks, min_size=min_sz, remove_edges=rm_edges, smooth_radius=smooth_r)
+                        edge_thr = 0.25 if use_dic_norm else 0.0
+                        masks = postprocess_mask(masks, min_size=min_sz, remove_edges=rm_edges, smooth_radius=smooth_r, edge_thresh=edge_thr)
                         n_objects = int(masks.max())
                         stem = img_path.stem
 

@@ -262,13 +262,22 @@ def smooth_labels(labels, smooth_radius=3):
     return smoothed
 
 
-def postprocess_mask(masks, min_size=0, remove_edges=False, smooth_radius=0):
+def postprocess_mask(masks, min_size=0, remove_edges=False, smooth_radius=0,
+                     edge_thresh=0.0):
     """
     Post-process a label mask:
     1. Remove objects smaller than *min_size*.
     2. Optionally remove objects touching the image border.
     3. Smooth mask edges (if smooth_radius > 0).
     4. Re-label consecutively.
+
+    Parameters
+    ----------
+    edge_thresh : float
+        Fraction of an object's perimeter that must lie on the image
+        border before it is removed (0.0–1.0).  When 0.0 (default),
+        any border contact removes the object.  Set to e.g. 0.25 for
+        DIC images to keep cells that only slightly touch the edge.
     """
     labels = masks.astype(np.int32, copy=True)
 
@@ -283,8 +292,21 @@ def postprocess_mask(masks, min_size=0, remove_edges=False, smooth_radius=0):
         border[0, :] = border[-1, :] = True
         border[:, 0] = border[:, -1] = True
         for lab in np.unique(labels[border]):
-            if lab != 0:
-                labels[labels == lab] = 0
+            if lab == 0:
+                continue
+            if edge_thresh > 0:
+                obj_mask = labels == lab
+                # Perimeter = pixels in the object that have at least
+                # one 4-connected background neighbour
+                eroded = morphology.binary_erosion(obj_mask)
+                perimeter = obj_mask & ~eroded
+                n_perim = int(perimeter.sum())
+                if n_perim == 0:
+                    continue
+                n_border = int((perimeter & border).sum())
+                if n_border / n_perim < edge_thresh:
+                    continue  # keep this object
+            labels[labels == lab] = 0
 
     if smooth_radius > 0:
         labels = smooth_labels(labels, smooth_radius=smooth_radius)
