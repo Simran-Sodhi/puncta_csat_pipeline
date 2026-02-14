@@ -482,6 +482,10 @@ class SegmentationGUI(tk.Tk):
         self.seg_edges_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row1, text="Remove edge objects", variable=self.seg_edges_var).pack(side=tk.LEFT, padx=8)
 
+        ttk.Label(row1, text="Smooth edges (radius):").pack(side=tk.LEFT, padx=(10, 5))
+        self.seg_smooth_radius = tk.IntVar(value=3)
+        ttk.Spinbox(row1, from_=0, to=10, textvariable=self.seg_smooth_radius, width=4).pack(side=tk.LEFT)
+
         # ---- Cytoplasm-specific options (shown/hidden) ----
         self.seg_cyto_frame = ttk.LabelFrame(body, text="Cytoplasm Options (cell - nucleus = cytoplasm)", padding=10)
 
@@ -578,6 +582,7 @@ class SegmentationGUI(tk.Tk):
             self.seg_nuc_channel.set(0)
             self.seg_min_size.set(50000)
             self.seg_edges_var.set(True)
+            self.seg_smooth_radius.set(3)
             self.seg_dic_norm_var.set(True)
             self.seg_cyto_frame.pack_forget()
         elif mode == "nucleus":
@@ -586,6 +591,7 @@ class SegmentationGUI(tk.Tk):
             self.seg_nuc_channel.set(0)
             self.seg_min_size.set(10000)
             self.seg_edges_var.set(True)
+            self.seg_smooth_radius.set(3)
             self.seg_dic_norm_var.set(False)
             self.seg_cyto_frame.pack_forget()
         elif mode == "puncta":
@@ -594,6 +600,7 @@ class SegmentationGUI(tk.Tk):
             self.seg_nuc_channel.set(0)
             self.seg_min_size.set(0)
             self.seg_edges_var.set(False)
+            self.seg_smooth_radius.set(0)
             self.seg_dic_norm_var.set(False)
             self.seg_cyto_frame.pack_forget()
         elif mode == "cytoplasm":
@@ -602,6 +609,7 @@ class SegmentationGUI(tk.Tk):
             self.seg_nuc_channel.set(0)
             self.seg_min_size.set(50000)
             self.seg_edges_var.set(True)
+            self.seg_smooth_radius.set(3)
             self.seg_dic_norm_var.set(True)
             self.seg_cyto_frame.pack(fill=tk.X, padx=10, pady=5, before=self.btn_seg_run.master)
         self._seg_update_channel_labels()
@@ -774,6 +782,7 @@ class SegmentationGUI(tk.Tk):
         min_sz = self.seg_min_size.get()
         gpu = self.seg_gpu_var.get()
         rm_edges = self.seg_edges_var.get()
+        smooth_r = self.seg_smooth_radius.get()
         use_dic_norm = self.seg_dic_norm_var.get()
         model_type = self._seg_get_model_type()
 
@@ -799,7 +808,7 @@ class SegmentationGUI(tk.Tk):
         norm_label = "DIC (CLAHE)" if use_dic_norm else "LUT"
         self._seg_log_append(
             f"Segmentation ({mode}): model={model_type}, diameter={diameter}, "
-            f"channel={channel}, z={z}, min_size={min_sz}, norm={norm_label}"
+            f"channel={channel}, z={z}, min_size={min_sz}, smooth={smooth_r}, norm={norm_label}"
         )
         self.btn_seg_run.config(state=tk.DISABLED)
         self.seg_tree.delete(*self.seg_tree.get_children())
@@ -848,7 +857,7 @@ class SegmentationGUI(tk.Tk):
                             img_norm = auto_lut_clip(img2d)
 
                         masks, flows = run_cellpose(img_norm, model=model, diameter=diameter)
-                        masks = postprocess_mask(masks, min_size=min_sz, remove_edges=rm_edges)
+                        masks = postprocess_mask(masks, min_size=min_sz, remove_edges=rm_edges, smooth_radius=smooth_r)
                         n_objects = int(masks.max())
                         stem = img_path.stem
 

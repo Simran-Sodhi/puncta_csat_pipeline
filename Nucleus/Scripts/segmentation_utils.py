@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import tifffile as tiff
 import matplotlib.pyplot as plt
+from scipy.ndimage import binary_fill_holes, gaussian_filter
 from skimage import morphology, exposure
 from skimage.segmentation import relabel_sequential
 
@@ -211,12 +212,63 @@ def filter_small_objects(masks, min_size):
     return filtered.astype(masks.dtype)
 
 
-def postprocess_mask(masks, min_size=0, remove_edges=False):
+def smooth_labels(labels, smooth_radius=3):
+    """
+    Smooth the edges of each labeled object using morphological operations
+    and Gaussian blurring.
+
+    For each label:
+    1. Extract binary mask for the label.
+    2. Apply morphological closing then opening (disk structuring element)
+       to remove small protrusions and fill small concavities.
+    3. Apply Gaussian blur + 0.5 threshold to round off remaining
+       jagged pixel-level edges.
+    4. Fill interior holes created by the smoothing.
+
+    Parameters
+    ----------
+    labels : np.ndarray (Y, X)
+        Integer label mask (0 = background).
+    smooth_radius : int
+        Radius of the disk structuring element and sigma for the
+        Gaussian blur.  Larger values = smoother edges.
+        Typical range: 2-5.  Default 3.
+
+    Returns
+    -------
+    smoothed : np.ndarray (Y, X), same dtype as input
+    """
+    if smooth_radius <= 0:
+        return labels
+
+    smoothed = np.zeros_like(labels)
+    selem = morphology.disk(smooth_radius)
+
+    for lab in np.unique(labels):
+        if lab == 0:
+            continue
+        binary = labels == lab
+        # Morphological close then open to regularise shape
+        binary = morphology.binary_closing(binary, selem)
+        binary = morphology.binary_opening(binary, selem)
+        # Gaussian blur + threshold to round off pixelated edges
+        blurred = gaussian_filter(binary.astype(np.float32), sigma=smooth_radius)
+        binary = blurred > 0.5
+        # Fill any interior holes
+        binary = binary_fill_holes(binary)
+        # Write back, later labels overwrite earlier ones at overlaps
+        smoothed[binary] = lab
+
+    return smoothed
+
+
+def postprocess_mask(masks, min_size=0, remove_edges=False, smooth_radius=0):
     """
     Post-process a label mask:
     1. Remove objects smaller than *min_size*.
     2. Optionally remove objects touching the image border.
-    3. Re-label consecutively.
+    3. Smooth mask edges (if smooth_radius > 0).
+    4. Re-label consecutively.
     """
     labels = masks.astype(np.int32, copy=True)
 
@@ -233,6 +285,9 @@ def postprocess_mask(masks, min_size=0, remove_edges=False):
         for lab in np.unique(labels[border]):
             if lab != 0:
                 labels[labels == lab] = 0
+
+    if smooth_radius > 0:
+        labels = smooth_labels(labels, smooth_radius=smooth_radius)
 
     labels, _, _ = relabel_sequential(labels)
     return labels.astype(np.int32)
