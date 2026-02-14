@@ -551,8 +551,6 @@ def save_seg_npy(img, masks, flows, filename, out_dir, diameter=None):
     diameter : float or None
         Estimated cell diameter (optional).
     """
-    from cellpose.utils import outlines_list
-
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -593,14 +591,11 @@ def save_seg_npy(img, masks, flows, filename, out_dir, diameter=None):
             img_u8 = np.zeros(ch0.shape, dtype=np.uint8)
         img_rgb = np.stack([img_u8, img_u8, img_u8], axis=-1)
 
-    # Build outlines from masks
-    outlines = outlines_list(masks)
-
     n_cells = int(masks.max()) if masks.max() > 0 else 0
     dat = {
         "img": img_rgb,
         "masks": masks.astype(np.uint16),
-        "outlines": outlines,
+        "outlines": [],
         "flows": flows,
         "ismanual": np.zeros(n_cells, dtype=bool),
         "filename": str(filename),
