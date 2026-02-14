@@ -539,7 +539,7 @@ def save_seg_npy(img, masks, flows, filename, out_dir, diameter=None):
     Parameters
     ----------
     img : np.ndarray
-        The 2D image that was segmented (normalized, float32 or uint8).
+        The 2D image that was segmented (any dtype, 2D or 3D).
     masks : np.ndarray (Y, X)
         Integer label mask.
     flows : list
@@ -558,12 +558,47 @@ def save_seg_npy(img, masks, flows, filename, out_dir, diameter=None):
 
     stem = Path(filename).stem
 
+    # Cellpose GUI expects img as (Y, X, 3) uint8 RGB stack.
+    # Convert our single-channel image to the expected format.
+    img_arr = np.asarray(img)
+    if img_arr.ndim == 2:
+        # Normalise to 0-255 uint8 for display
+        fmin, fmax = img_arr.min(), img_arr.max()
+        if fmax > fmin:
+            img_u8 = ((img_arr - fmin) / (fmax - fmin) * 255).astype(np.uint8)
+        else:
+            img_u8 = np.zeros(img_arr.shape, dtype=np.uint8)
+        # Stack to (Y, X, 3) so Cellpose GUI can unpack (Ly, Lx, _)
+        img_rgb = np.stack([img_u8, img_u8, img_u8], axis=-1)
+    elif img_arr.ndim == 3 and img_arr.shape[-1] == 3:
+        # Already (Y, X, 3)
+        if img_arr.dtype != np.uint8:
+            fmin, fmax = img_arr.min(), img_arr.max()
+            if fmax > fmin:
+                img_rgb = ((img_arr - fmin) / (fmax - fmin) * 255).astype(np.uint8)
+            else:
+                img_rgb = np.zeros(img_arr.shape, dtype=np.uint8)
+        else:
+            img_rgb = img_arr
+    else:
+        # Multi-channel (C, Y, X) – take first channel, convert to RGB
+        if img_arr.ndim == 3:
+            ch0 = img_arr[0]
+        else:
+            ch0 = img_arr.reshape(img_arr.shape[-2], img_arr.shape[-1])
+        fmin, fmax = ch0.min(), ch0.max()
+        if fmax > fmin:
+            img_u8 = ((ch0 - fmin) / (fmax - fmin) * 255).astype(np.uint8)
+        else:
+            img_u8 = np.zeros(ch0.shape, dtype=np.uint8)
+        img_rgb = np.stack([img_u8, img_u8, img_u8], axis=-1)
+
     # Build outlines from masks
     outlines = outlines_list(masks)
 
     n_cells = int(masks.max()) if masks.max() > 0 else 0
     dat = {
-        "img": img,
+        "img": img_rgb,
         "masks": masks.astype(np.uint16),
         "outlines": outlines,
         "flows": flows,
