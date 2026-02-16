@@ -211,22 +211,66 @@ def _count_puncta_objects(puncta_binary, nuc_mask):
     return int(labelled.max())
 
 
+def _per_puncta_metrics(puncta_clean, nuc_mask, img_puncta, lab):
+    """Compute per-puncta-object metrics within a nucleus."""
+    overlap = np.logical_and(puncta_clean, nuc_mask)
+    if not overlap.any():
+        return []
+    labelled = measure.label(overlap, connectivity=1)
+    puncta_objects = []
+    for prop in measure.regionprops(labelled, intensity_image=img_puncta):
+        puncta_objects.append({
+            "puncta_area": prop.area,
+            "puncta_mean_intensity": float(prop.mean_intensity),
+            "puncta_max_intensity": float(prop.max_intensity),
+            "puncta_centroid_y": float(prop.centroid[0]),
+            "puncta_centroid_x": float(prop.centroid[1]),
+            "puncta_eccentricity": float(prop.eccentricity) if prop.area > 1 else 0.0,
+        })
+    return puncta_objects
+
+
 def main(
     nuc_dir,
     puncta_dir,
     intensity_dir,
     out_csv,
+    cell_dir=None,
     min_puncta_area=5,
     puncta_open_radius=1,
     make_triptychs=False,
     triptych_out_dir=None,
     intensity_channel=2,
     puncta_channel=1,
+    export_per_puncta=False,
+    per_puncta_csv=None,
     progress_callback=None,
 ):
     """
     Parameters
     ----------
+    nuc_dir : str or Path
+        Folder with nucleus masks (required).
+    puncta_dir : str or Path
+        Folder with puncta masks (required).
+    intensity_dir : str or Path
+        Folder with raw OME-TIFF images (required).
+    out_csv : str or Path
+        Output CSV path for per-cell metrics.
+    cell_dir : str or Path or None
+        Optional folder with cell/cytoplasm masks. When provided,
+        additional cell-level metrics are computed (cell area, cytoplasm
+        intensity, etc.).
+    min_puncta_area : int
+        Minimum puncta pixel area to call has_puncta=1.
+    puncta_open_radius : int
+        Morphological opening radius for cleaning puncta mask.
+    export_per_puncta : bool
+        If True, also export a per-puncta-object CSV with individual
+        puncta metrics (area, intensity, position) linked to parent cell.
+    per_puncta_csv : str or Path or None
+        Output path for per-puncta CSV. Defaults to out_csv with
+        ``_per_puncta`` suffix.
     progress_callback : callable or None
         If provided, called with (current_index, total) after each image
         to report progress (e.g. for GUI progress bars).
@@ -235,10 +279,13 @@ def main(
     puncta_dir = Path(puncta_dir)
     intensity_dir = Path(intensity_dir)
     triptych_out_dir = Path(triptych_out_dir) if triptych_out_dir else None
+    cell_dir = Path(cell_dir) if cell_dir else None
 
     puncta_map = build_location_map(puncta_dir, "puncta")
     intensity_map = build_location_map(intensity_dir, "intensity")
+    cell_map = build_location_map(cell_dir, "cell") if cell_dir else {}
     rows = []
+    puncta_rows = []  # per-puncta-object rows
 
     nuc_files = sorted(
         list(nuc_dir.glob("*.tif")) + list(nuc_dir.glob("*_seg.npy"))
@@ -263,6 +310,11 @@ def main(
         puncta = _load_mask_2d(puncta_path)
         img = load_intensity_image(intensity_path, channel=intensity_channel)
         img_puncta = load_intensity_image(intensity_path, channel=puncta_channel)
+
+        # Optional cell mask
+        cell_labels = None
+        if cell_dir and location in cell_map:
+            cell_labels = get_labels(_load_mask_2d(cell_map[location]))
 
         # Shape validation
         if nucleus.shape != img.shape:
@@ -301,6 +353,7 @@ def main(
 
         # Background estimate for background-subtracted intensity
         bg_intensity = _estimate_background(img, labels)
+        bg_puncta = _estimate_background(img_puncta, labels)
 
         has_puncta_map = {}
 
@@ -327,21 +380,40 @@ def main(
             # Count distinct puncta objects within this nucleus
             n_puncta_objects = _count_puncta_objects(puncta_clean, nuc_mask)
 
-            # Intensity statistics (raw)
+            # Nucleus channel intensity statistics
             pixel_vals = img[nuc_mask].astype(np.float32)
             nuc_mean_raw = float(pixel_vals.mean())
             nuc_median_raw = float(np.median(pixel_vals))
             nuc_std_raw = float(pixel_vals.std())
             nuc_mean_bgsub = nuc_mean_raw - bg_intensity
 
+            # Puncta channel intensity within nucleus
+            puncta_ch_vals = img_puncta[nuc_mask].astype(np.float32)
+            puncta_ch_mean = float(puncta_ch_vals.mean())
+            puncta_ch_median = float(np.median(puncta_ch_vals))
+            puncta_ch_std = float(puncta_ch_vals.std())
+            puncta_ch_mean_bgsub = puncta_ch_mean - bg_puncta
+
+            # Puncta-only intensity (within detected puncta regions)
+            if n_puncta_px > 0:
+                puncta_only_vals = img_puncta[puncta_inside].astype(np.float32)
+                puncta_mean_intensity = float(puncta_only_vals.mean())
+                puncta_max_intensity = float(puncta_only_vals.max())
+                puncta_median_intensity = float(np.median(puncta_only_vals))
+            else:
+                puncta_mean_intensity = 0.0
+                puncta_max_intensity = 0.0
+                puncta_median_intensity = 0.0
+
             cy, cx = centroid_map.get(lab, (np.nan, np.nan))
 
-            rows.append({
+            row = {
                 "image_location": location,
                 "nuc_file": cyto_path.name,
                 "puncta_file": puncta_path.name,
                 "intensity_file": intensity_path.name,
                 "intensity_channel": intensity_channel,
+                "puncta_channel": puncta_channel,
                 "nucleus_label": lab,
                 "centroid_y": cy,
                 "centroid_x": cx,
@@ -358,8 +430,60 @@ def main(
                 "nuc_std_raw": nuc_std_raw,
                 "nuc_mean_bgsub": nuc_mean_bgsub,
                 "bg_intensity": bg_intensity,
+                "puncta_ch_mean": puncta_ch_mean,
+                "puncta_ch_median": puncta_ch_median,
+                "puncta_ch_std": puncta_ch_std,
+                "puncta_ch_mean_bgsub": puncta_ch_mean_bgsub,
+                "puncta_mean_intensity": puncta_mean_intensity,
+                "puncta_max_intensity": puncta_max_intensity,
+                "puncta_median_intensity": puncta_median_intensity,
                 "sat_frac_nuc": sat_frac,
-            })
+            }
+
+            # Cell-level metrics when cell masks available
+            if cell_labels is not None:
+                # Find corresponding cell label at nucleus centroid
+                cyi, cxi = int(round(cy)), int(round(cx))
+                if 0 <= cyi < cell_labels.shape[0] and 0 <= cxi < cell_labels.shape[1]:
+                    cell_lab = int(cell_labels[cyi, cxi])
+                else:
+                    cell_lab = 0
+                cell_mask = cell_labels == cell_lab if cell_lab > 0 else np.zeros_like(nuc_mask)
+                cell_area = int(cell_mask.sum())
+                cyto_mask = np.logical_and(cell_mask, ~nuc_mask)
+                cyto_area = int(cyto_mask.sum())
+                if cyto_area > 0:
+                    cyto_vals = img[cyto_mask].astype(np.float32)
+                    cyto_mean = float(cyto_vals.mean())
+                    cyto_puncta_vals = img_puncta[cyto_mask].astype(np.float32)
+                    cyto_puncta_mean = float(cyto_puncta_vals.mean())
+                else:
+                    cyto_mean = 0.0
+                    cyto_puncta_mean = 0.0
+                # Puncta in cytoplasm
+                cyto_puncta_px = int(np.logical_and(cyto_mask, puncta_clean).sum())
+                row.update({
+                    "cell_label": cell_lab,
+                    "cell_area": cell_area,
+                    "cyto_area": cyto_area,
+                    "cyto_nuc_mean": cyto_mean,
+                    "cyto_puncta_ch_mean": cyto_puncta_mean,
+                    "cyto_puncta_pixels": cyto_puncta_px,
+                    "nuc_cyto_ratio": n_pix / cell_area if cell_area > 0 else np.nan,
+                })
+
+            rows.append(row)
+
+            # Per-puncta-object details
+            if export_per_puncta:
+                puncta_objs = _per_puncta_metrics(puncta_clean, nuc_mask, img_puncta, lab)
+                for pi, po in enumerate(puncta_objs):
+                    po.update({
+                        "image_location": location,
+                        "nucleus_label": lab,
+                        "puncta_index": pi + 1,
+                    })
+                    puncta_rows.append(po)
 
         # Triptych
         if make_triptychs and triptych_out_dir is not None:
@@ -383,6 +507,15 @@ def main(
     df = pd.DataFrame(rows)
     df.to_csv(out_csv, index=False)
     print(f"Saved {len(rows)} rows to {out_csv}")
+
+    # Export per-puncta CSV
+    if export_per_puncta and puncta_rows:
+        if per_puncta_csv is None:
+            base = Path(out_csv)
+            per_puncta_csv = base.parent / f"{base.stem}_per_puncta{base.suffix}"
+        df_puncta = pd.DataFrame(puncta_rows)
+        df_puncta.to_csv(per_puncta_csv, index=False)
+        print(f"Saved {len(puncta_rows)} per-puncta rows to {per_puncta_csv}")
 
 
 if __name__ == "__main__":
@@ -409,6 +542,12 @@ if __name__ == "__main__":
                         help="Channel for nucleus intensity (default: 2)")
     parser.add_argument("--puncta-channel", type=int, default=1,
                         help="Channel for puncta intensity (default: 1)")
+    parser.add_argument("--cell-dir", type=str, default=None,
+                        help="Optional folder with cell/cytoplasm masks")
+    parser.add_argument("--export-per-puncta", action="store_true",
+                        help="Export per-puncta-object CSV with individual metrics")
+    parser.add_argument("--per-puncta-csv", type=str, default=None,
+                        help="Path for per-puncta CSV (default: auto from out-csv)")
 
     args = parser.parse_args()
     main(**vars(args))

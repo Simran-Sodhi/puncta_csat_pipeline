@@ -971,12 +971,12 @@ class SegmentationGUI(tk.Tk):
             self._seg_log_append("[DONE] Segmentation complete.")
 
     # ==================================================================
-    # TAB: PUNCTA SEGMENTATION (classical methods, not Cellpose)
+    # TAB: PUNCTA SEGMENTATION (hybrid detection framework)
     # ==================================================================
     def _build_puncta_seg_tab(self):
         tab = self.tab_puncta_seg
 
-        # Use a canvas + scrollbar so the tab is scrollable
+        # Scrollable canvas
         canvas = tk.Canvas(tab, highlightthickness=0)
         sb = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=canvas.yview)
         self.pseg_body = ttk.Frame(canvas)
@@ -992,8 +992,9 @@ class SegmentationGUI(tk.Tk):
 
         info = ttk.Label(
             body,
-            text="Detect puncta using classical image processing (threshold / LoG / DoG).\n"
-                 "Produces label masks for training or direct use in Analysis.\n"
+            text="Detect puncta using multiple methods: Threshold, LoG (Punctatools-style),\n"
+                 "DoG, Intensity-Ratio (PunctaFinder-style), Spotiflow (deep-learning),\n"
+                 "or Consensus (combine 2+ detectors).  Produces label masks for training.\n"
                  "Saves Cellpose-compatible _seg.npy for curation in the Cellpose GUI.",
             foreground="gray",
         )
@@ -1005,23 +1006,15 @@ class SegmentationGUI(tk.Tk):
 
         ttk.Label(io_frame, text="Image Directory:").grid(row=0, column=0, sticky=tk.W, pady=2)
         self.pseg_input_dir = tk.StringVar()
-        ttk.Entry(io_frame, textvariable=self.pseg_input_dir, width=55).grid(
-            row=0, column=1, padx=5, pady=2
-        )
+        ttk.Entry(io_frame, textvariable=self.pseg_input_dir, width=55).grid(row=0, column=1, padx=5, pady=2)
         ttk.Button(io_frame, text="Browse...",
-                    command=lambda: self._browse_dir(self.pseg_input_dir)).grid(
-            row=0, column=2, pady=2
-        )
+                    command=lambda: self._browse_dir(self.pseg_input_dir)).grid(row=0, column=2, pady=2)
 
         ttk.Label(io_frame, text="Output Masks Directory:").grid(row=1, column=0, sticky=tk.W, pady=2)
         self.pseg_out_dir = tk.StringVar()
-        ttk.Entry(io_frame, textvariable=self.pseg_out_dir, width=55).grid(
-            row=1, column=1, padx=5, pady=2
-        )
+        ttk.Entry(io_frame, textvariable=self.pseg_out_dir, width=55).grid(row=1, column=1, padx=5, pady=2)
         ttk.Button(io_frame, text="Browse...",
-                    command=lambda: self._browse_dir(self.pseg_out_dir)).grid(
-            row=1, column=2, pady=2
-        )
+                    command=lambda: self._browse_dir(self.pseg_out_dir)).grid(row=1, column=2, pady=2)
 
         # ---- Channel ----
         ch_frame = ttk.LabelFrame(body, text="Channel Selection", padding=10)
@@ -1029,72 +1022,113 @@ class SegmentationGUI(tk.Tk):
 
         ttk.Label(ch_frame, text="Puncta Channel:").grid(row=0, column=0, sticky=tk.W, pady=2)
         self.pseg_channel = tk.IntVar(value=1)
-        pseg_ch_combo = ttk.Combobox(
-            ch_frame, textvariable=self.pseg_channel, values=[0, 1, 2, 3],
-            width=5, state="readonly",
-        )
-        pseg_ch_combo.grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
+        ttk.Combobox(ch_frame, textvariable=self.pseg_channel, values=[0, 1, 2, 3],
+                     width=5, state="readonly").grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
         ttk.Label(ch_frame, text="(1 = mEGFP for most datasets)", foreground="gray").grid(
-            row=0, column=2, sticky=tk.W, padx=5
-        )
+            row=0, column=2, sticky=tk.W, padx=5)
 
         ttk.Label(ch_frame, text="Z-Slice:").grid(row=1, column=0, sticky=tk.W, pady=2)
         self.pseg_z_idx = tk.IntVar(value=0)
-        ttk.Entry(ch_frame, textvariable=self.pseg_z_idx, width=6).grid(
-            row=1, column=1, padx=5, pady=2, sticky=tk.W
-        )
+        ttk.Entry(ch_frame, textvariable=self.pseg_z_idx, width=6).grid(row=1, column=1, padx=5, pady=2, sticky=tk.W)
 
         # ---- Detection Method ----
         method_frame = ttk.LabelFrame(body, text="Detection Method", padding=10)
         method_frame.pack(fill=tk.X, padx=10, pady=5)
 
         self.pseg_method = tk.StringVar(value="threshold")
-        method_row = ttk.Frame(method_frame)
-        method_row.pack(fill=tk.X)
+        method_row1 = ttk.Frame(method_frame)
+        method_row1.pack(fill=tk.X)
         for label, val in [("Threshold", "threshold"),
-                           ("LoG (Laplacian of Gaussian)", "log"),
-                           ("DoG (Difference of Gaussians)", "dog")]:
-            ttk.Radiobutton(method_row, text=label, variable=self.pseg_method,
-                            value=val, command=self._pseg_on_method_change).pack(
-                side=tk.LEFT, padx=8
-            )
+                           ("LoG (Punctatools)", "log"),
+                           ("DoG", "dog")]:
+            ttk.Radiobutton(method_row1, text=label, variable=self.pseg_method,
+                            value=val, command=self._pseg_on_method_change).pack(side=tk.LEFT, padx=6)
 
-        # Threshold-specific options
+        method_row2 = ttk.Frame(method_frame)
+        method_row2.pack(fill=tk.X, pady=(2, 0))
+        for label, val in [("Intensity-Ratio (PunctaFinder)", "intensity_ratio"),
+                           ("Spotiflow (DL)", "spotiflow"),
+                           ("Consensus (multi-detector)", "consensus")]:
+            ttk.Radiobutton(method_row2, text=label, variable=self.pseg_method,
+                            value=val, command=self._pseg_on_method_change).pack(side=tk.LEFT, padx=6)
+
+        # -- Threshold sub-panel --
         self.pseg_thresh_frame = ttk.Frame(method_frame)
-        self.pseg_thresh_frame.pack(fill=tk.X, pady=(5, 0))
-
         ttk.Label(self.pseg_thresh_frame, text="Algorithm:").pack(side=tk.LEFT, padx=(0, 5))
         self.pseg_thresh_method = tk.StringVar(value="otsu")
-        ttk.Combobox(
-            self.pseg_thresh_frame, textvariable=self.pseg_thresh_method,
-            values=["otsu", "yen", "triangle", "li", "custom"],
-            width=10, state="readonly",
-        ).pack(side=tk.LEFT, padx=(0, 15))
-
+        ttk.Combobox(self.pseg_thresh_frame, textvariable=self.pseg_thresh_method,
+                     values=["otsu", "yen", "triangle", "li", "custom"],
+                     width=10, state="readonly").pack(side=tk.LEFT, padx=(0, 15))
         ttk.Label(self.pseg_thresh_frame, text="Custom value (0-1):").pack(side=tk.LEFT, padx=(0, 5))
         self.pseg_custom_thresh = tk.DoubleVar(value=0.3)
-        ttk.Entry(self.pseg_thresh_frame, textvariable=self.pseg_custom_thresh, width=6).pack(
-            side=tk.LEFT
-        )
+        ttk.Entry(self.pseg_thresh_frame, textvariable=self.pseg_custom_thresh, width=6).pack(side=tk.LEFT)
 
-        # Blob-specific options (LoG / DoG)
+        # -- Blob sub-panel (LoG / DoG) --
         self.pseg_blob_frame = ttk.Frame(method_frame)
-
         ttk.Label(self.pseg_blob_frame, text="Min sigma:").pack(side=tk.LEFT, padx=(0, 5))
         self.pseg_min_sigma = tk.DoubleVar(value=1.0)
-        ttk.Entry(self.pseg_blob_frame, textvariable=self.pseg_min_sigma, width=6).pack(
-            side=tk.LEFT, padx=(0, 15)
-        )
+        ttk.Entry(self.pseg_blob_frame, textvariable=self.pseg_min_sigma, width=6).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(self.pseg_blob_frame, text="Max sigma:").pack(side=tk.LEFT, padx=(0, 5))
         self.pseg_max_sigma = tk.DoubleVar(value=5.0)
-        ttk.Entry(self.pseg_blob_frame, textvariable=self.pseg_max_sigma, width=6).pack(
-            side=tk.LEFT, padx=(0, 15)
-        )
+        ttk.Entry(self.pseg_blob_frame, textvariable=self.pseg_max_sigma, width=6).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(self.pseg_blob_frame, text="Blob threshold:").pack(side=tk.LEFT, padx=(0, 5))
         self.pseg_blob_thresh = tk.DoubleVar(value=0.1)
-        ttk.Entry(self.pseg_blob_frame, textvariable=self.pseg_blob_thresh, width=6).pack(
-            side=tk.LEFT
-        )
+        ttk.Entry(self.pseg_blob_frame, textvariable=self.pseg_blob_thresh, width=6).pack(side=tk.LEFT)
+
+        # -- Intensity-Ratio sub-panel (PunctaFinder) --
+        self.pseg_ir_frame = ttk.Frame(method_frame)
+        ttk.Label(self.pseg_ir_frame, text="Punctum radius:").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_ir_radius = tk.IntVar(value=3)
+        ttk.Entry(self.pseg_ir_frame, textvariable=self.pseg_ir_radius, width=4).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(self.pseg_ir_frame, text="Local ratio:").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_ir_local = tk.DoubleVar(value=1.5)
+        ttk.Entry(self.pseg_ir_frame, textvariable=self.pseg_ir_local, width=5).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(self.pseg_ir_frame, text="Global ratio:").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_ir_global = tk.DoubleVar(value=1.5)
+        ttk.Entry(self.pseg_ir_frame, textvariable=self.pseg_ir_global, width=5).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(self.pseg_ir_frame, text="Max CV:").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_ir_cv = tk.DoubleVar(value=0.5)
+        ttk.Entry(self.pseg_ir_frame, textvariable=self.pseg_ir_cv, width=5).pack(side=tk.LEFT)
+
+        # -- Spotiflow sub-panel --
+        self.pseg_spoti_frame = ttk.Frame(method_frame)
+        ttk.Label(self.pseg_spoti_frame, text="Model:").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_spoti_model = tk.StringVar(value="general")
+        ttk.Combobox(self.pseg_spoti_frame, textvariable=self.pseg_spoti_model,
+                     values=["general", "Custom..."], width=12).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(self.pseg_spoti_frame, text="Prob threshold:").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_spoti_prob = tk.DoubleVar(value=0.5)
+        ttk.Entry(self.pseg_spoti_frame, textvariable=self.pseg_spoti_prob, width=5).pack(side=tk.LEFT)
+        ttk.Label(self.pseg_spoti_frame, text="  (requires: pip install spotiflow)",
+                  foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        # -- Consensus sub-panel --
+        self.pseg_cons_frame = ttk.Frame(method_frame)
+        cons_row1 = ttk.Frame(self.pseg_cons_frame)
+        cons_row1.pack(fill=tk.X, pady=2)
+        ttk.Label(cons_row1, text="Detectors to combine:").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_cons_thresh = tk.BooleanVar(value=True)
+        ttk.Checkbutton(cons_row1, text="Threshold", variable=self.pseg_cons_thresh).pack(side=tk.LEFT, padx=3)
+        self.pseg_cons_log = tk.BooleanVar(value=True)
+        ttk.Checkbutton(cons_row1, text="LoG", variable=self.pseg_cons_log).pack(side=tk.LEFT, padx=3)
+        self.pseg_cons_ir = tk.BooleanVar(value=False)
+        ttk.Checkbutton(cons_row1, text="Intensity-Ratio", variable=self.pseg_cons_ir).pack(side=tk.LEFT, padx=3)
+        self.pseg_cons_spoti = tk.BooleanVar(value=False)
+        ttk.Checkbutton(cons_row1, text="Spotiflow", variable=self.pseg_cons_spoti).pack(side=tk.LEFT, padx=3)
+
+        cons_row2 = ttk.Frame(self.pseg_cons_frame)
+        cons_row2.pack(fill=tk.X, pady=2)
+        ttk.Label(cons_row2, text="Strategy:").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_cons_strategy = tk.StringVar(value="weighted_confidence")
+        ttk.Combobox(cons_row2, textvariable=self.pseg_cons_strategy,
+                     values=["union", "intersection", "majority_vote", "weighted_confidence"],
+                     width=22, state="readonly").pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(cons_row2, text="Match distance:").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_cons_match_dist = tk.DoubleVar(value=3.0)
+        ttk.Entry(cons_row2, textvariable=self.pseg_cons_match_dist, width=5).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(cons_row2, text="Confidence threshold:").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_cons_conf_thresh = tk.DoubleVar(value=0.3)
+        ttk.Entry(cons_row2, textvariable=self.pseg_cons_conf_thresh, width=5).pack(side=tk.LEFT)
 
         # ---- Pre-processing ----
         preproc_frame = ttk.LabelFrame(body, text="Pre-processing", padding=10)
@@ -1102,18 +1136,23 @@ class SegmentationGUI(tk.Tk):
 
         row0 = ttk.Frame(preproc_frame)
         row0.pack(fill=tk.X, pady=2)
-
         ttk.Label(row0, text="Gaussian sigma:").pack(side=tk.LEFT, padx=(0, 5))
         self.pseg_sigma = tk.DoubleVar(value=1.0)
         ttk.Entry(row0, textvariable=self.pseg_sigma, width=6).pack(side=tk.LEFT, padx=(0, 15))
 
         self.pseg_bg_sub = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row0, text="Background subtraction (white top-hat)",
-                        variable=self.pseg_bg_sub).pack(side=tk.LEFT, padx=(0, 15))
+        ttk.Checkbutton(row0, text="Background subtraction", variable=self.pseg_bg_sub).pack(
+            side=tk.LEFT, padx=(0, 10))
 
-        ttk.Label(row0, text="Top-hat radius:").pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(row0, text="Method:").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_bg_method = tk.StringVar(value="white_tophat")
+        ttk.Combobox(row0, textvariable=self.pseg_bg_method,
+                     values=["white_tophat", "rolling_ball", "gaussian", "median"],
+                     width=14, state="readonly").pack(side=tk.LEFT, padx=(0, 10))
+
+        ttk.Label(row0, text="Radius:").pack(side=tk.LEFT, padx=(0, 5))
         self.pseg_tophat_radius = tk.IntVar(value=15)
-        ttk.Entry(row0, textvariable=self.pseg_tophat_radius, width=6).pack(side=tk.LEFT)
+        ttk.Entry(row0, textvariable=self.pseg_tophat_radius, width=5).pack(side=tk.LEFT)
 
         # ---- Post-processing ----
         post_frame = ttk.LabelFrame(body, text="Post-processing (size filters)", padding=10)
@@ -1121,16 +1160,13 @@ class SegmentationGUI(tk.Tk):
 
         row1 = ttk.Frame(post_frame)
         row1.pack(fill=tk.X, pady=2)
-
         ttk.Label(row1, text="Min size (px):").pack(side=tk.LEFT, padx=(0, 5))
         self.pseg_min_size = tk.IntVar(value=3)
         ttk.Entry(row1, textvariable=self.pseg_min_size, width=8).pack(side=tk.LEFT, padx=(0, 15))
-
         ttk.Label(row1, text="Max size (px):").pack(side=tk.LEFT, padx=(0, 5))
         self.pseg_max_size = tk.IntVar(value=0)
         ttk.Entry(row1, textvariable=self.pseg_max_size, width=8).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Label(row1, text="(0 = no limit)", foreground="gray").pack(side=tk.LEFT, padx=(0, 15))
-
         ttk.Label(row1, text="Open radius:").pack(side=tk.LEFT, padx=(0, 5))
         self.pseg_open_radius = tk.IntVar(value=0)
         ttk.Entry(row1, textvariable=self.pseg_open_radius, width=5).pack(side=tk.LEFT)
@@ -1142,7 +1178,6 @@ class SegmentationGUI(tk.Tk):
         self.pseg_save_npy = tk.BooleanVar(value=True)
         ttk.Checkbutton(out_opts, text="Save Cellpose _seg.npy (for curation / training)",
                         variable=self.pseg_save_npy).pack(anchor=tk.W, pady=1)
-
         self.pseg_save_trip = tk.BooleanVar(value=True)
         ttk.Checkbutton(out_opts, text="Save QC triptych PNGs",
                         variable=self.pseg_save_trip).pack(anchor=tk.W, pady=1)
@@ -1157,27 +1192,21 @@ class SegmentationGUI(tk.Tk):
         # Progress
         self.pseg_progress = ttk.Progressbar(body, mode="determinate")
         self.pseg_progress.pack(fill=tk.X, padx=10, pady=5)
-
         self.pseg_status = tk.StringVar(value="Ready")
         ttk.Label(body, textvariable=self.pseg_status).pack(padx=10, anchor=tk.W)
 
         # Results table
         result_frame = ttk.LabelFrame(body, text="Results", padding=5)
         result_frame.pack(fill=tk.X, padx=10, pady=(5, 5))
-
         columns = ("filename", "objects", "status")
-        self.pseg_tree = ttk.Treeview(
-            result_frame, columns=columns, show="headings", height=6
-        )
+        self.pseg_tree = ttk.Treeview(result_frame, columns=columns, show="headings", height=6)
         self.pseg_tree.heading("filename", text="Filename")
         self.pseg_tree.heading("objects", text="Puncta Found")
         self.pseg_tree.heading("status", text="Status")
         self.pseg_tree.column("filename", width=350)
         self.pseg_tree.column("objects", width=120, anchor=tk.CENTER)
         self.pseg_tree.column("status", width=120, anchor=tk.CENTER)
-
-        pseg_tree_scroll = ttk.Scrollbar(result_frame, orient=tk.VERTICAL,
-                                         command=self.pseg_tree.yview)
+        pseg_tree_scroll = ttk.Scrollbar(result_frame, orient=tk.VERTICAL, command=self.pseg_tree.yview)
         self.pseg_tree.configure(yscrollcommand=pseg_tree_scroll.set)
         self.pseg_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         pseg_tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1195,12 +1224,22 @@ class SegmentationGUI(tk.Tk):
 
     def _pseg_on_method_change(self):
         method = self.pseg_method.get()
+        # Hide all sub-panels
+        for frame in (self.pseg_thresh_frame, self.pseg_blob_frame,
+                      self.pseg_ir_frame, self.pseg_spoti_frame,
+                      self.pseg_cons_frame):
+            frame.pack_forget()
+        # Show relevant sub-panel
         if method == "threshold":
             self.pseg_thresh_frame.pack(fill=tk.X, pady=(5, 0))
-            self.pseg_blob_frame.pack_forget()
-        else:
-            self.pseg_thresh_frame.pack_forget()
+        elif method in ("log", "dog"):
             self.pseg_blob_frame.pack(fill=tk.X, pady=(5, 0))
+        elif method == "intensity_ratio":
+            self.pseg_ir_frame.pack(fill=tk.X, pady=(5, 0))
+        elif method == "spotiflow":
+            self.pseg_spoti_frame.pack(fill=tk.X, pady=(5, 0))
+        elif method == "consensus":
+            self.pseg_cons_frame.pack(fill=tk.X, pady=(5, 0))
 
     def _pseg_log_append(self, msg):
         self.pseg_log.config(state=tk.NORMAL)
@@ -1216,11 +1255,8 @@ class SegmentationGUI(tk.Tk):
                                    "Select both image directory and output directory.")
             return
         if NUCLEUS_SCRIPTS_DIR is None:
-            messagebox.showerror(
-                "Nucleus/Scripts not found",
-                "Cannot find Nucleus/Scripts/.\n"
-                "Make sure the Nucleus/ folder is in the repository root."
-            )
+            messagebox.showerror("Nucleus/Scripts not found",
+                                 "Cannot find Nucleus/Scripts/.\nMake sure the Nucleus/ folder is in the repository root.")
             return
 
         method = self.pseg_method.get()
@@ -1228,6 +1264,7 @@ class SegmentationGUI(tk.Tk):
         z_idx = self.pseg_z_idx.get()
         sigma = self.pseg_sigma.get()
         bg_sub = self.pseg_bg_sub.get()
+        bg_method = self.pseg_bg_method.get()
         tophat_r = self.pseg_tophat_radius.get()
         min_sz = self.pseg_min_size.get()
         max_sz = self.pseg_max_size.get()
@@ -1242,9 +1279,34 @@ class SegmentationGUI(tk.Tk):
         max_sig = self.pseg_max_sigma.get()
         blob_thr = self.pseg_blob_thresh.get()
 
+        # Intensity-ratio params
+        ir_radius = self.pseg_ir_radius.get()
+        ir_local = self.pseg_ir_local.get()
+        ir_global = self.pseg_ir_global.get()
+        ir_cv = self.pseg_ir_cv.get()
+
+        # Spotiflow params
+        spoti_model = self.pseg_spoti_model.get()
+        spoti_prob = self.pseg_spoti_prob.get()
+
+        # Consensus params
+        cons_detectors = []
+        if self.pseg_cons_thresh.get():
+            cons_detectors.append("threshold")
+        if self.pseg_cons_log.get():
+            cons_detectors.append("log")
+        if self.pseg_cons_ir.get():
+            cons_detectors.append("intensity_ratio")
+        if self.pseg_cons_spoti.get():
+            cons_detectors.append("spotiflow")
+        cons_strategy = self.pseg_cons_strategy.get()
+        cons_match_dist = self.pseg_cons_match_dist.get()
+        cons_conf_thresh = self.pseg_cons_conf_thresh.get()
+
         self._pseg_log_append(
             f"Puncta segmentation: method={method}, channel={channel}, z={z_idx}, "
-            f"sigma={sigma}, bg_sub={bg_sub}, min_size={min_sz}, max_size={max_sz}"
+            f"sigma={sigma}, bg={bg_method if bg_sub else 'off'}, "
+            f"min_size={min_sz}, max_size={max_sz}"
         )
         self.btn_pseg_run.config(state=tk.DISABLED)
         self.pseg_tree.delete(*self.pseg_tree.get_children())
@@ -1272,14 +1334,25 @@ class SegmentationGUI(tk.Tk):
                     sigma=sigma,
                     background_subtraction=bg_sub,
                     tophat_radius=tophat_r,
+                    bg_method=bg_method,
                     threshold_method=thresh_method,
                     custom_threshold=custom_thresh if thresh_method == "custom" else None,
                     min_sigma=min_sig,
                     max_sigma=max_sig,
                     blob_threshold=blob_thr,
+                    punctum_radius=ir_radius,
+                    t_local=ir_local,
+                    t_global=ir_global,
+                    t_cv=ir_cv,
                     min_size=min_sz,
                     max_size=max_sz,
                     open_radius=open_r,
+                    spotiflow_model=spoti_model,
+                    spotiflow_prob=spoti_prob,
+                    consensus_detectors=cons_detectors if method == "consensus" else None,
+                    consensus_strategy=cons_strategy,
+                    consensus_threshold=cons_conf_thresh,
+                    consensus_match_dist=cons_match_dist,
                     save_cellpose_npy=save_npy,
                     save_triptychs=save_trip,
                     progress_callback=_on_progress,
@@ -1309,10 +1382,9 @@ class SegmentationGUI(tk.Tk):
 
         info = ttk.Label(
             tab,
-            text="Per-cell intensity & puncta analysis using pre-computed masks.\n"
-                 "Run this after you have nucleus masks, puncta masks (from the Puncta Segmentation\n"
-                 "tab or Cellpose), and the raw OME-TIFF images.\n"
-                 "Outputs a CSV with per-cell metrics: intensity, puncta count, shape, etc.",
+            text="Post-mask analysis: compute per-cell metrics from pre-computed masks.\n"
+                 "Provide nucleus masks, puncta masks, and raw images. Optionally add cell masks\n"
+                 "for cytoplasm metrics. Outputs per-cell CSV and optional per-puncta CSV.",
             foreground="gray",
         )
         info.pack(anchor=tk.W, padx=10, pady=(10, 5))
@@ -1342,11 +1414,18 @@ class SegmentationGUI(tk.Tk):
             row=2, column=2, pady=2
         )
 
+        ttk.Label(io_frame, text="Cell Masks Folder (optional):").grid(row=3, column=0, sticky=tk.W, pady=2)
+        self.ana_cell_dir = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.ana_cell_dir, width=50).grid(row=3, column=1, padx=5, pady=2)
+        ttk.Button(io_frame, text="Browse...", command=lambda: self._browse_dir(self.ana_cell_dir)).grid(
+            row=3, column=2, pady=2
+        )
+
         # Output
         out_frame = ttk.LabelFrame(tab, text="Output", padding=10)
         out_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        ttk.Label(out_frame, text="Output CSV File:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        ttk.Label(out_frame, text="Per-cell CSV:").grid(row=0, column=0, sticky=tk.W, pady=2)
         self.ana_csv_path = tk.StringVar()
         ttk.Entry(out_frame, textvariable=self.ana_csv_path, width=50).grid(row=0, column=1, padx=5, pady=2)
         ttk.Button(out_frame, text="Browse...", command=self._ana_browse_csv).grid(
@@ -1390,6 +1469,29 @@ class SegmentationGUI(tk.Tk):
         ttk.Checkbutton(row1, text="Generate QC triptychs", variable=self.ana_trip_var).pack(
             side=tk.LEFT, padx=8
         )
+
+        self.ana_per_puncta_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            row1, text="Export per-puncta CSV (individual puncta metrics)",
+            variable=self.ana_per_puncta_var
+        ).pack(side=tk.LEFT, padx=8)
+
+        # Metrics info
+        metrics_frame = ttk.LabelFrame(tab, text="Output Metrics", padding=10)
+        metrics_frame.pack(fill=tk.X, padx=10, pady=5)
+        metrics_text = (
+            "Per-cell CSV columns:\n"
+            "  Shape: num_nuc_pixels, eccentricity, solidity\n"
+            "  Puncta: num_puncta_objects, puncta_density, has_puncta, puncta_area_in_nuc\n"
+            "  Nuc intensity: nuc_mean_raw, nuc_median_raw, nuc_std_raw, nuc_mean_bgsub\n"
+            "  Puncta ch intensity: puncta_ch_mean, puncta_ch_median, puncta_ch_std, puncta_ch_mean_bgsub\n"
+            "  Puncta spot intensity: puncta_mean_intensity, puncta_max_intensity, puncta_median_intensity\n"
+            "  Cell (if cell masks): cell_area, cyto_area, cyto_nuc_mean, cyto_puncta_ch_mean, nuc_cyto_ratio\n"
+            "\n"
+            "Per-puncta CSV (optional): puncta_area, puncta_mean/max_intensity, centroid, eccentricity"
+        )
+        ttk.Label(metrics_frame, text=metrics_text, foreground="gray", justify=tk.LEFT,
+                  font=("Courier", 8)).pack(anchor=tk.W)
 
         # Run button
         btn_frame = ttk.Frame(tab)
@@ -1457,8 +1559,14 @@ class SegmentationGUI(tk.Tk):
         open_r = self.ana_open_radius.get()
         trip = self.ana_trip_var.get()
         trip_dir = self.ana_trip_dir.get() or None
+        cell_dir = self.ana_cell_dir.get() or None
+        per_puncta = self.ana_per_puncta_var.get()
 
         self._ana_log_append(f"Analysis: nuc_ch={int_ch}, puncta_ch={pun_ch}, min_area={min_a}")
+        if cell_dir:
+            self._ana_log_append(f"  Cell masks: {cell_dir}")
+        if per_puncta:
+            self._ana_log_append("  Per-puncta CSV export enabled")
         self.btn_ana_run.config(state=tk.DISABLED)
         self.ana_status.set("Running analysis...")
 
@@ -1475,12 +1583,14 @@ class SegmentationGUI(tk.Tk):
                     puncta_dir=puncta,
                     intensity_dir=intensity,
                     out_csv=csv_path,
+                    cell_dir=cell_dir,
                     min_puncta_area=min_a,
                     puncta_open_radius=open_r,
                     make_triptychs=trip,
                     triptych_out_dir=trip_dir,
                     intensity_channel=int_ch,
                     puncta_channel=pun_ch,
+                    export_per_puncta=per_puncta,
                     progress_callback=_on_progress,
                 )
                 self.log_queue.put(f"__ANA_DONE__{csv_path}")
