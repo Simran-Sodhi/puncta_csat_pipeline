@@ -91,9 +91,13 @@ class SpotiflowDetector(BaseDetector):
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
         if self.model_path == "general":
-            self._model = _Spotiflow.from_pretrained("general", device=device)
+            self._model = _Spotiflow.from_pretrained("general")
         else:
-            self._model = _Spotiflow.from_folder(self.model_path, device=device)
+            self._model = _Spotiflow.from_folder(self.model_path)
+
+        # Move model to requested device after loading
+        import torch
+        self._model = self._model.to(torch.device(device))
 
     # -------------------------------------------------------------- #
     #  Detection
