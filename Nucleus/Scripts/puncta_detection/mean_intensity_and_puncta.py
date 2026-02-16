@@ -194,6 +194,23 @@ def make_triptych(img, img_puncta, labels, puncta_mask,
 #  Main analysis
 # ------------------------------------------------------------------ #
 
+def _estimate_background(img, labels):
+    """Estimate background intensity as the median of non-labelled pixels."""
+    bg_mask = labels == 0
+    if bg_mask.sum() == 0:
+        return 0.0
+    return float(np.median(img[bg_mask].astype(np.float32)))
+
+
+def _count_puncta_objects(puncta_binary, nuc_mask):
+    """Count distinct puncta objects within a nucleus mask."""
+    overlap = np.logical_and(puncta_binary, nuc_mask)
+    if not overlap.any():
+        return 0
+    labelled = measure.label(overlap, connectivity=1)
+    return int(labelled.max())
+
+
 def main(
     nuc_dir,
     puncta_dir,
@@ -205,7 +222,15 @@ def main(
     triptych_out_dir=None,
     intensity_channel=2,
     puncta_channel=1,
+    progress_callback=None,
 ):
+    """
+    Parameters
+    ----------
+    progress_callback : callable or None
+        If provided, called with (current_index, total) after each image
+        to report progress (e.g. for GUI progress bars).
+    """
     nuc_dir = Path(nuc_dir)
     puncta_dir = Path(puncta_dir)
     intensity_dir = Path(intensity_dir)
@@ -259,6 +284,7 @@ def main(
 
         props = measure.regionprops(labels)
         centroid_map = {p.label: p.centroid for p in props}
+        props_map = {p.label: p for p in props}
 
         # Clean puncta mask
         if puncta_open_radius > 0:
@@ -273,6 +299,9 @@ def main(
         else:
             imax = np.nan
 
+        # Background estimate for background-subtracted intensity
+        bg_intensity = _estimate_background(img, labels)
+
         has_puncta_map = {}
 
         for lab in range(1, max_label + 1):
@@ -280,6 +309,11 @@ def main(
             n_pix = int(nuc_mask.sum())
             if n_pix == 0:
                 continue
+
+            # Region properties (area, eccentricity, solidity)
+            rp = props_map.get(lab)
+            eccentricity = float(rp.eccentricity) if rp else np.nan
+            solidity = float(rp.solidity) if rp else np.nan
 
             # Saturation fraction
             sat_frac = float((img[nuc_mask] >= imax).mean()) if np.isfinite(imax) else 0.0
@@ -290,8 +324,15 @@ def main(
             has_puncta = int(n_puncta_px >= min_puncta_area)
             has_puncta_map[lab] = has_puncta
 
-            # Mean raw intensity
-            nuc_mean_raw = float(img[nuc_mask].astype(np.float32).mean())
+            # Count distinct puncta objects within this nucleus
+            n_puncta_objects = _count_puncta_objects(puncta_clean, nuc_mask)
+
+            # Intensity statistics (raw)
+            pixel_vals = img[nuc_mask].astype(np.float32)
+            nuc_mean_raw = float(pixel_vals.mean())
+            nuc_median_raw = float(np.median(pixel_vals))
+            nuc_std_raw = float(pixel_vals.std())
+            nuc_mean_bgsub = nuc_mean_raw - bg_intensity
 
             cy, cx = centroid_map.get(lab, (np.nan, np.nan))
 
@@ -305,11 +346,18 @@ def main(
                 "centroid_y": cy,
                 "centroid_x": cx,
                 "num_nuc_pixels": n_pix,
+                "eccentricity": eccentricity,
+                "solidity": solidity,
                 "num_puncta_pixels": n_puncta_px,
+                "num_puncta_objects": n_puncta_objects,
                 "has_puncta": has_puncta,
                 "puncta_area_in_nuc": n_puncta_px,
                 "puncta_density": n_puncta_px / n_pix,
                 "nuc_mean_raw": nuc_mean_raw,
+                "nuc_median_raw": nuc_median_raw,
+                "nuc_std_raw": nuc_std_raw,
+                "nuc_mean_bgsub": nuc_mean_bgsub,
+                "bg_intensity": bg_intensity,
                 "sat_frac_nuc": sat_frac,
             })
 
@@ -325,6 +373,9 @@ def main(
                 centroid_map=centroid_map,
                 out_path=trip_path,
             )
+
+        if progress_callback is not None:
+            progress_callback(idx, len(nuc_files))
 
         if idx % 10 == 0 or idx == len(nuc_files):
             print(f"  Processed {idx}/{len(nuc_files)} images")

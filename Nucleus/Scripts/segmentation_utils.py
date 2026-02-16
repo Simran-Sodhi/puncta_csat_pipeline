@@ -262,23 +262,34 @@ def smooth_labels(labels, smooth_radius=3):
     return smoothed
 
 
-def postprocess_mask(masks, min_size=0, remove_edges=False, smooth_radius=0,
-                     edge_thresh=0.0):
+def postprocess_mask(masks, min_size=0, max_size=0, remove_edges=False,
+                     smooth_radius=0, edge_thresh=0.0, min_solidity=0.0):
     """
     Post-process a label mask:
     1. Remove objects smaller than *min_size*.
-    2. Optionally remove objects touching the image border.
-    3. Smooth mask edges (if smooth_radius > 0).
-    4. Re-label consecutively.
+    2. Remove objects larger than *max_size* (if > 0).
+    3. Remove objects with solidity below *min_solidity* (if > 0).
+    4. Optionally remove objects touching the image border.
+    5. Smooth mask edges (if smooth_radius > 0).
+    6. Re-label consecutively.
 
     Parameters
     ----------
+    max_size : int
+        Maximum object area in pixels.  Objects larger than this are
+        removed (likely merged artifacts).  0 = no upper limit.
     edge_thresh : float
         Fraction of an object's perimeter that must lie on the image
         border before it is removed (0.0–1.0).  When 0.0 (default),
         any border contact removes the object.  Set to e.g. 0.25 for
         DIC images to keep cells that only slightly touch the edge.
+    min_solidity : float
+        Minimum solidity (area / convex-hull area) to keep an object.
+        Low-solidity objects are often segmentation artefacts or merged
+        cells.  0.0 = no solidity filter (default).
     """
+    from skimage.measure import regionprops
+
     labels = masks.astype(np.int32, copy=True)
 
     # BUG-FIX: original used ``or`` which always evaluated True
@@ -286,6 +297,18 @@ def postprocess_mask(masks, min_size=0, remove_edges=False, smooth_radius=0,
         labels = morphology.remove_small_objects(
             labels, min_size=int(min_size), connectivity=1,
         )
+
+    # Remove objects exceeding max_size
+    if max_size is not None and max_size > 0:
+        for prop in regionprops(labels):
+            if prop.area > max_size:
+                labels[labels == prop.label] = 0
+
+    # Remove objects with low solidity (irregular / merged shapes)
+    if min_solidity is not None and min_solidity > 0:
+        for prop in regionprops(labels):
+            if prop.solidity < min_solidity:
+                labels[labels == prop.label] = 0
 
     if remove_edges:
         border = np.zeros_like(labels, dtype=bool)
@@ -542,13 +565,27 @@ def load_cellpose_model(gpu=False, model_type="cyto3"):
 #  Cellpose runner
 # ------------------------------------------------------------------ #
 
-def run_cellpose(img2d, model, diameter=None, batch_size=1, normalize=True):
+def run_cellpose(img2d, model, diameter=None, batch_size=1, normalize=True,
+                 flow_threshold=0.4, cellprob_threshold=0.0, augment=False):
     """
     Run a pre-initialised Cellpose model on a 2D image.
 
     Compatible with Cellpose 3 (channels param) and 4 (no channels).
     Returns (masks, flows) where masks is (Y, X) label array and
     flows is the list of flow arrays from Cellpose.
+
+    Parameters
+    ----------
+    flow_threshold : float
+        Threshold on flow error to accept a mask (default 0.4).
+        Lower = stricter, higher = more permissive.
+    cellprob_threshold : float
+        Threshold on cell probability to seed a mask (default 0.0).
+        Negative values recover dim/faint cells; positive values
+        reduce false positives.
+    augment : bool
+        Run test-time augmentation (flip/rotate averaging). Improves
+        accuracy at ~4x runtime cost (default False).
     """
     if img2d.ndim == 3 and img2d.shape[-1] == 1:
         img2d = img2d[:, :, 0]
@@ -563,6 +600,9 @@ def run_cellpose(img2d, model, diameter=None, batch_size=1, normalize=True):
         diameter=diameter,
         batch_size=batch_size,
         normalize=normalize,
+        flow_threshold=flow_threshold,
+        cellprob_threshold=cellprob_threshold,
+        augment=augment,
     )
     # Only pass channels if the model.eval() accepts it (Cellpose 3)
     if "channels" in eval_params:

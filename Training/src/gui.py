@@ -428,6 +428,16 @@ class SegmentationGUI(tk.Tk):
         ttk.Checkbutton(chk_frame, text="Invert DIC (cells dark on bright background)",
                         variable=self.seg_invert_dic).pack(side=tk.LEFT)
 
+        # CLAHE clip limit
+        ttk.Label(norm_frame, text="CLAHE Clip Limit:").grid(row=6, column=0, sticky=tk.W, pady=2)
+        self.seg_clahe_clip = tk.DoubleVar(value=0.02)
+        clahe_frame = ttk.Frame(norm_frame)
+        clahe_frame.grid(row=6, column=1, columnspan=2, sticky=tk.W, padx=5)
+        ttk.Scale(clahe_frame, from_=0.005, to=0.10, variable=self.seg_clahe_clip,
+                  orient=tk.HORIZONTAL, length=180).pack(side=tk.LEFT)
+        ttk.Label(clahe_frame, textvariable=self.seg_clahe_clip, width=6).pack(side=tk.LEFT, padx=5)
+        ttk.Label(clahe_frame, text="(higher = more contrast)", foreground="gray").pack(side=tk.LEFT)
+
         # ---- Model Selection ----
         model_frame = ttk.LabelFrame(body, text="Model", padding=10)
         model_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -479,12 +489,31 @@ class SegmentationGUI(tk.Tk):
         self.seg_gpu_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(row1, text="Use GPU", variable=self.seg_gpu_var).pack(side=tk.LEFT, padx=8)
 
+        self.seg_augment_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row1, text="Test-time augmentation",
+                        variable=self.seg_augment_var).pack(side=tk.LEFT, padx=8)
+
         self.seg_edges_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row1, text="Remove edge objects", variable=self.seg_edges_var).pack(side=tk.LEFT, padx=8)
 
         ttk.Label(row1, text="Smooth edges (radius):").pack(side=tk.LEFT, padx=(10, 5))
         self.seg_smooth_radius = tk.IntVar(value=3)
         ttk.Spinbox(row1, from_=0, to=10, textvariable=self.seg_smooth_radius, width=4).pack(side=tk.LEFT)
+
+        # Row 2: max size and solidity filters
+        row2 = ttk.Frame(cp_frame)
+        row2.pack(fill=tk.X, pady=2)
+
+        ttk.Label(row2, text="Max object size (px):").pack(side=tk.LEFT, padx=(0, 5))
+        self.seg_max_size = tk.IntVar(value=0)
+        ttk.Entry(row2, textvariable=self.seg_max_size, width=10).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(row2, text="(0 = no limit)", foreground="gray").pack(side=tk.LEFT, padx=(0, 15))
+
+        ttk.Label(row2, text="Min solidity:").pack(side=tk.LEFT, padx=(0, 5))
+        self.seg_min_solidity = tk.DoubleVar(value=0.0)
+        ttk.Entry(row2, textvariable=self.seg_min_solidity, width=6).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(row2, text="(0 = off, 0.8 = filter irregular shapes)",
+                  foreground="gray").pack(side=tk.LEFT)
 
         # ---- Cytoplasm-specific options (shown/hidden) ----
         self.seg_cyto_frame = ttk.LabelFrame(body, text="Cytoplasm Options (cell - nucleus = cytoplasm)", padding=10)
@@ -780,10 +809,16 @@ class SegmentationGUI(tk.Tk):
         z_val = self.seg_z_idx.get().strip()
         z = int(z_val) if z_val else 0
         min_sz = self.seg_min_size.get()
+        max_sz = self.seg_max_size.get()
+        min_sol = self.seg_min_solidity.get()
         gpu = self.seg_gpu_var.get()
+        augment = self.seg_augment_var.get()
         rm_edges = self.seg_edges_var.get()
         smooth_r = self.seg_smooth_radius.get()
         use_dic_norm = self.seg_dic_norm_var.get()
+        clahe_clip = self.seg_clahe_clip.get()
+        flow_thr = self.seg_flow_thr.get()
+        cellprob_thr = self.seg_cellprob_thr.get()
         model_type = self._seg_get_model_type()
 
         is_cyto = mode == "cytoplasm"
@@ -805,10 +840,12 @@ class SegmentationGUI(tk.Tk):
             min_nuc_pixels = self.seg_min_nuc_px.get()
             min_overlap_frac = self.seg_min_overlap_frac.get()
 
-        norm_label = "DIC (CLAHE)" if use_dic_norm else "LUT"
+        norm_label = f"DIC (CLAHE clip={clahe_clip:.3f})" if use_dic_norm else "LUT"
         self._seg_log_append(
             f"Segmentation ({mode}): model={model_type}, diameter={diameter}, "
-            f"channel={channel}, z={z}, min_size={min_sz}, smooth={smooth_r}, norm={norm_label}"
+            f"channel={channel}, z={z}, flow={flow_thr}, cellprob={cellprob_thr}, "
+            f"min_size={min_sz}, max_size={max_sz}, solidity={min_sol}, "
+            f"smooth={smooth_r}, norm={norm_label}, augment={augment}"
         )
         self.btn_seg_run.config(state=tk.DISABLED)
         self.seg_tree.delete(*self.seg_tree.get_children())
@@ -852,13 +889,22 @@ class SegmentationGUI(tk.Tk):
                     try:
                         img2d = load_image_2d(img_path, channel_index=channel, z_index=z)
                         if use_dic_norm:
-                            img_norm = normalize_dic(img2d)
+                            img_norm = normalize_dic(img2d, clip_limit=clahe_clip)
                         else:
                             img_norm = auto_lut_clip(img2d)
 
-                        masks, flows = run_cellpose(img_norm, model=model, diameter=diameter)
+                        masks, flows = run_cellpose(
+                            img_norm, model=model, diameter=diameter,
+                            flow_threshold=flow_thr,
+                            cellprob_threshold=cellprob_thr,
+                            augment=augment,
+                        )
                         edge_thr = 0.25 if use_dic_norm else 0.0
-                        masks = postprocess_mask(masks, min_size=min_sz, remove_edges=rm_edges, smooth_radius=smooth_r, edge_thresh=edge_thr)
+                        masks = postprocess_mask(
+                            masks, min_size=min_sz, max_size=max_sz,
+                            remove_edges=rm_edges, smooth_radius=smooth_r,
+                            edge_thresh=edge_thr, min_solidity=min_sol,
+                        )
                         n_objects = int(masks.max())
                         stem = img_path.stem
 
@@ -1014,6 +1060,10 @@ class SegmentationGUI(tk.Tk):
         self.btn_ana_run = ttk.Button(btn_frame, text="Run Analysis", command=self._ana_run)
         self.btn_ana_run.pack(side=tk.LEFT, padx=5)
 
+        # Progress
+        self.ana_progress = ttk.Progressbar(tab, mode="determinate")
+        self.ana_progress.pack(fill=tk.X, padx=10, pady=5)
+
         self.ana_status = tk.StringVar(value="Ready")
         ttk.Label(tab, textvariable=self.ana_status).pack(padx=10, anchor=tk.W)
 
@@ -1078,6 +1128,11 @@ class SegmentationGUI(tk.Tk):
         def task():
             try:
                 from puncta_detection.mean_intensity_and_puncta import main as run_analysis
+
+                def _on_progress(current, total):
+                    pct = int(100 * current / total)
+                    self.log_queue.put(f"__ANA_PROGRESS__{pct}")
+
                 run_analysis(
                     nuc_dir=nuc,
                     puncta_dir=puncta,
@@ -1089,6 +1144,7 @@ class SegmentationGUI(tk.Tk):
                     triptych_out_dir=trip_dir,
                     intensity_channel=int_ch,
                     puncta_channel=pun_ch,
+                    progress_callback=_on_progress,
                 )
                 self.log_queue.put(f"__ANA_DONE__{csv_path}")
             except Exception as exc:
@@ -1098,6 +1154,7 @@ class SegmentationGUI(tk.Tk):
 
     def _on_ana_finished(self, csv_path=None, error=None):
         self.btn_ana_run.config(state=tk.NORMAL)
+        self.ana_progress.config(value=100)
         if error:
             self.ana_status.set(f"Error: {str(error)[:80]}")
             self._ana_log_append(f"[ERROR] {error}")
@@ -2053,6 +2110,11 @@ class SegmentationGUI(tk.Tk):
                 continue
 
             # -- Analysis --
+            if msg.startswith("__ANA_PROGRESS__"):
+                pct = int(msg[len("__ANA_PROGRESS__"):])
+                self.ana_progress.config(value=pct)
+                self.ana_status.set(f"Analysing... {pct}%")
+                continue
             if msg.startswith("__ANA_DONE__"):
                 self._on_ana_finished(csv_path=msg[len("__ANA_DONE__"):])
                 continue
