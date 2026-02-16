@@ -120,6 +120,7 @@ class SegmentationGUI(tk.Tk):
         # -- Analysis workflow tabs --
         self.tab_nd2 = ttk.Frame(self.notebook)
         self.tab_segmentation = ttk.Frame(self.notebook)
+        self.tab_puncta_seg = ttk.Frame(self.notebook)
         self.tab_analysis = ttk.Frame(self.notebook)
 
         # -- Training workflow tabs --
@@ -130,6 +131,7 @@ class SegmentationGUI(tk.Tk):
 
         self.notebook.add(self.tab_nd2, text="  ND2 Conversion  ")
         self.notebook.add(self.tab_segmentation, text="  Segmentation  ")
+        self.notebook.add(self.tab_puncta_seg, text="  Puncta Segmentation  ")
         self.notebook.add(self.tab_analysis, text="  Analysis  ")
         self.notebook.add(self.tab_rename, text="  File Renaming  ")
         self.notebook.add(self.tab_config, text="  Configuration  ")
@@ -138,6 +140,7 @@ class SegmentationGUI(tk.Tk):
 
         self._build_nd2_tab()
         self._build_segmentation_tab()
+        self._build_puncta_seg_tab()
         self._build_analysis_tab()
         self._build_rename_tab()
         self._build_config_tab()
@@ -968,6 +971,337 @@ class SegmentationGUI(tk.Tk):
             self._seg_log_append("[DONE] Segmentation complete.")
 
     # ==================================================================
+    # TAB: PUNCTA SEGMENTATION (classical methods, not Cellpose)
+    # ==================================================================
+    def _build_puncta_seg_tab(self):
+        tab = self.tab_puncta_seg
+
+        # Use a canvas + scrollbar so the tab is scrollable
+        canvas = tk.Canvas(tab, highlightthickness=0)
+        sb = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=canvas.yview)
+        self.pseg_body = ttk.Frame(canvas)
+        self.pseg_body.bind(
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=self.pseg_body, anchor=tk.NW)
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        body = self.pseg_body
+
+        info = ttk.Label(
+            body,
+            text="Detect puncta using classical image processing (threshold / LoG / DoG).\n"
+                 "Produces label masks for training or direct use in Analysis.\n"
+                 "Saves Cellpose-compatible _seg.npy for curation in the Cellpose GUI.",
+            foreground="gray",
+        )
+        info.pack(anchor=tk.W, padx=10, pady=(10, 5))
+
+        # ---- Input / Output ----
+        io_frame = ttk.LabelFrame(body, text="Input / Output", padding=10)
+        io_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(io_frame, text="Image Directory:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.pseg_input_dir = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.pseg_input_dir, width=55).grid(
+            row=0, column=1, padx=5, pady=2
+        )
+        ttk.Button(io_frame, text="Browse...",
+                    command=lambda: self._browse_dir(self.pseg_input_dir)).grid(
+            row=0, column=2, pady=2
+        )
+
+        ttk.Label(io_frame, text="Output Masks Directory:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.pseg_out_dir = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.pseg_out_dir, width=55).grid(
+            row=1, column=1, padx=5, pady=2
+        )
+        ttk.Button(io_frame, text="Browse...",
+                    command=lambda: self._browse_dir(self.pseg_out_dir)).grid(
+            row=1, column=2, pady=2
+        )
+
+        # ---- Channel ----
+        ch_frame = ttk.LabelFrame(body, text="Channel Selection", padding=10)
+        ch_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(ch_frame, text="Puncta Channel:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.pseg_channel = tk.IntVar(value=1)
+        pseg_ch_combo = ttk.Combobox(
+            ch_frame, textvariable=self.pseg_channel, values=[0, 1, 2, 3],
+            width=5, state="readonly",
+        )
+        pseg_ch_combo.grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(ch_frame, text="(1 = mEGFP for most datasets)", foreground="gray").grid(
+            row=0, column=2, sticky=tk.W, padx=5
+        )
+
+        ttk.Label(ch_frame, text="Z-Slice:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.pseg_z_idx = tk.IntVar(value=0)
+        ttk.Entry(ch_frame, textvariable=self.pseg_z_idx, width=6).grid(
+            row=1, column=1, padx=5, pady=2, sticky=tk.W
+        )
+
+        # ---- Detection Method ----
+        method_frame = ttk.LabelFrame(body, text="Detection Method", padding=10)
+        method_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        self.pseg_method = tk.StringVar(value="threshold")
+        method_row = ttk.Frame(method_frame)
+        method_row.pack(fill=tk.X)
+        for label, val in [("Threshold", "threshold"),
+                           ("LoG (Laplacian of Gaussian)", "log"),
+                           ("DoG (Difference of Gaussians)", "dog")]:
+            ttk.Radiobutton(method_row, text=label, variable=self.pseg_method,
+                            value=val, command=self._pseg_on_method_change).pack(
+                side=tk.LEFT, padx=8
+            )
+
+        # Threshold-specific options
+        self.pseg_thresh_frame = ttk.Frame(method_frame)
+        self.pseg_thresh_frame.pack(fill=tk.X, pady=(5, 0))
+
+        ttk.Label(self.pseg_thresh_frame, text="Algorithm:").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_thresh_method = tk.StringVar(value="otsu")
+        ttk.Combobox(
+            self.pseg_thresh_frame, textvariable=self.pseg_thresh_method,
+            values=["otsu", "yen", "triangle", "li", "custom"],
+            width=10, state="readonly",
+        ).pack(side=tk.LEFT, padx=(0, 15))
+
+        ttk.Label(self.pseg_thresh_frame, text="Custom value (0-1):").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_custom_thresh = tk.DoubleVar(value=0.3)
+        ttk.Entry(self.pseg_thresh_frame, textvariable=self.pseg_custom_thresh, width=6).pack(
+            side=tk.LEFT
+        )
+
+        # Blob-specific options (LoG / DoG)
+        self.pseg_blob_frame = ttk.Frame(method_frame)
+
+        ttk.Label(self.pseg_blob_frame, text="Min sigma:").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_min_sigma = tk.DoubleVar(value=1.0)
+        ttk.Entry(self.pseg_blob_frame, textvariable=self.pseg_min_sigma, width=6).pack(
+            side=tk.LEFT, padx=(0, 15)
+        )
+        ttk.Label(self.pseg_blob_frame, text="Max sigma:").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_max_sigma = tk.DoubleVar(value=5.0)
+        ttk.Entry(self.pseg_blob_frame, textvariable=self.pseg_max_sigma, width=6).pack(
+            side=tk.LEFT, padx=(0, 15)
+        )
+        ttk.Label(self.pseg_blob_frame, text="Blob threshold:").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_blob_thresh = tk.DoubleVar(value=0.1)
+        ttk.Entry(self.pseg_blob_frame, textvariable=self.pseg_blob_thresh, width=6).pack(
+            side=tk.LEFT
+        )
+
+        # ---- Pre-processing ----
+        preproc_frame = ttk.LabelFrame(body, text="Pre-processing", padding=10)
+        preproc_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        row0 = ttk.Frame(preproc_frame)
+        row0.pack(fill=tk.X, pady=2)
+
+        ttk.Label(row0, text="Gaussian sigma:").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_sigma = tk.DoubleVar(value=1.0)
+        ttk.Entry(row0, textvariable=self.pseg_sigma, width=6).pack(side=tk.LEFT, padx=(0, 15))
+
+        self.pseg_bg_sub = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row0, text="Background subtraction (white top-hat)",
+                        variable=self.pseg_bg_sub).pack(side=tk.LEFT, padx=(0, 15))
+
+        ttk.Label(row0, text="Top-hat radius:").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_tophat_radius = tk.IntVar(value=15)
+        ttk.Entry(row0, textvariable=self.pseg_tophat_radius, width=6).pack(side=tk.LEFT)
+
+        # ---- Post-processing ----
+        post_frame = ttk.LabelFrame(body, text="Post-processing (size filters)", padding=10)
+        post_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        row1 = ttk.Frame(post_frame)
+        row1.pack(fill=tk.X, pady=2)
+
+        ttk.Label(row1, text="Min size (px):").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_min_size = tk.IntVar(value=3)
+        ttk.Entry(row1, textvariable=self.pseg_min_size, width=8).pack(side=tk.LEFT, padx=(0, 15))
+
+        ttk.Label(row1, text="Max size (px):").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_max_size = tk.IntVar(value=0)
+        ttk.Entry(row1, textvariable=self.pseg_max_size, width=8).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(row1, text="(0 = no limit)", foreground="gray").pack(side=tk.LEFT, padx=(0, 15))
+
+        ttk.Label(row1, text="Open radius:").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_open_radius = tk.IntVar(value=0)
+        ttk.Entry(row1, textvariable=self.pseg_open_radius, width=5).pack(side=tk.LEFT)
+
+        # ---- Output options ----
+        out_opts = ttk.LabelFrame(body, text="Output Options", padding=10)
+        out_opts.pack(fill=tk.X, padx=10, pady=5)
+
+        self.pseg_save_npy = tk.BooleanVar(value=True)
+        ttk.Checkbutton(out_opts, text="Save Cellpose _seg.npy (for curation / training)",
+                        variable=self.pseg_save_npy).pack(anchor=tk.W, pady=1)
+
+        self.pseg_save_trip = tk.BooleanVar(value=True)
+        ttk.Checkbutton(out_opts, text="Save QC triptych PNGs",
+                        variable=self.pseg_save_trip).pack(anchor=tk.W, pady=1)
+
+        # ---- Buttons ----
+        btn_frame = ttk.Frame(body)
+        btn_frame.pack(fill=tk.X, padx=10, pady=5)
+        self.btn_pseg_run = ttk.Button(btn_frame, text="Run Puncta Segmentation",
+                                       command=self._pseg_run)
+        self.btn_pseg_run.pack(side=tk.LEFT, padx=5)
+
+        # Progress
+        self.pseg_progress = ttk.Progressbar(body, mode="determinate")
+        self.pseg_progress.pack(fill=tk.X, padx=10, pady=5)
+
+        self.pseg_status = tk.StringVar(value="Ready")
+        ttk.Label(body, textvariable=self.pseg_status).pack(padx=10, anchor=tk.W)
+
+        # Results table
+        result_frame = ttk.LabelFrame(body, text="Results", padding=5)
+        result_frame.pack(fill=tk.X, padx=10, pady=(5, 5))
+
+        columns = ("filename", "objects", "status")
+        self.pseg_tree = ttk.Treeview(
+            result_frame, columns=columns, show="headings", height=6
+        )
+        self.pseg_tree.heading("filename", text="Filename")
+        self.pseg_tree.heading("objects", text="Puncta Found")
+        self.pseg_tree.heading("status", text="Status")
+        self.pseg_tree.column("filename", width=350)
+        self.pseg_tree.column("objects", width=120, anchor=tk.CENTER)
+        self.pseg_tree.column("status", width=120, anchor=tk.CENTER)
+
+        pseg_tree_scroll = ttk.Scrollbar(result_frame, orient=tk.VERTICAL,
+                                         command=self.pseg_tree.yview)
+        self.pseg_tree.configure(yscrollcommand=pseg_tree_scroll.set)
+        self.pseg_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        pseg_tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Log
+        log_frame = ttk.LabelFrame(body, text="Log", padding=5)
+        log_frame.pack(fill=tk.X, padx=10, pady=(5, 10))
+        self.pseg_log = scrolledtext.ScrolledText(
+            log_frame, wrap=tk.WORD, height=8, state=tk.DISABLED, font=("Courier", 9)
+        )
+        self.pseg_log.pack(fill=tk.BOTH, expand=True)
+
+        # Initial method state
+        self._pseg_on_method_change()
+
+    def _pseg_on_method_change(self):
+        method = self.pseg_method.get()
+        if method == "threshold":
+            self.pseg_thresh_frame.pack(fill=tk.X, pady=(5, 0))
+            self.pseg_blob_frame.pack_forget()
+        else:
+            self.pseg_thresh_frame.pack_forget()
+            self.pseg_blob_frame.pack(fill=tk.X, pady=(5, 0))
+
+    def _pseg_log_append(self, msg):
+        self.pseg_log.config(state=tk.NORMAL)
+        self.pseg_log.insert(tk.END, msg + "\n")
+        self.pseg_log.see(tk.END)
+        self.pseg_log.config(state=tk.DISABLED)
+
+    def _pseg_run(self):
+        img_dir = self.pseg_input_dir.get()
+        out_dir = self.pseg_out_dir.get()
+        if not img_dir or not out_dir:
+            messagebox.showwarning("Missing input",
+                                   "Select both image directory and output directory.")
+            return
+        if NUCLEUS_SCRIPTS_DIR is None:
+            messagebox.showerror(
+                "Nucleus/Scripts not found",
+                "Cannot find Nucleus/Scripts/.\n"
+                "Make sure the Nucleus/ folder is in the repository root."
+            )
+            return
+
+        method = self.pseg_method.get()
+        channel = self.pseg_channel.get()
+        z_idx = self.pseg_z_idx.get()
+        sigma = self.pseg_sigma.get()
+        bg_sub = self.pseg_bg_sub.get()
+        tophat_r = self.pseg_tophat_radius.get()
+        min_sz = self.pseg_min_size.get()
+        max_sz = self.pseg_max_size.get()
+        open_r = self.pseg_open_radius.get()
+        save_npy = self.pseg_save_npy.get()
+        save_trip = self.pseg_save_trip.get()
+
+        # Method-specific params
+        thresh_method = self.pseg_thresh_method.get()
+        custom_thresh = self.pseg_custom_thresh.get()
+        min_sig = self.pseg_min_sigma.get()
+        max_sig = self.pseg_max_sigma.get()
+        blob_thr = self.pseg_blob_thresh.get()
+
+        self._pseg_log_append(
+            f"Puncta segmentation: method={method}, channel={channel}, z={z_idx}, "
+            f"sigma={sigma}, bg_sub={bg_sub}, min_size={min_sz}, max_size={max_sz}"
+        )
+        self.btn_pseg_run.config(state=tk.DISABLED)
+        self.pseg_tree.delete(*self.pseg_tree.get_children())
+        self.pseg_progress.config(mode="determinate", value=0)
+        self.pseg_status.set("Running puncta segmentation...")
+
+        def task():
+            try:
+                from puncta_detection.puncta_segmentation import batch_segment
+
+                def _on_progress(idx, total, fname, n_obj):
+                    pct = int(100 * idx / total)
+                    self.log_queue.put(f"__PSEG_PROGRESS__{pct}")
+                    self.log_queue.put(
+                        f"__PSEG_RESULT__{fname}||{n_obj}||"
+                        f"{'OK' if n_obj > 0 else 'No puncta' if n_obj == 0 else 'FAILED'}"
+                    )
+
+                batch_segment(
+                    image_dir=img_dir,
+                    out_dir=out_dir,
+                    channel=channel,
+                    z_index=z_idx,
+                    method=method,
+                    sigma=sigma,
+                    background_subtraction=bg_sub,
+                    tophat_radius=tophat_r,
+                    threshold_method=thresh_method,
+                    custom_threshold=custom_thresh if thresh_method == "custom" else None,
+                    min_sigma=min_sig,
+                    max_sigma=max_sig,
+                    blob_threshold=blob_thr,
+                    min_size=min_sz,
+                    max_size=max_sz,
+                    open_radius=open_r,
+                    save_cellpose_npy=save_npy,
+                    save_triptychs=save_trip,
+                    progress_callback=_on_progress,
+                )
+                self.log_queue.put("__PSEG_DONE__")
+            except Exception as exc:
+                import traceback
+                self.log_queue.put(f"__PSEG_ERROR__{exc}\n{traceback.format_exc()}")
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _on_pseg_finished(self, error=None):
+        self.btn_pseg_run.config(state=tk.NORMAL)
+        self.pseg_progress.config(value=100)
+        if error:
+            self.pseg_status.set(f"Error: {str(error)[:80]}")
+            self._pseg_log_append(f"[ERROR] {error}")
+        else:
+            self.pseg_status.set("Puncta segmentation complete")
+            self._pseg_log_append("[DONE] Puncta segmentation complete.")
+
+    # ==================================================================
     # TAB: INTENSITY & PUNCTA ANALYSIS
     # ==================================================================
     def _build_analysis_tab(self):
@@ -975,7 +1309,10 @@ class SegmentationGUI(tk.Tk):
 
         info = ttk.Label(
             tab,
-            text="Per-nucleus intensity measurement and puncta detection analysis.",
+            text="Per-cell intensity & puncta analysis using pre-computed masks.\n"
+                 "Run this after you have nucleus masks, puncta masks (from the Puncta Segmentation\n"
+                 "tab or Cellpose), and the raw OME-TIFF images.\n"
+                 "Outputs a CSV with per-cell metrics: intensity, puncta count, shape, etc.",
             foreground="gray",
         )
         info.pack(anchor=tk.W, padx=10, pady=(10, 5))
@@ -2107,6 +2444,26 @@ class SegmentationGUI(tk.Tk):
                 name, n_str, status = payload.split("||", 2)
                 n = int(n_str)
                 self.seg_tree.insert("", tk.END, values=(name, n if n >= 0 else "-", status))
+                continue
+
+            # -- Puncta Segmentation --
+            if msg == "__PSEG_DONE__":
+                self._on_pseg_finished()
+                continue
+            if msg.startswith("__PSEG_ERROR__"):
+                self._on_pseg_finished(error=msg[len("__PSEG_ERROR__"):])
+                continue
+            if msg.startswith("__PSEG_PROGRESS__"):
+                pct = int(msg[len("__PSEG_PROGRESS__"):])
+                self.pseg_progress.config(value=pct)
+                self.pseg_status.set(f"Processing... {pct}%")
+                continue
+            if msg.startswith("__PSEG_RESULT__"):
+                payload = msg[len("__PSEG_RESULT__"):]
+                name, n_str, status = payload.split("||", 2)
+                n = int(n_str)
+                self.pseg_tree.insert("", tk.END,
+                                      values=(name, n if n >= 0 else "-", status))
                 continue
 
             # -- Analysis --
