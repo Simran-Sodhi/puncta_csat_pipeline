@@ -58,6 +58,23 @@ from segmentation_utils import (
 from .preprocessing import preprocess_pipeline
 from .core import PunctaDetectionResult
 
+# ------------------------------------------------------------------ #
+#  Spotiflow model cache — avoids reloading the DL model per image
+# ------------------------------------------------------------------ #
+_spotiflow_cache = {}
+
+
+def _get_spotiflow_detector(model_path="general", prob_threshold=0.5):
+    """Return a cached SpotiflowDetector for the given config."""
+    key = (model_path, prob_threshold)
+    if key not in _spotiflow_cache:
+        from .spotiflow_detector import SpotiflowDetector
+        _spotiflow_cache[key] = SpotiflowDetector(
+            model_path=model_path,
+            prob_threshold=prob_threshold,
+        )
+    return _spotiflow_cache[key]
+
 
 # ------------------------------------------------------------------ #
 #  Legacy simple detectors (threshold / DoG) — kept for backwards
@@ -226,11 +243,7 @@ def segment_puncta_2d(
         return labels, preprocessed
 
     if method == "spotiflow":
-        from .spotiflow_detector import SpotiflowDetector
-        det = SpotiflowDetector(
-            model_path=spotiflow_model,
-            prob_threshold=spotiflow_prob,
-        )
+        det = _get_spotiflow_detector(spotiflow_model, spotiflow_prob)
         result = det.detect_2d(img2d, mask=cell_mask)
         # Build label mask from coordinates
         labels = _coords_to_labels(
@@ -357,10 +370,9 @@ def _run_consensus(
                 results[name] = det.detect_2d(img2d, mask=cell_mask)
 
             elif name == "spotiflow":
-                from .spotiflow_detector import SpotiflowDetector
-                det = SpotiflowDetector(
-                    model_path=detector_params.get("spotiflow_model", "general"),
-                    prob_threshold=detector_params.get("spotiflow_prob", 0.5),
+                det = _get_spotiflow_detector(
+                    detector_params.get("spotiflow_model", "general"),
+                    detector_params.get("spotiflow_prob", 0.5),
                 )
                 results[name] = det.detect_2d(img2d, mask=cell_mask)
 

@@ -12,7 +12,10 @@ from pathlib import Path
 
 import numpy as np
 import tifffile as tiff
+import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
 from scipy.ndimage import binary_fill_holes, gaussian_filter
 from skimage import morphology, exposure
 from skimage.segmentation import relabel_sequential
@@ -750,8 +753,12 @@ def save_triptych(img_norm, masks, out_path):
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-    cmap = plt.cm.get_cmap("tab20").copy()
+    # Use non-interactive Agg backend directly — thread-safe for save-only
+    fig = Figure(figsize=(12, 4))
+    FigureCanvasAgg(fig)
+    axes = fig.subplots(1, 3)
+
+    cmap = matplotlib.colormaps["tab20"].copy()
     cmap.set_bad(color="black")
 
     axes[0].imshow(img_norm, cmap="gray")
@@ -768,6 +775,5 @@ def save_triptych(img_norm, masks, out_path):
     axes[2].set_title("Overlay")
     axes[2].axis("off")
 
-    plt.tight_layout()
+    fig.tight_layout()
     fig.savefig(str(out_path), dpi=150, bbox_inches="tight")
-    plt.close(fig)
