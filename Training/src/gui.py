@@ -1099,6 +1099,10 @@ class SegmentationGUI(tk.Tk):
         ttk.Label(self.pseg_spoti_frame, text="Prob threshold:").pack(side=tk.LEFT, padx=(0, 5))
         self.pseg_spoti_prob = tk.DoubleVar(value=0.5)
         ttk.Entry(self.pseg_spoti_frame, textvariable=self.pseg_spoti_prob, width=5).pack(side=tk.LEFT)
+        ttk.Label(self.pseg_spoti_frame, text="  Spot radius (px):").pack(side=tk.LEFT, padx=(10, 5))
+        self.pseg_spoti_radius = tk.IntVar(value=2)
+        ttk.Spinbox(self.pseg_spoti_frame, from_=1, to=20,
+                     textvariable=self.pseg_spoti_radius, width=4).pack(side=tk.LEFT)
         ttk.Label(self.pseg_spoti_frame, text="  (requires: pip install spotiflow)",
                   foreground="gray").pack(side=tk.LEFT, padx=5)
 
@@ -1288,6 +1292,7 @@ class SegmentationGUI(tk.Tk):
         # Spotiflow params
         spoti_model = self.pseg_spoti_model.get()
         spoti_prob = self.pseg_spoti_prob.get()
+        spoti_radius = self.pseg_spoti_radius.get()
 
         # Consensus params
         cons_detectors = []
@@ -1349,6 +1354,7 @@ class SegmentationGUI(tk.Tk):
                     open_radius=open_r,
                     spotiflow_model=spoti_model,
                     spotiflow_prob=spoti_prob,
+                    spot_radius=spoti_radius,
                     consensus_detectors=cons_detectors if method == "consensus" else None,
                     consensus_strategy=cons_strategy,
                     consensus_threshold=cons_conf_thresh,

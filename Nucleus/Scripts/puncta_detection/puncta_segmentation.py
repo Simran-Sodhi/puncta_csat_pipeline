@@ -167,6 +167,7 @@ def segment_puncta_2d(
     # Spotiflow params
     spotiflow_model="general",
     spotiflow_prob=0.5,
+    spot_radius=2,
     # Consensus params
     consensus_detectors=None,
     consensus_strategy="weighted_confidence",
@@ -248,7 +249,7 @@ def segment_puncta_2d(
         # Build label mask from coordinates
         labels = _coords_to_labels(
             result.coordinates, img2d.shape,
-            radius=2, radii=result.radii,
+            radius=spot_radius, radii=result.radii,
         )
         return labels, preprocessed
 
@@ -433,6 +434,7 @@ def batch_segment(
     bg_rejection=True,
     spotiflow_model="general",
     spotiflow_prob=0.5,
+    spot_radius=2,
     consensus_detectors=None,
     consensus_strategy="weighted_confidence",
     consensus_weights=None,
@@ -502,6 +504,7 @@ def batch_segment(
                 bg_rejection=bg_rejection,
                 spotiflow_model=spotiflow_model,
                 spotiflow_prob=spotiflow_prob,
+                spot_radius=spot_radius,
                 consensus_detectors=consensus_detectors,
                 consensus_strategy=consensus_strategy,
                 consensus_weights=consensus_weights,
@@ -579,6 +582,8 @@ if __name__ == "__main__":
     parser.add_argument("--min-size", type=int, default=3)
     parser.add_argument("--max-size", type=int, default=0)
     parser.add_argument("--open-radius", type=int, default=0)
+    parser.add_argument("--spot-radius", type=int, default=2,
+                        help="Radius (px) for Spotiflow spot masks (default: 2)")
     parser.add_argument("--no-cellpose-npy", action="store_true")
     parser.add_argument("--no-triptychs", action="store_true")
     # Consensus
@@ -610,6 +615,7 @@ if __name__ == "__main__":
         min_size=args.min_size,
         max_size=args.max_size,
         open_radius=args.open_radius,
+        spot_radius=args.spot_radius,
         save_cellpose_npy=not args.no_cellpose_npy,
         save_triptychs=not args.no_triptychs,
         consensus_detectors=args.consensus_detectors,
