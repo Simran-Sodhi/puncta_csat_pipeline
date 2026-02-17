@@ -168,6 +168,12 @@ def segment_puncta_2d(
     spotiflow_model="general",
     spotiflow_prob=0.5,
     spot_radius=2,
+    # Tight borders params
+    tb_threshold_factor=4.0,
+    tb_max_branch_length=10,
+    tb_connect_distance=10,
+    tb_min_eq_diameter=0,
+    tb_min_border_strength=0,
     # Consensus params
     consensus_detectors=None,
     consensus_strategy="weighted_confidence",
@@ -189,6 +195,8 @@ def segment_puncta_2d(
         ``"dog"`` — Difference of Gaussians
         ``"intensity_ratio"`` — PunctaFinder-style 3-criteria
         ``"spotiflow"`` — deep-learning (requires spotiflow package)
+        ``"spotiflow+threshold"`` — Spotiflow seeds + Otsu morphology
+        ``"tight_borders"`` — skeletonization-based precise boundaries
         ``"consensus"`` — combine multiple detectors
     cell_mask : ndarray or None
         If provided, detections outside the mask are discarded.
@@ -253,6 +261,18 @@ def segment_puncta_2d(
         )
         return labels, preprocessed
 
+    if method == "spotiflow+threshold":
+        labels = _spotiflow_threshold_hybrid(
+            img2d, preprocessed, cell_mask, preproc_kw,
+            spotiflow_model=spotiflow_model,
+            spotiflow_prob=spotiflow_prob,
+            threshold_method=threshold_method,
+            custom_threshold=custom_threshold,
+            min_size=min_size,
+            max_size=max_size,
+        )
+        return labels, preprocessed
+
     if method == "spotiflow+log":
         labels = _spotiflow_log_hybrid(
             img2d, preprocessed, cell_mask, preproc_kw,
@@ -261,6 +281,21 @@ def segment_puncta_2d(
             min_sigma=min_sigma,
             max_sigma=max_sigma,
             num_sigma=num_sigma,
+            min_size=min_size,
+            max_size=max_size,
+        )
+        return labels, preprocessed
+
+    if method == "tight_borders":
+        labels = _detect_tight_borders(
+            preprocessed,
+            threshold_factor=tb_threshold_factor,
+            max_branch_length=tb_max_branch_length,
+            connect_distance=tb_connect_distance,
+            min_eq_diameter=tb_min_eq_diameter,
+            min_border_strength=tb_min_border_strength,
+            raw_image=img2d,
+            cell_mask=cell_mask,
             min_size=min_size,
             max_size=max_size,
         )
@@ -308,6 +343,239 @@ def segment_puncta_2d(
     return labels, preprocessed
 
 
+def _detect_tight_borders(
+    preprocessed,
+    threshold_factor=4,
+    max_branch_length=10,
+    connect_distance=10,
+    min_eq_diameter=0,
+    min_border_strength=0,
+    raw_image=None,
+    cell_mask=None,
+    min_size=3,
+    max_size=0,
+):
+    """Tight Borders Detection — skeletonization-based precise boundaries.
+
+    Mirrors the Icy TightBordersDetection plugin:
+
+    1. **Threshold** — adaptive edge threshold to find border pixels.
+    2. **Skeletonize** — reduce borders to 1-pixel-wide lines.
+    3. **Prune branches** — remove spurious short branches (< max_branch_length).
+    4. **Connect free endings** — bridge nearby skeleton endpoints to close gaps.
+    5. **Fill** — flood-fill enclosed regions to produce label masks.
+    6. **Filter** — remove objects by equivalent diameter / border strength.
+
+    Parameters
+    ----------
+    preprocessed : ndarray (Y, X)
+        Pre-processed intensity image.
+    threshold_factor : float
+        Multiplier on the mean gradient for thresholding edges.
+    max_branch_length : int
+        Skeleton branches shorter than this are pruned.
+    connect_distance : int
+        Free skeleton endpoints within this distance are connected.
+    min_eq_diameter : float
+        Vanish objects with equivalent diameter smaller than this.
+    min_border_strength : float
+        Keep objects with mean border intensity above this even if small.
+    """
+    from scipy import ndimage as ndi
+    from skimage.morphology import skeletonize, remove_small_objects
+
+    h, w = preprocessed.shape
+    img = preprocessed.astype(np.float64)
+
+    # --- Step 1: Edge-based thresholding ------------------------------
+    # Compute gradient magnitude (Sobel)
+    gy = filters.sobel_h(img)
+    gx = filters.sobel_v(img)
+    gradient = np.sqrt(gx**2 + gy**2)
+
+    # Threshold: gradient > factor * mean(gradient)
+    grad_mean = gradient.mean()
+    if grad_mean > 0:
+        border_binary = gradient > (threshold_factor * grad_mean)
+    else:
+        border_binary = np.zeros_like(gradient, dtype=bool)
+
+    # Intersect with cell mask
+    if cell_mask is not None:
+        border_binary &= (cell_mask > 0)
+
+    if not border_binary.any():
+        return np.zeros((h, w), dtype=np.int32)
+
+    # --- Step 2: Skeletonize ------------------------------------------
+    skeleton = skeletonize(border_binary)
+
+    # --- Step 3: Prune short branches ---------------------------------
+    if max_branch_length > 0:
+        skeleton = _prune_skeleton_branches(skeleton, max_branch_length)
+
+    # --- Step 4: Connect free endings ---------------------------------
+    if connect_distance > 0:
+        skeleton = _connect_skeleton_endpoints(skeleton, connect_distance)
+
+    # --- Step 5: Fill enclosed regions --------------------------------
+    # Invert skeleton so enclosed regions become connected foreground
+    # Add a 1-pixel border to prevent flood-fill from leaking
+    padded = np.pad(~skeleton, 1, constant_values=False)
+    # Label connected regions (background of skeleton = objects)
+    filled_labels = measure.label(padded, connectivity=1)
+    # Remove the border padding
+    filled_labels = filled_labels[1:-1, 1:-1]
+
+    # The largest region is typically the background — remove it
+    if filled_labels.max() > 0:
+        props = measure.regionprops(filled_labels)
+        bg_label = max(props, key=lambda p: p.area).label
+        filled_labels[filled_labels == bg_label] = 0
+
+    # Intersect with cell mask
+    if cell_mask is not None:
+        filled_labels[cell_mask == 0] = 0
+
+    # --- Step 6: Filter by size / eq. diameter / border strength ------
+    if filled_labels.max() > 0:
+        intensity_img = raw_image if raw_image is not None else preprocessed
+        for prop in measure.regionprops(filled_labels,
+                                         intensity_image=gradient):
+            remove = False
+            if min_size > 0 and prop.area < min_size:
+                remove = True
+            if max_size > 0 and prop.area > max_size:
+                remove = True
+            if min_eq_diameter > 0 and prop.equivalent_diameter < min_eq_diameter:
+                # Check if border is strong enough to keep
+                if min_border_strength > 0 and prop.mean_intensity >= min_border_strength:
+                    remove = False
+                else:
+                    remove = True
+            if remove:
+                filled_labels[filled_labels == prop.label] = 0
+
+    filled_labels, _, _ = relabel_sequential(filled_labels)
+    return filled_labels.astype(np.int32)
+
+
+def _prune_skeleton_branches(skeleton, max_length):
+    """Remove skeleton branches shorter than max_length pixels.
+
+    Endpoints have exactly 1 neighbour; branch points have 3+.
+    We trace from each endpoint and remove if path length < max_length
+    before hitting another branch point or endpoint.
+    """
+    skel = skeleton.copy()
+    h, w = skel.shape
+
+    def _neighbours(y, x):
+        pts = []
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < h and 0 <= nx < w and skel[ny, nx]:
+                    pts.append((ny, nx))
+        return pts
+
+    def _n_neighbours(y, x):
+        return len(_neighbours(y, x))
+
+    # Iteratively prune until no more short branches
+    changed = True
+    iterations = 0
+    while changed and iterations < 20:
+        changed = False
+        iterations += 1
+        endpoints = []
+        for y in range(h):
+            for x in range(w):
+                if skel[y, x] and _n_neighbours(y, x) == 1:
+                    endpoints.append((y, x))
+
+        for ey, ex in endpoints:
+            if not skel[ey, ex]:
+                continue
+            # Trace from endpoint
+            path = [(ey, ex)]
+            cy, cx = ey, ex
+            for _ in range(max_length + 1):
+                nbrs = _neighbours(cy, cx)
+                # Exclude previous pixel
+                nbrs = [(ny, nx) for ny, nx in nbrs if (ny, nx) not in path]
+                if not nbrs:
+                    break
+                cy, cx = nbrs[0]
+                nn = _n_neighbours(cy, cx)
+                if nn >= 3:
+                    # Reached a junction — this is a short branch
+                    break
+                path.append((cy, cx))
+
+            # If branch is short (< max_length), remove it
+            if len(path) <= max_length:
+                for py, px in path[:-1]:  # Keep the junction point
+                    skel[py, px] = False
+                changed = True
+
+    return skel
+
+
+def _connect_skeleton_endpoints(skeleton, max_distance):
+    """Connect nearby free endpoints in a skeleton.
+
+    For each pair of endpoints within max_distance, draw a line
+    connecting them on the skeleton.
+    """
+    from skimage.draw import line as skline
+
+    skel = skeleton.copy()
+    h, w = skel.shape
+
+    # Find endpoints (pixels with exactly 1 skeleton neighbour)
+    endpoints = []
+    for y in range(h):
+        for x in range(w):
+            if not skel[y, x]:
+                continue
+            n = 0
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = y + dy, x + dx
+                    if 0 <= ny < h and 0 <= nx < w and skel[ny, nx]:
+                        n += 1
+            if n == 1:
+                endpoints.append((y, x))
+
+    # Connect nearby pairs
+    connected = set()
+    for i, (y1, x1) in enumerate(endpoints):
+        if i in connected:
+            continue
+        best_j = -1
+        best_dist = max_distance + 1
+        for j, (y2, x2) in enumerate(endpoints):
+            if j <= i or j in connected:
+                continue
+            d = np.sqrt((y1 - y2)**2 + (x1 - x2)**2)
+            if d < best_dist and d <= max_distance:
+                best_dist = d
+                best_j = j
+        if best_j >= 0:
+            y2, x2 = endpoints[best_j]
+            rr, cc = skline(y1, x1, y2, x2)
+            skel[rr, cc] = True
+            connected.add(i)
+            connected.add(best_j)
+
+    return skel
+
+
 def _coords_to_labels(coords, shape, radius=2, radii=None):
     """Convert coordinate array to a label mask."""
     from skimage.draw import disk as skdisk
@@ -318,6 +586,100 @@ def _coords_to_labels(coords, shape, radius=2, radii=None):
         rr, cc = skdisk((int(round(y)), int(round(x))), r, shape=shape)
         labels[rr, cc] = i + 1
     return labels
+
+
+def _spotiflow_threshold_hybrid(
+    img2d, preprocessed, cell_mask, preproc_kw,
+    spotiflow_model="general",
+    spotiflow_prob=0.5,
+    threshold_method="otsu",
+    custom_threshold=None,
+    min_size=3,
+    max_size=0,
+):
+    """Hybrid: Spotiflow seeds + Otsu thresholding morphology + watershed.
+
+    Best of both worlds:
+    - **Spotiflow** provides accurate (y, x) point localisations even
+      in noisy images.
+    - **Otsu thresholding** defines the actual blob-like extent of each
+      punctum (morphology), capturing the full shape.
+    - **Marker-controlled watershed** assigns foreground pixels to the
+      nearest Spotiflow seed, producing clean label masks.
+
+    Steps
+    -----
+    1. Spotiflow detects puncta centres.
+    2. Otsu (or user-chosen) threshold generates a binary foreground mask.
+    3. Each Spotiflow seed becomes a watershed marker.
+    4. Watershed assigns foreground pixels to the nearest seed.
+    5. Standard size filtering is applied.
+    """
+    from skimage.segmentation import watershed
+
+    # --- Step 1: Spotiflow point detection ----------------------------
+    det = _get_spotiflow_detector(spotiflow_model, spotiflow_prob)
+    result = det.detect_2d(img2d, mask=cell_mask)
+
+    if result.coordinates is None or len(result.coordinates) == 0:
+        return np.zeros(img2d.shape, dtype=np.int32)
+
+    coords = np.asarray(result.coordinates, dtype=np.float64)
+
+    # --- Step 2: Otsu threshold for blob morphology -------------------
+    binary = _detect_threshold(preprocessed, threshold_method, custom_threshold)
+
+    # Intersect with cell mask if provided
+    if cell_mask is not None:
+        binary = binary & (cell_mask > 0)
+
+    if not binary.any():
+        # If no foreground, fall back to small disk labels from Spotiflow
+        return _coords_to_labels(coords, img2d.shape, radius=2)
+
+    # --- Step 3: Place Spotiflow seeds as markers ---------------------
+    h, w = preprocessed.shape
+    markers = np.zeros((h, w), dtype=np.int32)
+    valid_seeds = 0
+    for i, (y, x) in enumerate(coords):
+        yi, xi = int(round(y)), int(round(x))
+        yi = np.clip(yi, 0, h - 1)
+        xi = np.clip(xi, 0, w - 1)
+        # Only seed within the thresholded foreground
+        if binary[yi, xi]:
+            markers[yi, xi] = i + 1
+            valid_seeds += 1
+        else:
+            # Seed landed just outside the Otsu region — check local
+            # neighbourhood (3x3) for any foreground pixel
+            for dy in range(-1, 2):
+                for dx in range(-1, 2):
+                    ny, nx = yi + dy, xi + dx
+                    if 0 <= ny < h and 0 <= nx < w and binary[ny, nx]:
+                        markers[ny, nx] = i + 1
+                        valid_seeds += 1
+                        break
+                else:
+                    continue
+                break
+
+    if valid_seeds == 0:
+        return _coords_to_labels(coords, img2d.shape, radius=2)
+
+    # --- Step 4: Watershed on Otsu foreground -------------------------
+    inv = preprocessed.max() - preprocessed
+    labels = watershed(inv, markers=markers, mask=binary, compactness=1.0)
+
+    # --- Step 5: Size filter ------------------------------------------
+    if min_size > 0 or max_size > 0:
+        for prop in measure.regionprops(labels):
+            if min_size > 0 and prop.area < min_size:
+                labels[labels == prop.label] = 0
+            if max_size > 0 and prop.area > max_size:
+                labels[labels == prop.label] = 0
+        labels, _, _ = relabel_sequential(labels)
+
+    return labels.astype(np.int32)
 
 
 def _spotiflow_log_hybrid(
@@ -673,6 +1035,11 @@ def batch_segment(
     spotiflow_model="general",
     spotiflow_prob=0.5,
     spot_radius=2,
+    tb_threshold_factor=4.0,
+    tb_max_branch_length=10,
+    tb_connect_distance=10,
+    tb_min_eq_diameter=0,
+    tb_min_border_strength=0,
     consensus_detectors=None,
     consensus_strategy="weighted_confidence",
     consensus_weights=None,
@@ -771,6 +1138,11 @@ def batch_segment(
                 spotiflow_prob=spotiflow_prob,
                 spot_radius=spot_radius,
                 cell_mask=cell_mask,
+                tb_threshold_factor=tb_threshold_factor,
+                tb_max_branch_length=tb_max_branch_length,
+                tb_connect_distance=tb_connect_distance,
+                tb_min_eq_diameter=tb_min_eq_diameter,
+                tb_min_border_strength=tb_min_border_strength,
                 consensus_detectors=consensus_detectors,
                 consensus_strategy=consensus_strategy,
                 consensus_weights=consensus_weights,
@@ -856,7 +1228,8 @@ if __name__ == "__main__":
     parser.add_argument("--method",
                         choices=["threshold", "log", "dog",
                                  "intensity_ratio", "spotiflow",
-                                 "spotiflow+log", "consensus"],
+                                 "spotiflow+threshold", "spotiflow+log",
+                                 "tight_borders", "consensus"],
                         default="threshold")
     parser.add_argument("--sigma", type=float, default=1.0)
     parser.add_argument("--no-bg-sub", action="store_true")
@@ -882,6 +1255,17 @@ if __name__ == "__main__":
                         help="Radius (px) for Spotiflow spot masks (default: 2)")
     parser.add_argument("--cell-mask-dir", default=None,
                         help="Directory of cell masks for per-cell quantification")
+    # Tight borders
+    parser.add_argument("--tb-threshold-factor", type=float, default=4.0,
+                        help="Edge threshold multiplier for tight borders (default: 4)")
+    parser.add_argument("--tb-max-branch-length", type=int, default=10,
+                        help="Max skeleton branch length to prune (default: 10)")
+    parser.add_argument("--tb-connect-distance", type=int, default=10,
+                        help="Max distance to connect free skeleton endpoints (default: 10)")
+    parser.add_argument("--tb-min-eq-diameter", type=float, default=0,
+                        help="Min equivalent diameter to keep (default: 0 = off)")
+    parser.add_argument("--tb-min-border-strength", type=float, default=0,
+                        help="Keep small objects with border strength above this (default: 0)")
     parser.add_argument("--no-cellpose-npy", action="store_true")
     parser.add_argument("--no-triptychs", action="store_true")
     # Consensus
@@ -915,6 +1299,11 @@ if __name__ == "__main__":
         open_radius=args.open_radius,
         spot_radius=args.spot_radius,
         cell_mask_dir=args.cell_mask_dir,
+        tb_threshold_factor=args.tb_threshold_factor,
+        tb_max_branch_length=args.tb_max_branch_length,
+        tb_connect_distance=args.tb_connect_distance,
+        tb_min_eq_diameter=args.tb_min_eq_diameter,
+        tb_min_border_strength=args.tb_min_border_strength,
         save_cellpose_npy=not args.no_cellpose_npy,
         save_triptychs=not args.no_triptychs,
         consensus_detectors=args.consensus_detectors,

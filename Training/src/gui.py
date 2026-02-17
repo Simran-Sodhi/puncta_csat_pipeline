@@ -1056,9 +1056,16 @@ class SegmentationGUI(tk.Tk):
         method_row2.pack(fill=tk.X, pady=(2, 0))
         for label, val in [("Intensity-Ratio (PunctaFinder)", "intensity_ratio"),
                            ("Spotiflow (DL)", "spotiflow"),
-                           ("Spotiflow + LoG (hybrid)", "spotiflow+log"),
-                           ("Consensus (multi-detector)", "consensus")]:
+                           ("Spotiflow + Otsu (hybrid)", "spotiflow+threshold"),
+                           ("Spotiflow + LoG (hybrid)", "spotiflow+log")]:
             ttk.Radiobutton(method_row2, text=label, variable=self.pseg_method,
+                            value=val, command=self._pseg_on_method_change).pack(side=tk.LEFT, padx=6)
+
+        method_row3 = ttk.Frame(method_frame)
+        method_row3.pack(fill=tk.X, pady=(2, 0))
+        for label, val in [("Tight Borders", "tight_borders"),
+                           ("Consensus (multi-detector)", "consensus")]:
+            ttk.Radiobutton(method_row3, text=label, variable=self.pseg_method,
                             value=val, command=self._pseg_on_method_change).pack(side=tk.LEFT, padx=6)
 
         # -- Threshold sub-panel --
@@ -1114,6 +1121,31 @@ class SegmentationGUI(tk.Tk):
                      textvariable=self.pseg_spoti_radius, width=4).pack(side=tk.LEFT)
         ttk.Label(self.pseg_spoti_frame, text="  (requires: pip install spotiflow)",
                   foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        # -- Tight Borders sub-panel --
+        self.pseg_tb_frame = ttk.Frame(method_frame)
+        tb_row1 = ttk.Frame(self.pseg_tb_frame)
+        tb_row1.pack(fill=tk.X, pady=2)
+        ttk.Label(tb_row1, text="Threshold factor:").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_tb_threshold = tk.DoubleVar(value=4.0)
+        ttk.Entry(tb_row1, textvariable=self.pseg_tb_threshold, width=5).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(tb_row1, text="Max branch length (px):").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_tb_branch_len = tk.IntVar(value=10)
+        ttk.Spinbox(tb_row1, from_=0, to=100,
+                     textvariable=self.pseg_tb_branch_len, width=4).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(tb_row1, text="Connect free endings (px):").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_tb_connect = tk.IntVar(value=10)
+        ttk.Spinbox(tb_row1, from_=0, to=100,
+                     textvariable=self.pseg_tb_connect, width=4).pack(side=tk.LEFT)
+
+        tb_row2 = ttk.Frame(self.pseg_tb_frame)
+        tb_row2.pack(fill=tk.X, pady=2)
+        ttk.Label(tb_row2, text="Min eq. diameter:").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_tb_min_eq_dia = tk.DoubleVar(value=0)
+        ttk.Entry(tb_row2, textvariable=self.pseg_tb_min_eq_dia, width=5).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(tb_row2, text="Keep if border > :").pack(side=tk.LEFT, padx=(0, 5))
+        self.pseg_tb_border_strength = tk.DoubleVar(value=0)
+        ttk.Entry(tb_row2, textvariable=self.pseg_tb_border_strength, width=5).pack(side=tk.LEFT)
 
         # -- Consensus sub-panel --
         self.pseg_cons_frame = ttk.Frame(method_frame)
@@ -1202,6 +1234,11 @@ class SegmentationGUI(tk.Tk):
                                        command=self._pseg_run)
         self.btn_pseg_run.pack(side=tk.LEFT, padx=5)
 
+        self.btn_pseg_benchmark = ttk.Button(
+            btn_frame, text="Benchmark Methods",
+            command=self._pseg_benchmark)
+        self.btn_pseg_benchmark.pack(side=tk.LEFT, padx=5)
+
         # Progress
         self.pseg_progress = ttk.Progressbar(body, mode="determinate")
         self.pseg_progress.pack(fill=tk.X, padx=10, pady=5)
@@ -1240,7 +1277,7 @@ class SegmentationGUI(tk.Tk):
         # Hide all sub-panels
         for frame in (self.pseg_thresh_frame, self.pseg_blob_frame,
                       self.pseg_ir_frame, self.pseg_spoti_frame,
-                      self.pseg_cons_frame):
+                      self.pseg_tb_frame, self.pseg_cons_frame):
             frame.pack_forget()
         # Show relevant sub-panel
         if method == "threshold":
@@ -1251,9 +1288,14 @@ class SegmentationGUI(tk.Tk):
             self.pseg_ir_frame.pack(fill=tk.X, pady=(5, 0))
         elif method == "spotiflow":
             self.pseg_spoti_frame.pack(fill=tk.X, pady=(5, 0))
+        elif method == "spotiflow+threshold":
+            self.pseg_spoti_frame.pack(fill=tk.X, pady=(5, 0))
+            self.pseg_thresh_frame.pack(fill=tk.X, pady=(5, 0))
         elif method == "spotiflow+log":
             self.pseg_spoti_frame.pack(fill=tk.X, pady=(5, 0))
             self.pseg_blob_frame.pack(fill=tk.X, pady=(5, 0))
+        elif method == "tight_borders":
+            self.pseg_tb_frame.pack(fill=tk.X, pady=(5, 0))
         elif method == "consensus":
             self.pseg_cons_frame.pack(fill=tk.X, pady=(5, 0))
 
@@ -1305,6 +1347,13 @@ class SegmentationGUI(tk.Tk):
         spoti_model = self.pseg_spoti_model.get()
         spoti_prob = self.pseg_spoti_prob.get()
         spoti_radius = self.pseg_spoti_radius.get()
+
+        # Tight borders params
+        tb_threshold = self.pseg_tb_threshold.get()
+        tb_branch_len = self.pseg_tb_branch_len.get()
+        tb_connect = self.pseg_tb_connect.get()
+        tb_min_eq_dia = self.pseg_tb_min_eq_dia.get()
+        tb_border_str = self.pseg_tb_border_strength.get()
 
         # Consensus params
         cons_detectors = []
@@ -1372,6 +1421,11 @@ class SegmentationGUI(tk.Tk):
                     spotiflow_model=spoti_model,
                     spotiflow_prob=spoti_prob,
                     spot_radius=spoti_radius,
+                    tb_threshold_factor=tb_threshold,
+                    tb_max_branch_length=tb_branch_len,
+                    tb_connect_distance=tb_connect,
+                    tb_min_eq_diameter=tb_min_eq_dia,
+                    tb_min_border_strength=tb_border_str,
                     consensus_detectors=cons_detectors if method == "consensus" else None,
                     consensus_strategy=cons_strategy,
                     consensus_threshold=cons_conf_thresh,
@@ -1397,6 +1451,114 @@ class SegmentationGUI(tk.Tk):
         else:
             self.pseg_status.set("Puncta segmentation complete")
             self._pseg_log_append("[DONE] Puncta segmentation complete.")
+
+    def _pseg_benchmark(self):
+        """Run the benchmarking pipeline comparing multiple methods."""
+        img_dir = self.pseg_input_dir.get()
+        out_dir = self.pseg_out_dir.get()
+        if not img_dir or not out_dir:
+            messagebox.showwarning("Missing input",
+                                   "Select both image directory and output directory.")
+            return
+        if NUCLEUS_SCRIPTS_DIR is None:
+            messagebox.showerror("Nucleus/Scripts not found",
+                                 "Cannot find Nucleus/Scripts/.")
+            return
+
+        channel = self.pseg_channel.get()
+        z_idx = self.pseg_z_idx.get()
+        cell_mask_dir = self.pseg_cell_mask_dir.get() or None
+
+        # Ask user which methods to benchmark
+        methods_win = tk.Toplevel(self)
+        methods_win.title("Select methods to compare")
+        methods_win.geometry("380x350")
+        ttk.Label(methods_win, text="Select methods to include in benchmark:",
+                  font=("", 10, "bold")).pack(pady=(10, 5))
+
+        method_vars = {}
+        defaults = {
+            "threshold": True,
+            "spotiflow": True,
+            "spotiflow+threshold": True,
+            "spotiflow+log": False,
+            "tight_borders": True,
+            "log": False,
+            "dog": False,
+            "intensity_ratio": False,
+        }
+        for name, default in defaults.items():
+            var = tk.BooleanVar(value=default)
+            method_vars[name] = var
+            ttk.Checkbutton(methods_win, text=name, variable=var).pack(
+                anchor=tk.W, padx=20, pady=1)
+
+        ttk.Label(methods_win, text="\nGround-truth masks (optional):").pack(anchor=tk.W, padx=10)
+        gt_var = tk.StringVar()
+        gt_frame = ttk.Frame(methods_win)
+        gt_frame.pack(fill=tk.X, padx=10, pady=2)
+        ttk.Entry(gt_frame, textvariable=gt_var, width=30).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(gt_frame, text="Browse...",
+                    command=lambda: self._browse_dir(gt_var)).pack(side=tk.LEFT)
+
+        def _run_benchmark():
+            methods = [n for n, v in method_vars.items() if v.get()]
+            if len(methods) < 2:
+                messagebox.showwarning("Need methods",
+                                       "Select at least 2 methods to compare.")
+                return
+            methods_win.destroy()
+
+            bench_dir = str(Path(out_dir) / "benchmark")
+            gt_dir = gt_var.get() or None
+
+            self._pseg_log_append(f"Benchmark: comparing {', '.join(methods)}")
+            self.btn_pseg_run.config(state=tk.DISABLED)
+            self.btn_pseg_benchmark.config(state=tk.DISABLED)
+            self.pseg_status.set("Running benchmark...")
+            self.pseg_progress.config(mode="indeterminate")
+            self.pseg_progress.start(20)
+
+            def _task():
+                try:
+                    import pandas as pd
+                    from puncta_detection.benchmark import run_benchmark
+                    result = run_benchmark(
+                        image_dir=img_dir,
+                        out_dir=bench_dir,
+                        methods=methods,
+                        channel=channel,
+                        z_index=z_idx,
+                        gt_mask_dir=gt_dir,
+                        cell_mask_dir=cell_mask_dir,
+                        sigma=self.pseg_sigma.get(),
+                        threshold_method=self.pseg_thresh_method.get(),
+                        min_size=self.pseg_min_size.get(),
+                        max_size=self.pseg_max_size.get(),
+                        spotiflow_model=self.pseg_spoti_model.get(),
+                        spotiflow_prob=self.pseg_spoti_prob.get(),
+                        spot_radius=self.pseg_spoti_radius.get(),
+                    )
+                    # Log summary
+                    if result and "summary" in result:
+                        df = result["summary"]
+                        for _, row in df.iterrows():
+                            line = (f"  {row['method']:25s}  "
+                                    f"count={row['mean_detections']:6.1f} +/- "
+                                    f"{row['std_detections']:5.1f}  "
+                                    f"area={row['mean_area']:5.1f}")
+                            if "mean_gt_f1" in row and not pd.isna(row.get("mean_gt_f1")):
+                                line += f"  F1={row['mean_gt_f1']:.3f}"
+                            self.log_queue.put(f"__PSEG_LOG__{line}")
+                    self.log_queue.put(f"__PSEG_LOG__Benchmark results saved to {bench_dir}")
+                    self.log_queue.put("__PSEG_BENCH_DONE__")
+                except Exception as exc:
+                    import traceback
+                    self.log_queue.put(f"__PSEG_ERROR__{exc}\n{traceback.format_exc()}")
+
+            threading.Thread(target=_task, daemon=True).start()
+
+        ttk.Button(methods_win, text="Run Benchmark", command=_run_benchmark).pack(pady=10)
 
     # ==================================================================
     # TAB: INTENSITY & PUNCTA ANALYSIS
@@ -2584,8 +2746,21 @@ class SegmentationGUI(tk.Tk):
             if msg == "__PSEG_DONE__":
                 self._on_pseg_finished()
                 continue
+            if msg == "__PSEG_BENCH_DONE__":
+                self.btn_pseg_run.config(state=tk.NORMAL)
+                self.btn_pseg_benchmark.config(state=tk.NORMAL)
+                self.pseg_progress.stop()
+                self.pseg_progress.config(mode="determinate", value=100)
+                self.pseg_status.set("Benchmark complete")
+                self._pseg_log_append("[DONE] Benchmark complete.")
+                continue
+            if msg.startswith("__PSEG_LOG__"):
+                self._pseg_log_append(msg[len("__PSEG_LOG__"):])
+                continue
             if msg.startswith("__PSEG_ERROR__"):
                 self._on_pseg_finished(error=msg[len("__PSEG_ERROR__"):])
+                # Also re-enable benchmark button
+                self.btn_pseg_benchmark.config(state=tk.NORMAL)
                 continue
             if msg.startswith("__PSEG_PROGRESS__"):
                 pct = int(msg[len("__PSEG_PROGRESS__"):])
