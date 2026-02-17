@@ -1048,6 +1048,7 @@ class SegmentationGUI(tk.Tk):
         method_row2.pack(fill=tk.X, pady=(2, 0))
         for label, val in [("Intensity-Ratio (PunctaFinder)", "intensity_ratio"),
                            ("Spotiflow (DL)", "spotiflow"),
+                           ("Spotiflow + LoG (hybrid)", "spotiflow+log"),
                            ("Consensus (multi-detector)", "consensus")]:
             ttk.Radiobutton(method_row2, text=label, variable=self.pseg_method,
                             value=val, command=self._pseg_on_method_change).pack(side=tk.LEFT, padx=6)
@@ -1242,6 +1243,9 @@ class SegmentationGUI(tk.Tk):
             self.pseg_ir_frame.pack(fill=tk.X, pady=(5, 0))
         elif method == "spotiflow":
             self.pseg_spoti_frame.pack(fill=tk.X, pady=(5, 0))
+        elif method == "spotiflow+log":
+            self.pseg_spoti_frame.pack(fill=tk.X, pady=(5, 0))
+            self.pseg_blob_frame.pack(fill=tk.X, pady=(5, 0))
         elif method == "consensus":
             self.pseg_cons_frame.pack(fill=tk.X, pady=(5, 0))
 

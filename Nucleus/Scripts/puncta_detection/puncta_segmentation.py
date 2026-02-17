@@ -253,6 +253,19 @@ def segment_puncta_2d(
         )
         return labels, preprocessed
 
+    if method == "spotiflow+log":
+        labels = _spotiflow_log_hybrid(
+            img2d, preprocessed, cell_mask, preproc_kw,
+            spotiflow_model=spotiflow_model,
+            spotiflow_prob=spotiflow_prob,
+            min_sigma=min_sigma,
+            max_sigma=max_sigma,
+            num_sigma=num_sigma,
+            min_size=min_size,
+            max_size=max_size,
+        )
+        return labels, preprocessed
+
     if method == "consensus":
         labels = _run_consensus(
             img2d, preprocessed, cell_mask, preproc_kw,
@@ -305,6 +318,97 @@ def _coords_to_labels(coords, shape, radius=2, radii=None):
         rr, cc = skdisk((int(round(y)), int(round(x))), r, shape=shape)
         labels[rr, cc] = i + 1
     return labels
+
+
+def _spotiflow_log_hybrid(
+    img2d, preprocessed, cell_mask, preproc_kw,
+    spotiflow_model="general",
+    spotiflow_prob=0.5,
+    min_sigma=1.0,
+    max_sigma=5.0,
+    num_sigma=5,
+    min_size=3,
+    max_size=0,
+):
+    """Hybrid: Spotiflow seeds + LoG scale estimation + watershed segmentation.
+
+    1. Spotiflow provides accurate (y, x) point detections.
+    2. A multi-scale LoG filter bank is evaluated at each seed to estimate
+       the best-matching blob sigma (and thus radius).
+    3. Marker-controlled watershed segments the actual blob boundaries
+       using the Spotiflow seeds as markers.
+    4. Standard size filtering is applied.
+    """
+    from skimage.segmentation import watershed
+
+    # --- Step 1: Spotiflow point detection ----------------------------
+    det = _get_spotiflow_detector(spotiflow_model, spotiflow_prob)
+    result = det.detect_2d(img2d, mask=cell_mask)
+
+    if result.coordinates is None or len(result.coordinates) == 0:
+        return np.zeros(img2d.shape, dtype=np.int32)
+
+    coords = np.asarray(result.coordinates, dtype=np.float64)
+
+    # --- Step 2: LoG scale-space → radius per seed --------------------
+    sigmas = np.linspace(min_sigma, max_sigma, num_sigma)
+    h, w = preprocessed.shape
+    # Pre-compute normalized LoG responses at every scale
+    from scipy.ndimage import gaussian_laplace
+    log_stack = np.empty((len(sigmas), h, w), dtype=np.float32)
+    for si, s in enumerate(sigmas):
+        # Normalized Laplacian of Gaussian (sigma^2 weighting)
+        log_stack[si] = -(gaussian_laplace(preprocessed.astype(np.float64), sigma=s) * s * s)
+
+    radii = np.empty(len(coords), dtype=np.float64)
+    for i, (y, x) in enumerate(coords):
+        yi, xi = int(round(y)), int(round(x))
+        yi = np.clip(yi, 0, h - 1)
+        xi = np.clip(xi, 0, w - 1)
+        # Pick sigma with strongest LoG response at this location
+        responses = log_stack[:, yi, xi]
+        best_idx = int(np.argmax(responses))
+        radii[i] = sigmas[best_idx] * np.sqrt(2)  # blob radius = sigma * sqrt(2)
+
+    # --- Step 3: Marker-controlled watershed --------------------------
+    markers = np.zeros(preprocessed.shape, dtype=np.int32)
+    for i, (y, x) in enumerate(coords):
+        yi, xi = int(round(y)), int(round(x))
+        yi = np.clip(yi, 0, h - 1)
+        xi = np.clip(xi, 0, w - 1)
+        markers[yi, xi] = i + 1
+
+    # Build a generous binary mask around all seeds so watershed doesn't
+    # flood the entire image.  Each seed gets a disk of 3x its LoG radius.
+    from skimage.draw import disk as skdisk
+    ws_mask_local = np.zeros(preprocessed.shape, dtype=bool)
+    for i, (y, x) in enumerate(coords):
+        yi, xi = int(round(y)), int(round(x))
+        yi = np.clip(yi, 0, h - 1)
+        xi = np.clip(xi, 0, w - 1)
+        r = max(3, int(round(radii[i] * 3)))
+        rr, cc = skdisk((yi, xi), r, shape=preprocessed.shape)
+        ws_mask_local[rr, cc] = True
+
+    # Intersect with cell mask if provided
+    if cell_mask is not None:
+        ws_mask_local &= (cell_mask > 0)
+
+    # Invert preprocessed image so watershed flows into bright regions
+    inv = preprocessed.max() - preprocessed
+    labels = watershed(inv, markers=markers, mask=ws_mask_local,
+                       compactness=1.0)
+
+    # --- Step 4: Size filter ------------------------------------------
+    if min_size > 0 or max_size > 0:
+        for prop in measure.regionprops(labels):
+            if min_size > 0 and prop.area < min_size:
+                labels[labels == prop.label] = 0
+            if max_size > 0 and prop.area > max_size:
+                labels[labels == prop.label] = 0
+        labels, _, _ = relabel_sequential(labels)
+
+    return labels.astype(np.int32)
 
 
 def _run_consensus(
@@ -560,7 +664,8 @@ if __name__ == "__main__":
     parser.add_argument("--z-index", type=int, default=0)
     parser.add_argument("--method",
                         choices=["threshold", "log", "dog",
-                                 "intensity_ratio", "spotiflow", "consensus"],
+                                 "intensity_ratio", "spotiflow",
+                                 "spotiflow+log", "consensus"],
                         default="threshold")
     parser.add_argument("--sigma", type=float, default=1.0)
     parser.add_argument("--no-bg-sub", action="store_true")
