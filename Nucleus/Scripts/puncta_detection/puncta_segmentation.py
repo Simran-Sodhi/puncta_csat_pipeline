@@ -174,6 +174,8 @@ def segment_puncta_2d(
     tb_connect_distance=10,
     tb_min_eq_diameter=0,
     tb_min_border_strength=0,
+    # Local thresholding params
+    local_radius=50,
     # Consensus params
     consensus_detectors=None,
     consensus_strategy="weighted_confidence",
@@ -270,6 +272,7 @@ def segment_puncta_2d(
             custom_threshold=custom_threshold,
             min_size=min_size,
             max_size=max_size,
+            local_radius=local_radius,
         )
         return labels, preprocessed
 
@@ -596,24 +599,41 @@ def _spotiflow_threshold_hybrid(
     custom_threshold=None,
     min_size=3,
     max_size=0,
+    local_radius=50,
 ):
-    """Hybrid: Spotiflow seeds + Otsu thresholding morphology + watershed.
+    """Hybrid: Spotiflow seeds + **local** Otsu thresholding + watershed.
 
-    Best of both worlds:
-    - **Spotiflow** provides accurate (y, x) point localisations even
-      in noisy images.
-    - **Otsu thresholding** defines the actual blob-like extent of each
-      punctum (morphology), capturing the full shape.
-    - **Marker-controlled watershed** assigns foreground pixels to the
-      nearest Spotiflow seed, producing clean label masks.
+    Spotiflow-first pipeline that captures faint puncta missed by global
+    thresholding:
+
+    - **Spotiflow** detects all puncta centres — including dim spots that
+      a global threshold would miss.
+    - **Local Otsu** is computed in a window around each seed, so the
+      threshold adapts to the local intensity profile and correctly
+      captures spots that are locally bright but globally faint.
+    - **Marker-controlled watershed** assigns the locally-thresholded
+      foreground pixels to the nearest Spotiflow seed, producing clean
+      label masks.
 
     Steps
     -----
-    1. Spotiflow detects puncta centres.
-    2. Otsu (or user-chosen) threshold generates a binary foreground mask.
-    3. Each Spotiflow seed becomes a watershed marker.
+    1. Spotiflow detects puncta centres (seeds).
+    2. For each seed, Otsu (or user-chosen) threshold is computed on a
+       local patch of radius ``local_radius`` around the seed and the
+       resulting foreground pixels are accumulated into a combined mask.
+    3. Each Spotiflow seed becomes a watershed marker placed inside its
+       local foreground region.
     4. Watershed assigns foreground pixels to the nearest seed.
     5. Standard size filtering is applied.
+
+    Parameters
+    ----------
+    local_radius : int
+        Half-width (in pixels) of the square neighbourhood around each
+        Spotiflow seed in which local Otsu thresholding is performed.
+        Larger values give more context but approach global behaviour;
+        smaller values are more adaptive but may under-segment.
+        Default 50.
     """
     from skimage.segmentation import watershed
 
@@ -626,8 +646,43 @@ def _spotiflow_threshold_hybrid(
 
     coords = np.asarray(result.coordinates, dtype=np.float64)
 
-    # --- Step 2: Otsu threshold for blob morphology -------------------
-    binary = _detect_threshold(preprocessed, threshold_method, custom_threshold)
+    # --- Step 2: Local Otsu around each Spotiflow seed ----------------
+    h, w = preprocessed.shape
+    binary = np.zeros((h, w), dtype=bool)
+    lr = int(local_radius)
+
+    for y, x in coords:
+        yi, xi = int(round(y)), int(round(x))
+        yi = np.clip(yi, 0, h - 1)
+        xi = np.clip(xi, 0, w - 1)
+
+        # Extract local patch
+        y0 = max(0, yi - lr)
+        y1 = min(h, yi + lr + 1)
+        x0 = max(0, xi - lr)
+        x1 = min(w, xi + lr + 1)
+        patch = preprocessed[y0:y1, x0:x1]
+
+        # Skip degenerate patches (uniform intensity)
+        if patch.max() == patch.min():
+            continue
+
+        # Compute threshold on the local patch
+        if threshold_method == "custom" and custom_threshold is not None:
+            local_thresh = float(custom_threshold)
+        elif threshold_method == "otsu":
+            local_thresh = filters.threshold_otsu(patch)
+        elif threshold_method == "yen":
+            local_thresh = filters.threshold_yen(patch)
+        elif threshold_method == "triangle":
+            local_thresh = filters.threshold_triangle(patch)
+        elif threshold_method == "li":
+            local_thresh = filters.threshold_li(patch)
+        else:
+            local_thresh = filters.threshold_otsu(patch)
+
+        # Apply local threshold and write into the global binary mask
+        binary[y0:y1, x0:x1] |= (patch > local_thresh)
 
     # Intersect with cell mask if provided
     if cell_mask is not None:
@@ -638,20 +693,18 @@ def _spotiflow_threshold_hybrid(
         return _coords_to_labels(coords, img2d.shape, radius=2)
 
     # --- Step 3: Place Spotiflow seeds as markers ---------------------
-    h, w = preprocessed.shape
     markers = np.zeros((h, w), dtype=np.int32)
     valid_seeds = 0
     for i, (y, x) in enumerate(coords):
         yi, xi = int(round(y)), int(round(x))
         yi = np.clip(yi, 0, h - 1)
         xi = np.clip(xi, 0, w - 1)
-        # Only seed within the thresholded foreground
+        # Seed should now be inside the locally-thresholded region
         if binary[yi, xi]:
             markers[yi, xi] = i + 1
             valid_seeds += 1
         else:
-            # Seed landed just outside the Otsu region — check local
-            # neighbourhood (3x3) for any foreground pixel
+            # Seed just outside — check local neighbourhood (3x3)
             for dy in range(-1, 2):
                 for dx in range(-1, 2):
                     ny, nx = yi + dy, xi + dx
@@ -666,7 +719,7 @@ def _spotiflow_threshold_hybrid(
     if valid_seeds == 0:
         return _coords_to_labels(coords, img2d.shape, radius=2)
 
-    # --- Step 4: Watershed on Otsu foreground -------------------------
+    # --- Step 4: Watershed on locally-thresholded foreground ----------
     inv = preprocessed.max() - preprocessed
     labels = watershed(inv, markers=markers, mask=binary, compactness=1.0)
 
@@ -1040,6 +1093,7 @@ def batch_segment(
     tb_connect_distance=10,
     tb_min_eq_diameter=0,
     tb_min_border_strength=0,
+    local_radius=50,
     consensus_detectors=None,
     consensus_strategy="weighted_confidence",
     consensus_weights=None,
@@ -1138,6 +1192,7 @@ def batch_segment(
                 spotiflow_prob=spotiflow_prob,
                 spot_radius=spot_radius,
                 cell_mask=cell_mask,
+                local_radius=local_radius,
                 tb_threshold_factor=tb_threshold_factor,
                 tb_max_branch_length=tb_max_branch_length,
                 tb_connect_distance=tb_connect_distance,
@@ -1253,6 +1308,9 @@ if __name__ == "__main__":
     parser.add_argument("--open-radius", type=int, default=0)
     parser.add_argument("--spot-radius", type=int, default=2,
                         help="Radius (px) for Spotiflow spot masks (default: 2)")
+    parser.add_argument("--local-radius", type=int, default=50,
+                        help="Half-width (px) of local Otsu window around each "
+                             "Spotiflow seed for spotiflow+threshold (default: 50)")
     parser.add_argument("--cell-mask-dir", default=None,
                         help="Directory of cell masks for per-cell quantification")
     # Tight borders
@@ -1298,6 +1356,7 @@ if __name__ == "__main__":
         max_size=args.max_size,
         open_radius=args.open_radius,
         spot_radius=args.spot_radius,
+        local_radius=args.local_radius,
         cell_mask_dir=args.cell_mask_dir,
         tb_threshold_factor=args.tb_threshold_factor,
         tb_max_branch_length=args.tb_max_branch_length,
