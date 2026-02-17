@@ -1016,6 +1016,14 @@ class SegmentationGUI(tk.Tk):
         ttk.Button(io_frame, text="Browse...",
                     command=lambda: self._browse_dir(self.pseg_out_dir)).grid(row=1, column=2, pady=2)
 
+        ttk.Label(io_frame, text="Cell Masks Folder (optional):").grid(row=2, column=0, sticky=tk.W, pady=2)
+        self.pseg_cell_mask_dir = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.pseg_cell_mask_dir, width=55).grid(row=2, column=1, padx=5, pady=2)
+        ttk.Button(io_frame, text="Browse...",
+                    command=lambda: self._browse_dir(self.pseg_cell_mask_dir)).grid(row=2, column=2, pady=2)
+        ttk.Label(io_frame, text="Assigns puncta to cells and exports per-cell CSV",
+                  foreground="gray").grid(row=2, column=3, sticky=tk.W, padx=5)
+
         # ---- Channel ----
         ch_frame = ttk.LabelFrame(body, text="Channel Selection", padding=10)
         ch_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -1312,11 +1320,16 @@ class SegmentationGUI(tk.Tk):
         cons_match_dist = self.pseg_cons_match_dist.get()
         cons_conf_thresh = self.pseg_cons_conf_thresh.get()
 
+        # Cell mask dir (optional — for per-cell quantification)
+        cell_mask_dir = self.pseg_cell_mask_dir.get() or None
+
         self._pseg_log_append(
             f"Puncta segmentation: method={method}, channel={channel}, z={z_idx}, "
             f"sigma={sigma}, bg={bg_method if bg_sub else 'off'}, "
             f"min_size={min_sz}, max_size={max_sz}"
         )
+        if cell_mask_dir:
+            self._pseg_log_append(f"  Cell masks: {cell_mask_dir}")
         self.btn_pseg_run.config(state=tk.DISABLED)
         self.pseg_tree.delete(*self.pseg_tree.get_children())
         self.pseg_progress.config(mode="determinate", value=0)
@@ -1363,6 +1376,7 @@ class SegmentationGUI(tk.Tk):
                     consensus_strategy=cons_strategy,
                     consensus_threshold=cons_conf_thresh,
                     consensus_match_dist=cons_match_dist,
+                    cell_mask_dir=cell_mask_dir,
                     save_cellpose_npy=save_npy,
                     save_triptychs=save_trip,
                     progress_callback=_on_progress,

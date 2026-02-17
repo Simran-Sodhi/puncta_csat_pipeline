@@ -507,6 +507,140 @@ def _labels_to_coords(labels):
 
 
 # ------------------------------------------------------------------ #
+#  Puncta-to-cell assignment and per-cell quantification
+# ------------------------------------------------------------------ #
+
+def assign_puncta_to_cells(puncta_labels, cell_labels):
+    """Map each punctum to the cell it falls within.
+
+    Parameters
+    ----------
+    puncta_labels : ndarray int32 (Y, X)
+        Label mask where each punctum has a unique integer > 0.
+    cell_labels : ndarray int32 (Y, X)
+        Label mask where each cell has a unique integer > 0.
+
+    Returns
+    -------
+    mapping : dict
+        ``{cell_id: [list of puncta_ids]}``.
+        Puncta that fall outside all cells are collected under key ``0``.
+    """
+    mapping = {}
+    for prop in measure.regionprops(puncta_labels):
+        cy, cx = int(round(prop.centroid[0])), int(round(prop.centroid[1]))
+        cy = np.clip(cy, 0, cell_labels.shape[0] - 1)
+        cx = np.clip(cx, 0, cell_labels.shape[1] - 1)
+        cell_id = int(cell_labels[cy, cx])
+        mapping.setdefault(cell_id, []).append(prop.label)
+    return mapping
+
+
+def per_cell_quantification(puncta_labels, cell_labels, raw_image=None):
+    """Compute per-cell puncta statistics.
+
+    Parameters
+    ----------
+    puncta_labels : ndarray int32 (Y, X)
+        Puncta label mask.
+    cell_labels : ndarray int32 (Y, X)
+        Cell label mask.
+    raw_image : ndarray or None
+        If provided, intensity metrics are computed for each punctum.
+
+    Returns
+    -------
+    list of dict
+        One row per cell with columns:
+        cell_id, cell_area, puncta_count, puncta_total_area,
+        puncta_density, puncta_ids, [mean_puncta_intensity].
+    """
+    assignment = assign_puncta_to_cells(puncta_labels, cell_labels)
+
+    # Pre-compute puncta properties
+    puncta_props = {p.label: p for p in measure.regionprops(puncta_labels)}
+
+    # Gather intensity per punctum if raw image is provided
+    puncta_int_props = {}
+    if raw_image is not None:
+        for p in measure.regionprops(puncta_labels, intensity_image=raw_image):
+            puncta_int_props[p.label] = p
+
+    cell_props = {p.label: p for p in measure.regionprops(cell_labels)}
+
+    rows = []
+    for cell_id in sorted(cell_props.keys()):
+        cell_area = cell_props[cell_id].area
+        p_ids = assignment.get(cell_id, [])
+        p_count = len(p_ids)
+        p_total_area = sum(puncta_props[pid].area for pid in p_ids if pid in puncta_props)
+        p_density = p_count / cell_area if cell_area > 0 else 0.0
+
+        row = {
+            "cell_id": cell_id,
+            "cell_area": cell_area,
+            "puncta_count": p_count,
+            "puncta_total_area": p_total_area,
+            "puncta_density": round(p_density, 6),
+            "puncta_ids": p_ids,
+        }
+
+        if raw_image is not None:
+            intensities = [
+                puncta_int_props[pid].mean_intensity
+                for pid in p_ids if pid in puncta_int_props
+            ]
+            row["mean_puncta_intensity"] = (
+                round(float(np.mean(intensities)), 4) if intensities else 0.0
+            )
+
+        rows.append(row)
+
+    return rows
+
+
+def _load_cell_mask(path):
+    """Load a cell mask from .tif or Cellpose _seg.npy."""
+    path = Path(path)
+    if path.suffix == ".npy":
+        dat = np.load(str(path), allow_pickle=True).item()
+        return ensure_2d(np.asarray(dat["masks"]))
+    return ensure_2d(tiff.imread(str(path)))
+
+
+def _parse_location(path):
+    """Extract a location token for matching images across directories."""
+    import re
+    s = str(path)
+    m = re.search(r"XYPos[/\\\\]([^.]*)\.ome", s)
+    if m:
+        return m.group(1)
+    m = re.search(r"(\d+_Z\d+)", s)
+    if m:
+        return m.group(1)
+    stem = Path(path).stem
+    for suffix in ("_seg", "_cyto3_masks", "_cell_masks", "_cyto_masks", "_masks",
+                    "_puncta_masks", "_puncta"):
+        if stem.endswith(suffix):
+            stem = stem[:-len(suffix)]
+            break
+    return stem
+
+
+def _build_cell_mask_map(cell_mask_dir):
+    """Build {location_token: Path} for cell masks."""
+    cell_mask_dir = Path(cell_mask_dir)
+    mapping = {}
+    for ext in ("*.tif", "*.tiff", "*_seg.npy"):
+        for p in cell_mask_dir.rglob(ext):
+            loc = _parse_location(p)
+            if loc not in mapping or p.suffix == ".npy":
+                mapping[loc] = p
+    print(f"[INFO] Cell masks: indexed {len(mapping)} masks from {cell_mask_dir}")
+    return mapping
+
+
+# ------------------------------------------------------------------ #
 #  Public API — batch
 # ------------------------------------------------------------------ #
 
@@ -544,6 +678,7 @@ def batch_segment(
     consensus_weights=None,
     consensus_threshold=0.3,
     consensus_match_dist=3.0,
+    cell_mask_dir=None,
     save_cellpose_npy=True,
     save_triptychs=True,
     progress_callback=None,
@@ -552,6 +687,11 @@ def batch_segment(
 
     Parameters
     ----------
+    cell_mask_dir : str or Path or None
+        Directory containing cell/ROI label masks (.tif or _seg.npy).
+        When provided, each image is matched to its cell mask by location
+        token, puncta are assigned to individual cells, and a per-cell
+        CSV is saved alongside the output masks.
     progress_callback : callable or None
         Called with (index, total, filename, n_objects) after each image.
 
@@ -559,6 +699,8 @@ def batch_segment(
     -------
     list of dict — per-image summary.
     """
+    import pandas as pd
+
     image_dir = Path(image_dir)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -567,12 +709,18 @@ def batch_segment(
     if save_triptychs:
         trip_dir.mkdir(parents=True, exist_ok=True)
 
+    # Build cell mask lookup if directory provided
+    cell_mask_map = {}
+    if cell_mask_dir:
+        cell_mask_map = _build_cell_mask_map(cell_mask_dir)
+
     image_paths = collect_image_paths(str(image_dir))
     if not image_paths:
         print("[WARN] No images found")
         return []
 
     summaries = []
+    all_cell_rows = []
     total = len(image_paths)
     print(f"[INFO] Processing {total} image(s) for puncta segmentation")
 
@@ -582,6 +730,19 @@ def batch_segment(
 
         try:
             img2d = load_image_2d(img_path, channel_index=channel, z_index=z_index)
+
+            # Look up matching cell mask
+            cell_mask = None
+            location = _parse_location(img_path)
+            if cell_mask_map and location in cell_mask_map:
+                cell_mask = _load_cell_mask(cell_mask_map[location])
+                if cell_mask.shape != img2d.shape:
+                    print(f"    [WARN] Cell mask shape {cell_mask.shape} != "
+                          f"image shape {img2d.shape}, skipping cell mask")
+                    cell_mask = None
+                else:
+                    print(f"    Using cell mask: {cell_mask_map[location].name} "
+                          f"({int(cell_mask.max())} cells)")
 
             labels, preprocessed = segment_puncta_2d(
                 img2d,
@@ -609,6 +770,7 @@ def batch_segment(
                 spotiflow_model=spotiflow_model,
                 spotiflow_prob=spotiflow_prob,
                 spot_radius=spot_radius,
+                cell_mask=cell_mask,
                 consensus_detectors=consensus_detectors,
                 consensus_strategy=consensus_strategy,
                 consensus_weights=consensus_weights,
@@ -628,6 +790,19 @@ def batch_segment(
                 save_triptych(auto_lut_clip(img2d), labels,
                               trip_dir / f"{stem}_puncta_triptych.png")
 
+            # Per-cell quantification
+            if cell_mask is not None and n_objects > 0:
+                cell_rows = per_cell_quantification(
+                    labels, cell_mask, raw_image=img2d,
+                )
+                for row in cell_rows:
+                    row["filename"] = img_path.name
+                    row["location"] = location
+                    row["puncta_ids"] = str(row["puncta_ids"])
+                all_cell_rows.extend(cell_rows)
+                print(f"    {n_objects} puncta assigned to "
+                      f"{sum(1 for r in cell_rows if r['puncta_count'] > 0)} cells")
+
             summaries.append({
                 "filename": img_path.name,
                 "n_objects": n_objects,
@@ -645,6 +820,22 @@ def batch_segment(
         if progress_callback is not None:
             progress_callback(idx, total, img_path.name,
                               summaries[-1]["n_objects"])
+
+    # Save per-cell CSV if we have cell data
+    if all_cell_rows:
+        csv_path = out_dir / "per_cell_puncta_summary.csv"
+        df = pd.DataFrame(all_cell_rows)
+        # Reorder columns
+        col_order = [
+            "filename", "location", "cell_id", "cell_area",
+            "puncta_count", "puncta_total_area", "puncta_density",
+        ]
+        if "mean_puncta_intensity" in df.columns:
+            col_order.append("mean_puncta_intensity")
+        col_order.append("puncta_ids")
+        df = df[[c for c in col_order if c in df.columns]]
+        df.to_csv(csv_path, index=False)
+        print(f"[INFO] Per-cell summary saved: {csv_path} ({len(df)} rows)")
 
     print(f"[DONE] Processed {total} images -> {out_dir}")
     return summaries
@@ -689,6 +880,8 @@ if __name__ == "__main__":
     parser.add_argument("--open-radius", type=int, default=0)
     parser.add_argument("--spot-radius", type=int, default=2,
                         help="Radius (px) for Spotiflow spot masks (default: 2)")
+    parser.add_argument("--cell-mask-dir", default=None,
+                        help="Directory of cell masks for per-cell quantification")
     parser.add_argument("--no-cellpose-npy", action="store_true")
     parser.add_argument("--no-triptychs", action="store_true")
     # Consensus
@@ -721,6 +914,7 @@ if __name__ == "__main__":
         max_size=args.max_size,
         open_radius=args.open_radius,
         spot_radius=args.spot_radius,
+        cell_mask_dir=args.cell_mask_dir,
         save_cellpose_npy=not args.no_cellpose_npy,
         save_triptychs=not args.no_triptychs,
         consensus_detectors=args.consensus_detectors,
