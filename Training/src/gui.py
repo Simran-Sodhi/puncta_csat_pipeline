@@ -7,15 +7,18 @@ Combines Training workflow and Analysis workflow in a single interface.
 Provides tabs for:
   -- Analysis Workflow --
   1. ND2 Conversion   — Convert ND2 files to OME-TIFF
-  2. Segmentation     — Run Cellpose (nucleus / puncta / cell / cytoplasm)
+  2. Deconvolution    — Pre-processing: Huygens (commercial) or CARE/CSBDeep
+                        (deep-learning) deconvolution for fluorescence images
+  3. Segmentation     — Run Cellpose (nucleus / puncta / cell / cytoplasm)
                         with model selection, channel & normalization controls
-  3. Analysis         — Per-cell intensity & puncta analysis
+  4. Puncta Segmentation — Multi-method puncta detection & segmentation
+  5. Analysis         — Per-cell intensity & puncta analysis
 
   -- Training Workflow --
-  4. File Renaming    — Rename images/masks to pipeline convention
-  5. Configuration    — Edit training parameters from YAML configs
-  6. Training         — Launch and monitor model training
-  7. Evaluation       — Run inference and view results
+  6. File Renaming    — Rename images/masks to pipeline convention
+  7. Configuration    — Edit training parameters from YAML configs
+  8. Training         — Launch and monitor model training
+  9. Evaluation       — Run inference and view results
 """
 
 import logging
@@ -119,6 +122,7 @@ class SegmentationGUI(tk.Tk):
 
         # -- Analysis workflow tabs --
         self.tab_nd2 = ttk.Frame(self.notebook)
+        self.tab_deconv = ttk.Frame(self.notebook)
         self.tab_segmentation = ttk.Frame(self.notebook)
         self.tab_puncta_seg = ttk.Frame(self.notebook)
         self.tab_analysis = ttk.Frame(self.notebook)
@@ -130,6 +134,7 @@ class SegmentationGUI(tk.Tk):
         self.tab_eval = ttk.Frame(self.notebook)
 
         self.notebook.add(self.tab_nd2, text="  ND2 Conversion  ")
+        self.notebook.add(self.tab_deconv, text="  Deconvolution  ")
         self.notebook.add(self.tab_segmentation, text="  Segmentation  ")
         self.notebook.add(self.tab_puncta_seg, text="  Puncta Segmentation  ")
         self.notebook.add(self.tab_analysis, text="  Analysis  ")
@@ -139,6 +144,7 @@ class SegmentationGUI(tk.Tk):
         self.notebook.add(self.tab_eval, text="  Evaluation  ")
 
         self._build_nd2_tab()
+        self._build_deconv_tab()
         self._build_segmentation_tab()
         self._build_puncta_seg_tab()
         self._build_analysis_tab()
@@ -277,6 +283,358 @@ class SegmentationGUI(tk.Tk):
         else:
             self.nd2_status.set("Conversion complete")
             self._nd2_log_append("[DONE] ND2 conversion complete.")
+
+    # ==================================================================
+    # TAB: DECONVOLUTION (pre-processing)
+    #   Two back-ends:
+    #   - Huygens (commercial, via HuCore CLI)
+    #   - CARE / CSBDeep (deep-learning, open-source)
+    # ==================================================================
+    def _build_deconv_tab(self):
+        tab = self.tab_deconv
+
+        info = ttk.Label(
+            tab,
+            text="Deconvolution pre-processing for fluorescence images.\n"
+                 "Huygens requires a local HuCore installation (commercial).  "
+                 "CARE/CSBDeep requires: pip install csbdeep tensorflow",
+            foreground="gray",
+        )
+        info.pack(anchor=tk.W, padx=10, pady=(10, 5))
+
+        # -- Input / Output --
+        io_frame = ttk.LabelFrame(tab, text="Input / Output", padding=10)
+        io_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(io_frame, text="Image directory:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.deconv_input_dir = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.deconv_input_dir, width=55).grid(
+            row=0, column=1, padx=5, pady=2)
+        ttk.Button(io_frame, text="Browse...", command=self._deconv_browse_input).grid(
+            row=0, column=2, pady=2)
+
+        ttk.Label(io_frame, text="Output directory:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.deconv_out_dir = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.deconv_out_dir, width=55).grid(
+            row=1, column=1, padx=5, pady=2)
+        ttk.Button(io_frame, text="Browse...", command=self._deconv_browse_output).grid(
+            row=1, column=2, pady=2)
+
+        # -- Channel / Z selection --
+        ch_frame = ttk.Frame(io_frame)
+        ch_frame.grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(5, 0))
+        ttk.Label(ch_frame, text="Channel index:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_channel = tk.IntVar(value=0)
+        ttk.Spinbox(ch_frame, from_=0, to=10, textvariable=self.deconv_channel, width=4).pack(
+            side=tk.LEFT, padx=(0, 15))
+        ttk.Label(ch_frame, text="Z-plane index:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_z_index = tk.IntVar(value=0)
+        ttk.Spinbox(ch_frame, from_=0, to=200, textvariable=self.deconv_z_index, width=4).pack(
+            side=tk.LEFT)
+
+        # -- Method selection --
+        method_frame = ttk.LabelFrame(tab, text="Method", padding=10)
+        method_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        self.deconv_method = tk.StringVar(value="huygens")
+        ttk.Radiobutton(method_frame, text="Huygens (HuCore CLI)",
+                         variable=self.deconv_method, value="huygens",
+                         command=self._deconv_on_method_change).pack(
+            side=tk.LEFT, padx=(0, 20))
+        ttk.Radiobutton(method_frame, text="CARE / CSBDeep (deep-learning)",
+                         variable=self.deconv_method, value="care",
+                         command=self._deconv_on_method_change).pack(
+            side=tk.LEFT)
+
+        # -- Huygens parameters --
+        self.deconv_huy_frame = ttk.LabelFrame(tab, text="Huygens Parameters", padding=10)
+        self.deconv_huy_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        huy_row0 = ttk.Frame(self.deconv_huy_frame)
+        huy_row0.pack(fill=tk.X, pady=2)
+        ttk.Label(huy_row0, text="HuCore path:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_hucore_path = tk.StringVar(value="hucore")
+        ttk.Entry(huy_row0, textvariable=self.deconv_hucore_path, width=30).pack(
+            side=tk.LEFT, padx=(0, 10))
+        ttk.Button(huy_row0, text="Browse...", command=self._deconv_browse_hucore).pack(
+            side=tk.LEFT, padx=(0, 20))
+        ttk.Label(huy_row0, text="Algorithm:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_huy_algorithm = tk.StringVar(value="cmle")
+        ttk.Combobox(huy_row0, textvariable=self.deconv_huy_algorithm,
+                      values=["cmle", "qmle", "gmle"], width=6,
+                      state="readonly").pack(side=tk.LEFT)
+
+        huy_row1 = ttk.Frame(self.deconv_huy_frame)
+        huy_row1.pack(fill=tk.X, pady=2)
+        ttk.Label(huy_row1, text="Iterations:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_huy_iterations = tk.IntVar(value=40)
+        ttk.Spinbox(huy_row1, from_=1, to=200,
+                      textvariable=self.deconv_huy_iterations, width=5).pack(
+            side=tk.LEFT, padx=(0, 15))
+        ttk.Label(huy_row1, text="SNR:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_huy_snr = tk.DoubleVar(value=20.0)
+        ttk.Entry(huy_row1, textvariable=self.deconv_huy_snr, width=6).pack(
+            side=tk.LEFT, padx=(0, 15))
+        ttk.Label(huy_row1, text="Quality threshold:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_huy_quality = tk.DoubleVar(value=0.05)
+        ttk.Entry(huy_row1, textvariable=self.deconv_huy_quality, width=6).pack(side=tk.LEFT)
+
+        huy_row2 = ttk.Frame(self.deconv_huy_frame)
+        huy_row2.pack(fill=tk.X, pady=2)
+        ttk.Label(huy_row2, text="Microscope type:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_huy_micro = tk.StringVar(value="widefield")
+        ttk.Combobox(huy_row2, textvariable=self.deconv_huy_micro,
+                      values=["widefield", "confocal", "spinning_disk", "multiphoton"],
+                      width=14, state="readonly").pack(side=tk.LEFT, padx=(0, 15))
+        ttk.Label(huy_row2, text="Background:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_huy_bg = tk.StringVar(value="auto")
+        ttk.Combobox(huy_row2, textvariable=self.deconv_huy_bg,
+                      values=["auto", "lowest", "manual"], width=8,
+                      state="readonly").pack(side=tk.LEFT)
+
+        huy_row3 = ttk.Frame(self.deconv_huy_frame)
+        huy_row3.pack(fill=tk.X, pady=2)
+        ttk.Label(huy_row3, text="Excitation (nm):").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_huy_ex = tk.DoubleVar(value=488.0)
+        ttk.Entry(huy_row3, textvariable=self.deconv_huy_ex, width=6).pack(
+            side=tk.LEFT, padx=(0, 10))
+        ttk.Label(huy_row3, text="Emission (nm):").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_huy_em = tk.DoubleVar(value=520.0)
+        ttk.Entry(huy_row3, textvariable=self.deconv_huy_em, width=6).pack(
+            side=tk.LEFT, padx=(0, 10))
+        ttk.Label(huy_row3, text="NA:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_huy_na = tk.DoubleVar(value=1.4)
+        ttk.Entry(huy_row3, textvariable=self.deconv_huy_na, width=5).pack(
+            side=tk.LEFT, padx=(0, 10))
+        ttk.Label(huy_row3, text="RI medium:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_huy_ri_medium = tk.DoubleVar(value=1.515)
+        ttk.Entry(huy_row3, textvariable=self.deconv_huy_ri_medium, width=6).pack(
+            side=tk.LEFT, padx=(0, 10))
+        ttk.Label(huy_row3, text="RI lens:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_huy_ri_lens = tk.DoubleVar(value=1.515)
+        ttk.Entry(huy_row3, textvariable=self.deconv_huy_ri_lens, width=6).pack(side=tk.LEFT)
+
+        # -- CARE / CSBDeep parameters --
+        self.deconv_care_frame = ttk.LabelFrame(tab, text="CARE / CSBDeep Parameters", padding=10)
+
+        care_row0 = ttk.Frame(self.deconv_care_frame)
+        care_row0.pack(fill=tk.X, pady=2)
+        ttk.Label(care_row0, text="Model directory:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_care_model_dir = tk.StringVar()
+        ttk.Entry(care_row0, textvariable=self.deconv_care_model_dir, width=40).pack(
+            side=tk.LEFT, padx=(0, 5))
+        ttk.Button(care_row0, text="Browse...", command=self._deconv_browse_care_model).pack(
+            side=tk.LEFT)
+
+        care_row1 = ttk.Frame(self.deconv_care_frame)
+        care_row1.pack(fill=tk.X, pady=2)
+        ttk.Label(care_row1, text="Model name:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_care_model_name = tk.StringVar(value="my_care_model")
+        ttk.Entry(care_row1, textvariable=self.deconv_care_model_name, width=25).pack(
+            side=tk.LEFT, padx=(0, 15))
+        ttk.Label(care_row1, text="Axes:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_care_axes = tk.StringVar(value="YX")
+        ttk.Combobox(care_row1, textvariable=self.deconv_care_axes,
+                      values=["YX", "ZYX", "CYX", "CZYX"], width=6).pack(
+            side=tk.LEFT, padx=(0, 15))
+        ttk.Label(care_row1, text="(subfolder name inside model directory)",
+                  foreground="gray").pack(side=tk.LEFT)
+
+        care_row2 = ttk.Frame(self.deconv_care_frame)
+        care_row2.pack(fill=tk.X, pady=2)
+        ttk.Label(care_row2, text="Tile Y:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_care_tile_y = tk.IntVar(value=1)
+        ttk.Spinbox(care_row2, from_=1, to=16,
+                      textvariable=self.deconv_care_tile_y, width=4).pack(
+            side=tk.LEFT, padx=(0, 10))
+        ttk.Label(care_row2, text="Tile X:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_care_tile_x = tk.IntVar(value=1)
+        ttk.Spinbox(care_row2, from_=1, to=16,
+                      textvariable=self.deconv_care_tile_x, width=4).pack(
+            side=tk.LEFT, padx=(0, 15))
+        self.deconv_care_normalise = tk.BooleanVar(value=True)
+        ttk.Checkbutton(care_row2, text="Percentile-normalise input",
+                         variable=self.deconv_care_normalise).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(care_row2, text="pmin:").pack(side=tk.LEFT, padx=(0, 3))
+        self.deconv_care_pmin = tk.DoubleVar(value=1.0)
+        ttk.Entry(care_row2, textvariable=self.deconv_care_pmin, width=5).pack(
+            side=tk.LEFT, padx=(0, 8))
+        ttk.Label(care_row2, text="pmax:").pack(side=tk.LEFT, padx=(0, 3))
+        self.deconv_care_pmax = tk.DoubleVar(value=99.8)
+        ttk.Entry(care_row2, textvariable=self.deconv_care_pmax, width=5).pack(side=tk.LEFT)
+
+        # -- Run / progress --
+        btn_frame = ttk.Frame(tab)
+        btn_frame.pack(fill=tk.X, padx=10, pady=10)
+        self.btn_deconv_run = ttk.Button(btn_frame, text="Run Deconvolution",
+                                          command=self._deconv_run)
+        self.btn_deconv_run.pack(side=tk.LEFT, padx=5)
+
+        self.deconv_progress = ttk.Progressbar(btn_frame, length=300, mode="determinate")
+        self.deconv_progress.pack(side=tk.LEFT, padx=10)
+
+        self.deconv_status = tk.StringVar(value="Ready")
+        ttk.Label(btn_frame, textvariable=self.deconv_status).pack(side=tk.LEFT, padx=5)
+
+        # -- Results table --
+        tree_frame = ttk.Frame(tab)
+        tree_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=(0, 5))
+        self.deconv_tree = ttk.Treeview(
+            tree_frame, columns=("file", "status", "message"), show="headings", height=6)
+        self.deconv_tree.heading("file", text="File")
+        self.deconv_tree.heading("status", text="Status")
+        self.deconv_tree.heading("message", text="Message")
+        self.deconv_tree.column("file", width=250)
+        self.deconv_tree.column("status", width=80)
+        self.deconv_tree.column("message", width=350)
+        self.deconv_tree.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+        sb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.deconv_tree.yview)
+        self.deconv_tree.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # -- Log --
+        log_frame = ttk.LabelFrame(tab, text="Log", padding=5)
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.deconv_log = scrolledtext.ScrolledText(
+            log_frame, wrap=tk.WORD, height=8, state=tk.DISABLED, font=("Courier", 9))
+        self.deconv_log.pack(fill=tk.BOTH, expand=True)
+
+        # Show the correct parameter panel
+        self._deconv_on_method_change()
+
+    # ---- Deconvolution helpers ----
+
+    def _deconv_on_method_change(self):
+        method = self.deconv_method.get()
+        if method == "huygens":
+            self.deconv_huy_frame.pack(fill=tk.X, padx=10, pady=5,
+                                        after=self.tab_deconv.winfo_children()[2])
+            self.deconv_care_frame.pack_forget()
+        else:
+            self.deconv_care_frame.pack(fill=tk.X, padx=10, pady=5,
+                                         after=self.tab_deconv.winfo_children()[2])
+            self.deconv_huy_frame.pack_forget()
+
+    def _deconv_browse_input(self):
+        d = filedialog.askdirectory(title="Select Image Directory")
+        if d:
+            self.deconv_input_dir.set(d)
+
+    def _deconv_browse_output(self):
+        d = filedialog.askdirectory(title="Select Output Directory")
+        if d:
+            self.deconv_out_dir.set(d)
+
+    def _deconv_browse_hucore(self):
+        path = filedialog.askopenfilename(
+            title="Select HuCore Executable",
+            filetypes=[("Executables", "*"), ("All files", "*.*")],
+        )
+        if path:
+            self.deconv_hucore_path.set(path)
+
+    def _deconv_browse_care_model(self):
+        d = filedialog.askdirectory(title="Select CARE Model Directory")
+        if d:
+            self.deconv_care_model_dir.set(d)
+
+    def _deconv_log_append(self, msg):
+        self.deconv_log.config(state=tk.NORMAL)
+        self.deconv_log.insert(tk.END, msg + "\n")
+        self.deconv_log.see(tk.END)
+        self.deconv_log.config(state=tk.DISABLED)
+
+    def _deconv_run(self):
+        img_dir = self.deconv_input_dir.get()
+        out_dir = self.deconv_out_dir.get()
+        if not img_dir or not out_dir:
+            messagebox.showwarning("Missing input",
+                                    "Select both image and output directories.")
+            return
+
+        method = self.deconv_method.get()
+        channel = self.deconv_channel.get()
+        z_idx = self.deconv_z_index.get()
+
+        self.btn_deconv_run.config(state=tk.DISABLED)
+        self.deconv_tree.delete(*self.deconv_tree.get_children())
+        self.deconv_progress.config(mode="determinate", value=0)
+        self.deconv_status.set(f"Running {method} deconvolution...")
+        self._deconv_log_append(f"Deconvolution: method={method}")
+
+        def task():
+            try:
+                from preprocessing.deconvolution import (
+                    deconvolve_huygens, deconvolve_care,
+                )
+
+                def _on_progress(idx, total, fname):
+                    pct = int(100 * idx / total)
+                    self.log_queue.put(f"__DECONV_PROGRESS__{pct}")
+                    self.log_queue.put(f"__DECONV_LOG__  [{idx}/{total}] {fname}")
+
+                if method == "huygens":
+                    results = deconvolve_huygens(
+                        image_dir=img_dir,
+                        out_dir=out_dir,
+                        hucore_path=self.deconv_hucore_path.get(),
+                        algorithm=self.deconv_huy_algorithm.get(),
+                        iterations=self.deconv_huy_iterations.get(),
+                        snr=self.deconv_huy_snr.get(),
+                        microscope_type=self.deconv_huy_micro.get(),
+                        wavelength_ex=self.deconv_huy_ex.get(),
+                        wavelength_em=self.deconv_huy_em.get(),
+                        na=self.deconv_huy_na.get(),
+                        refractive_index_medium=self.deconv_huy_ri_medium.get(),
+                        refractive_index_lens=self.deconv_huy_ri_lens.get(),
+                        background_mode=self.deconv_huy_bg.get(),
+                        quality_threshold=self.deconv_huy_quality.get(),
+                        channel_index=channel,
+                        z_index=z_idx,
+                        progress_callback=_on_progress,
+                    )
+                else:
+                    n_tiles = (self.deconv_care_tile_y.get(),
+                               self.deconv_care_tile_x.get())
+                    results = deconvolve_care(
+                        image_dir=img_dir,
+                        out_dir=out_dir,
+                        model_dir=self.deconv_care_model_dir.get(),
+                        model_name=self.deconv_care_model_name.get(),
+                        axes=self.deconv_care_axes.get(),
+                        n_tiles=n_tiles,
+                        channel_index=channel,
+                        z_index=z_idx,
+                        normalise_input=self.deconv_care_normalise.get(),
+                        norm_pmin=self.deconv_care_pmin.get(),
+                        norm_pmax=self.deconv_care_pmax.get(),
+                        progress_callback=_on_progress,
+                    )
+
+                # Send per-file results
+                for r in results:
+                    self.log_queue.put(
+                        f"__DECONV_RESULT__{r['file']}||{r['status']}||{r['message']}"
+                    )
+
+                self.log_queue.put("__DECONV_DONE__")
+            except Exception as exc:
+                import traceback
+                self.log_queue.put(
+                    f"__DECONV_ERROR__{exc}\n{traceback.format_exc()}"
+                )
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _on_deconv_finished(self, error=None):
+        self.btn_deconv_run.config(state=tk.NORMAL)
+        self.deconv_progress.config(value=100)
+        if error:
+            self.deconv_status.set(f"Error: {str(error)[:80]}")
+            self._deconv_log_append(f"[ERROR] {error}")
+        else:
+            self.deconv_status.set("Deconvolution complete")
+            self._deconv_log_append("[DONE] Deconvolution complete.")
 
     # ==================================================================
     # TAB: SEGMENTATION (unified: nucleus / puncta / cell / cytoplasm)
@@ -2721,6 +3079,28 @@ class SegmentationGUI(tk.Tk):
                 self._on_nd2_finished(error=msg[len("__ND2_ERROR__"):])
                 continue
 
+            # -- Deconvolution --
+            if msg == "__DECONV_DONE__":
+                self._on_deconv_finished()
+                continue
+            if msg.startswith("__DECONV_ERROR__"):
+                self._on_deconv_finished(error=msg[len("__DECONV_ERROR__"):])
+                continue
+            if msg.startswith("__DECONV_LOG__"):
+                self._deconv_log_append(msg[len("__DECONV_LOG__"):])
+                continue
+            if msg.startswith("__DECONV_PROGRESS__"):
+                pct = int(msg[len("__DECONV_PROGRESS__"):])
+                self.deconv_progress.config(value=pct)
+                self.deconv_status.set(f"Deconvolving... {pct}%")
+                continue
+            if msg.startswith("__DECONV_RESULT__"):
+                payload = msg[len("__DECONV_RESULT__"):]
+                fname, status, message = payload.split("||", 2)
+                self.deconv_tree.insert("", tk.END,
+                                         values=(fname, status, message[:80]))
+                continue
+
             # -- Segmentation --
             if msg == "__SEG_DONE__":
                 self._on_seg_finished()
@@ -2824,6 +3204,7 @@ class SegmentationGUI(tk.Tk):
             "Unified GUI for analysis and training workflows.\n\n"
             "Analysis Workflow:\n"
             "  - ND2 to OME-TIFF conversion\n"
+            "  - Deconvolution pre-processing (Huygens / CARE-CSBDeep)\n"
             "  - Cellpose segmentation (nucleus / puncta / cell / cytoplasm)\n"
             "    with model selection (cyto3 / cpsam / custom / BioImage.io)\n"
             "    and channel & normalization controls\n"
