@@ -415,7 +415,7 @@ def _richardson_lucy_tv(
     tv_lambda: float = 0.0,
     early_stop_delta: float = 0.0,
 ) -> np.ndarray:
-    """RL deconvolution with optional TV regularisation and early stopping.
+    """RL deconvolution with edge padding, optional TV and early stopping.
 
     Parameters
     ----------
@@ -432,13 +432,17 @@ def _richardson_lucy_tv(
     psf64 = psf.astype(np.float64)
     psf_mirror = psf64[::-1, ::-1]
 
-    estimate = img.copy()
+    # Pad image with reflected borders to reduce edge artifacts
+    pad_w = psf.shape[0]
+    img_padded = np.pad(img, pad_w, mode="reflect")
+
+    estimate = img_padded.copy()
     prev_estimate = estimate.copy()
 
     for i in range(iterations):
         reblurred = fftconvolve(estimate, psf64, mode="same")
         reblurred = np.clip(reblurred, 1e-12, None)
-        ratio = img / reblurred
+        ratio = img_padded / reblurred
         correction = fftconvolve(ratio, psf_mirror, mode="same")
 
         if tv_lambda > 0:
@@ -454,7 +458,9 @@ def _richardson_lucy_tv(
                 break
             prev_estimate = estimate.copy()
 
-    return estimate.astype(np.float32)
+    # Remove padding
+    result = estimate[pad_w:-pad_w, pad_w:-pad_w]
+    return result.astype(np.float32)
 
 
 def _tv_gradient(image: np.ndarray) -> np.ndarray:
@@ -486,9 +492,10 @@ def deconvolve_richardson_lucy(
     # RL parameters
     iterations: int = 30,
     tv_lambda: float = 0.0,
-    early_stop_delta: float = 0.001,
+    early_stop_delta: float = 0.0,
+    subtract_background: bool = True,
     # Pre-denoising
-    predenoise_enabled: bool = True,
+    predenoise_enabled: bool = False,
     predenoise_method: str = "nlm",
     predenoise_sigma: float = 0.0,
     # Image slicing
@@ -517,10 +524,15 @@ def deconvolve_richardson_lucy(
         TV-regularisation weight.  0 disables it.
     early_stop_delta : float
         Relative convergence threshold for early stopping.  0 = disabled.
+    subtract_background : bool
+        Automatically subtract camera / fluorescence background before
+        RL.  Greatly improves convergence and prevents RL from wasting
+        iterations trying to explain uniform background.
     predenoise_enabled : bool
-        Apply a denoising filter before RL to stabilise convergence.
+        Apply a denoising filter before RL.  Disabled by default — RL
+        works best on unsmoothed data with a correct PSF.
     predenoise_method : {"nlm", "bilateral", "gaussian", "median"}
-        Which denoiser to apply.  NLM is recommended for most data.
+        Which denoiser to apply.  NLM is recommended if enabled.
     predenoise_sigma : float
         Noise estimate or filter parameter.  0 = auto-estimate.
     progress_callback : callable, optional
@@ -560,8 +572,15 @@ def deconvolve_richardson_lucy(
 
         try:
             raw = tiff.imread(str(img_path))
+            orig_dtype = raw.dtype
             img2d = _extract_2d(raw, channel_index, z_index)
             img_in = img2d.astype(np.float32)
+
+            # Subtract background (critical for RL convergence)
+            bg_level = 0.0
+            if subtract_background:
+                bg_level = float(np.percentile(img_in, 1.0))
+                img_in = np.clip(img_in - bg_level, 0, None)
 
             # Optional pre-denoising
             if predenoise_enabled:
@@ -579,7 +598,14 @@ def deconvolve_richardson_lucy(
                 early_stop_delta=early_stop_delta,
             )
 
-            tiff.imwrite(str(out_path), restored.astype(np.float32))
+            # Add background back and convert to original bit depth
+            restored = restored + bg_level
+            if np.issubdtype(orig_dtype, np.integer):
+                info = np.iinfo(orig_dtype)
+                restored = np.clip(restored, info.min, info.max)
+                restored = restored.astype(orig_dtype)
+
+            tiff.imwrite(str(out_path), restored)
             results.append({"file": stem, "status": "OK", "message": ""})
 
         except Exception as exc:

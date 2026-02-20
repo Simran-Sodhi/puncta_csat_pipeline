@@ -366,7 +366,7 @@ class SegmentationGUI(tk.Tk):
 
         dn_row0 = ttk.Frame(self.deconv_denoise_frame)
         dn_row0.pack(fill=tk.X, pady=2)
-        self.deconv_denoise_enabled = tk.BooleanVar(value=True)
+        self.deconv_denoise_enabled = tk.BooleanVar(value=False)
         ttk.Checkbutton(dn_row0, text="Enable pre-denoising",
                          variable=self.deconv_denoise_enabled).pack(side=tk.LEFT, padx=(0, 20))
         ttk.Label(dn_row0, text="Method:").pack(side=tk.LEFT, padx=(0, 5))
@@ -478,19 +478,29 @@ class SegmentationGUI(tk.Tk):
                       textvariable=self.deconv_iterations, width=5).pack(
             side=tk.LEFT, padx=(0, 15))
         ttk.Label(rl_row, text="TV lambda:").pack(side=tk.LEFT, padx=(0, 5))
-        self.deconv_tv_lambda = tk.DoubleVar(value=0.002)
+        self.deconv_tv_lambda = tk.DoubleVar(value=0.0)
         ttk.Entry(rl_row, textvariable=self.deconv_tv_lambda, width=7).pack(
             side=tk.LEFT, padx=(0, 15))
         ttk.Label(rl_row, text="Early-stop delta:").pack(side=tk.LEFT, padx=(0, 5))
-        self.deconv_early_stop = tk.DoubleVar(value=0.001)
+        self.deconv_early_stop = tk.DoubleVar(value=0.0)
         ttk.Entry(rl_row, textvariable=self.deconv_early_stop, width=7).pack(
             side=tk.LEFT, padx=(0, 5))
         ttk.Label(rl_row, text="(0 = disabled)", foreground="gray").pack(side=tk.LEFT)
 
+        # Background subtraction
+        rl_row2 = ttk.Frame(self.deconv_rl_frame)
+        rl_row2.pack(fill=tk.X, pady=2)
+        self.deconv_subtract_bg = tk.BooleanVar(value=True)
+        ttk.Checkbutton(rl_row2, text="Subtract background before RL",
+                         variable=self.deconv_subtract_bg).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(rl_row2,
+                   text="(auto-detects and removes camera/fluorescence background)",
+                   foreground="gray").pack(side=tk.LEFT)
+
         rl_hint = ttk.Label(
             self.deconv_rl_frame,
-            text="10-50 iterations typical.  TV lambda 0.001-0.01 suppresses noise amplification.\n"
-                 "Early-stop halts when relative change per iteration < delta.",
+            text="10-50 iterations typical.  TV lambda 0.001-0.01 suppresses noise (0 = pure RL).\n"
+                 "Background subtraction greatly improves RL convergence.",
             foreground="gray",
         )
         rl_hint.pack(anchor=tk.W, pady=(2, 0))
@@ -668,9 +678,12 @@ class SegmentationGUI(tk.Tk):
         if meta.get("immersion_ri"):
             self.deconv_n_immersion.set(meta["immersion_ri"])
             populated.append(f"immersion RI={meta['immersion_ri']}")
+        # NOTE: Do NOT auto-fill magnification — OME-TIFF pixel sizes are
+        # already at the sample plane (PhysicalSizeX already accounts for
+        # magnification).  Setting magnification here would double-correct,
+        # making the PSF enormous.
         if meta.get("magnification"):
-            self.deconv_magnification.set(meta["magnification"])
-            populated.append(f"magnification={meta['magnification']}x")
+            self.deconv_magnification.set(0.0)  # keep at 0 (sample-plane px)
 
         if populated:
             summary = ", ".join(populated)
@@ -679,6 +692,8 @@ class SegmentationGUI(tk.Tk):
             extra = []
             if meta.get("excitation_nm"):
                 extra.append(f"excitation={meta['excitation_nm']} nm")
+            if meta.get("magnification"):
+                extra.append(f"magnification={meta['magnification']}x (pixel size already at sample plane)")
             if meta.get("objective_name"):
                 extra.append(f"objective={meta['objective_name']}")
             if meta.get("channel_name"):
@@ -745,6 +760,7 @@ class SegmentationGUI(tk.Tk):
                         iterations=self.deconv_iterations.get(),
                         tv_lambda=self.deconv_tv_lambda.get(),
                         early_stop_delta=self.deconv_early_stop.get(),
+                        subtract_background=self.deconv_subtract_bg.get(),
                         predenoise_enabled=self.deconv_denoise_enabled.get(),
                         predenoise_method=self.deconv_denoise_method.get(),
                         predenoise_sigma=self.deconv_denoise_sigma.get(),
