@@ -404,7 +404,9 @@ class SegmentationGUI(tk.Tk):
                          command=self._deconv_on_psf_change).pack(side=tk.LEFT, padx=(0, 15))
         ttk.Radiobutton(psf_row0, text="Measured PSF file",
                          variable=self.deconv_psf_type, value="measured",
-                         command=self._deconv_on_psf_change).pack(side=tk.LEFT)
+                         command=self._deconv_on_psf_change).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Button(psf_row0, text="Auto-detect from images",
+                    command=self._deconv_autodetect_metadata).pack(side=tk.LEFT)
 
         # Theoretical PSF parameters
         self.deconv_psf_theo_frame = ttk.Frame(self.deconv_rl_frame)
@@ -597,6 +599,64 @@ class SegmentationGUI(tk.Tk):
         )
         if path:
             self.deconv_psf_path.set(path)
+
+    def _deconv_autodetect_metadata(self):
+        """Read OME-TIFF metadata from the first image in the input dir
+        and populate emission wavelength, NA, pixel size fields."""
+        img_dir = self.deconv_input_dir.get()
+        if not img_dir:
+            messagebox.showwarning(
+                "No image directory",
+                "Set the image directory first, then click Auto-detect.")
+            return
+
+        try:
+            from preprocessing.deconvolution import collect_tiffs, read_ome_metadata
+        except ImportError as exc:
+            self._deconv_log_append(f"[ERROR] Import failed: {exc}")
+            return
+
+        paths = collect_tiffs(img_dir)
+        if not paths:
+            messagebox.showinfo("No images", "No TIFF files found in the directory.")
+            return
+
+        meta = read_ome_metadata(paths[0])
+        populated = []
+
+        if meta.get("emission_nm"):
+            self.deconv_wavelength_em.set(meta["emission_nm"])
+            populated.append(f"emission={meta['emission_nm']} nm")
+        if meta.get("na"):
+            self.deconv_na.set(meta["na"])
+            populated.append(f"NA={meta['na']}")
+        if meta.get("pixel_size_nm"):
+            self.deconv_pixel_size.set(round(meta["pixel_size_nm"], 2))
+            populated.append(f"pixel={meta['pixel_size_nm']:.1f} nm")
+        elif meta.get("pixel_size_um"):
+            nm = meta["pixel_size_um"] * 1000.0
+            self.deconv_pixel_size.set(round(nm, 2))
+            populated.append(f"pixel={nm:.1f} nm")
+
+        if populated:
+            summary = ", ".join(populated)
+            self._deconv_log_append(
+                f"[AUTO] From {paths[0].name}: {summary}")
+            extra = []
+            if meta.get("excitation_nm"):
+                extra.append(f"excitation={meta['excitation_nm']} nm")
+            if meta.get("immersion_ri"):
+                extra.append(f"immersion RI={meta['immersion_ri']}")
+            if meta.get("objective_name"):
+                extra.append(f"objective={meta['objective_name']}")
+            if meta.get("channel_name"):
+                extra.append(f"channel={meta['channel_name']}")
+            if extra:
+                self._deconv_log_append(f"       Also found: {', '.join(extra)}")
+        else:
+            self._deconv_log_append(
+                f"[AUTO] No optical metadata found in {paths[0].name}. "
+                "Ensure images were converted with ND2 Conversion tab.")
 
     def _deconv_browse_care_model(self):
         d = filedialog.askdirectory(title="Select CARE Model Directory")

@@ -84,13 +84,66 @@ def convert_nd2(input_path, output_dir, z_index=8, split_channels=False):
     if not ch_names:
         ch_names = [f"Ch{i}" for i in range(n_channels)]
 
-    # Get pixel sizes
-    px_x = px_y = None
+    # ------------------------------------------------------------------
+    # Extract optical metadata from ND2 for OME-TIFF propagation
+    # ------------------------------------------------------------------
+    px_x = px_y = px_z = None
+    obj_na = None
+    obj_mag = None
+    obj_name = None
+    immersion_ri = None
+    per_ch_ex = []   # excitation wavelength per channel (nm)
+    per_ch_em = []   # emission wavelength per channel (nm)
+    pinhole_um = None
+
     if f.metadata and f.metadata.channels:
         vol = f.metadata.channels[0].volume
         if vol:
-            px_x = vol.axesCalibration[0] if vol.axesCalibration else None
-            px_y = vol.axesCalibration[1] if len(vol.axesCalibration) > 1 else None
+            cal = getattr(vol, "axesCalibration", None)
+            if cal:
+                px_x = cal[0] if len(cal) > 0 else None
+                px_y = cal[1] if len(cal) > 1 else None
+                px_z = cal[2] if len(cal) > 2 else None
+            obj_na = getattr(vol, "objectiveNumericalAperture", None)
+            obj_mag = getattr(vol, "objectiveMagnification", None)
+            obj_name = getattr(vol, "objectiveName", None)
+            immersion_ri = getattr(vol, "immersionRefractiveIndex", None)
+
+        for ch_meta in f.metadata.channels:
+            ch_obj = getattr(ch_meta, "channel", None)
+            if ch_obj:
+                ex = getattr(ch_obj, "excitationWavelengthNm", None)
+                em = getattr(ch_obj, "emissionWavelengthNm", None)
+                per_ch_ex.append(float(ex) if ex else None)
+                per_ch_em.append(float(em) if em else None)
+                if pinhole_um is None:
+                    ph = getattr(ch_obj, "pinholeDiameterUm", None)
+                    if ph:
+                        pinhole_um = float(ph)
+            else:
+                per_ch_ex.append(None)
+                per_ch_em.append(None)
+
+    # Pad lists to match channel count
+    while len(per_ch_ex) < n_channels:
+        per_ch_ex.append(None)
+        per_ch_em.append(None)
+
+    # Print extracted metadata
+    if obj_na:
+        print(f"  Objective: NA={obj_na}"
+              f"{f', mag={obj_mag}x' if obj_mag else ''}"
+              f"{f', {obj_name}' if obj_name else ''}")
+    if immersion_ri:
+        print(f"  Immersion RI: {immersion_ri}")
+    if px_x:
+        print(f"  Pixel size: {px_x:.4f} x {px_y:.4f} um"
+              f"{f', Z-step={px_z:.4f} um' if px_z else ''}")
+    for ci, (ex, em) in enumerate(zip(per_ch_ex[:n_channels],
+                                       per_ch_em[:n_channels])):
+        if ex or em:
+            print(f"  Channel {ci} ({ch_names[ci]}): "
+                  f"ex={ex} nm, em={em} nm")
 
     # Create per-channel subdirectories if splitting
     ch_dirs = {}
@@ -155,7 +208,37 @@ def convert_nd2(input_path, output_dir, z_index=8, split_channels=False):
         else:
             scene_name = "single"
 
-        ch_meta = [{"Name": n} for n in ch_names[:C]]
+        # ---- Build OME metadata for multi-channel image ----
+        ch_ome_list = []
+        for ci in range(C):
+            ch_entry = {"Name": ch_names[ci] if ci < len(ch_names) else f"Ch{ci}"}
+            if ci < len(per_ch_ex) and per_ch_ex[ci]:
+                ch_entry["ExcitationWavelength"] = per_ch_ex[ci]
+                ch_entry["ExcitationWavelengthUnit"] = "nm"
+            if ci < len(per_ch_em) and per_ch_em[ci]:
+                ch_entry["EmissionWavelength"] = per_ch_em[ci]
+                ch_entry["EmissionWavelengthUnit"] = "nm"
+            if pinhole_um:
+                ch_entry["PinholeSize"] = pinhole_um
+                ch_entry["PinholeSizeUnit"] = "um"
+            ch_ome_list.append(ch_entry)
+
+        ome_meta = {
+            "axes": "CYX",
+            "Channel": ch_ome_list,
+            "PhysicalSizeX": float(px_x) if px_x else None,
+            "PhysicalSizeY": float(px_y) if px_y else None,
+            "PhysicalSizeXUnit": "micrometer",
+            "PhysicalSizeYUnit": "micrometer",
+        }
+        # Objective metadata (stored in OME Instrument/Objective)
+        if obj_na:
+            ome_meta["NominalMagnification"] = float(obj_mag) if obj_mag else None
+            ome_meta["LensNA"] = float(obj_na)
+        if immersion_ri:
+            ome_meta["ImmersionRefractiveIndex"] = float(immersion_ri)
+        if obj_name:
+            ome_meta["ObjectiveName"] = str(obj_name)
 
         # Save multi-channel OME-TIFF (always)
         out_path = out_dir / f"{inp.stem}_{scene_name}_Z{z_index:03d}.ome.tif"
@@ -167,35 +250,47 @@ def convert_nd2(input_path, output_dir, z_index=8, split_channels=False):
             photometric="minisblack",
             compression="deflate",
             bigtiff=True,
-            metadata={
-                "axes": "CYX",
-                "Channel": ch_meta,
-                "PhysicalSizeX": float(px_x) if px_x else None,
-                "PhysicalSizeY": float(px_y) if px_y else None,
-                "PhysicalSizeXUnit": "micrometer",
-                "PhysicalSizeYUnit": "micrometer",
-            },
+            metadata=ome_meta,
         )
 
-        # Save per-channel single-channel TIFFs
+        # Save per-channel single-channel OME-TIFFs with full metadata
         if split_channels:
             for ch_idx in range(C):
                 if ch_idx not in ch_dirs:
                     continue
                 ch_data = plane[ch_idx]  # (Y, X), original dtype/intensity
-                ch_out = ch_dirs[ch_idx] / f"{inp.stem}_{scene_name}_Z{z_index:03d}.tif"
+
+                # Build per-channel OME metadata
+                ch_single_meta = {
+                    "axes": "YX",
+                    "PhysicalSizeX": float(px_x) if px_x else None,
+                    "PhysicalSizeY": float(px_y) if px_y else None,
+                    "PhysicalSizeXUnit": "micrometer",
+                    "PhysicalSizeYUnit": "micrometer",
+                    "Channel": [ch_ome_list[ch_idx]],
+                }
+                if obj_na:
+                    ch_single_meta["LensNA"] = float(obj_na)
+                    ch_single_meta["NominalMagnification"] = (
+                        float(obj_mag) if obj_mag else None
+                    )
+                if immersion_ri:
+                    ch_single_meta["ImmersionRefractiveIndex"] = float(immersion_ri)
+                if obj_name:
+                    ch_single_meta["ObjectiveName"] = str(obj_name)
+
+                ch_out = (
+                    ch_dirs[ch_idx]
+                    / f"{inp.stem}_{scene_name}_Z{z_index:03d}.ome.tif"
+                )
                 tifffile.imwrite(
                     str(ch_out),
                     np.ascontiguousarray(ch_data),
+                    ome=True,
+                    imagej=False,
                     photometric="minisblack",
                     compression="deflate",
-                    metadata={
-                        "axes": "YX",
-                        "PhysicalSizeX": float(px_x) if px_x else None,
-                        "PhysicalSizeY": float(px_y) if px_y else None,
-                        "PhysicalSizeXUnit": "micrometer",
-                        "PhysicalSizeYUnit": "micrometer",
-                    },
+                    metadata=ch_single_meta,
                 )
 
         exported += 1
@@ -209,8 +304,8 @@ def convert_nd2(input_path, output_dir, z_index=8, split_channels=False):
 
     if split_channels:
         for ch_idx, ch_dir in ch_dirs.items():
-            n_files = len(list(ch_dir.glob("*.tif")))
-            print(f"  Channel '{ch_names[ch_idx]}' -> {ch_dir.name}/ ({n_files} files)")
+            n_files = len(list(ch_dir.glob("*.ome.tif")))
+            print(f"  Channel '{ch_names[ch_idx]}' -> {ch_dir.name}/ ({n_files} OME-TIFFs)")
 
     # Quick verification on first exported file
     first_files = sorted(out_dir.glob(f"{inp.stem}_*_Z{z_index:03d}.ome.tif"))

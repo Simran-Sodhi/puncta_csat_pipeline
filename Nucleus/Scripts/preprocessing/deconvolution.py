@@ -52,6 +52,170 @@ def collect_tiffs(directory: str | Path) -> list[Path]:
 
 
 # ------------------------------------------------------------------ #
+#  OME-TIFF metadata reader (for auto-populating optical parameters)
+# ------------------------------------------------------------------ #
+
+def read_ome_metadata(path: str | Path) -> dict:
+    """Read optical metadata from an OME-TIFF file.
+
+    Returns a dict with keys (any may be ``None`` if not present):
+        ``emission_nm``, ``excitation_nm``, ``na``, ``pixel_size_nm``,
+        ``pixel_size_um``, ``immersion_ri``, ``magnification``,
+        ``objective_name``, ``channel_name``, ``pinhole_um``.
+
+    The function inspects OME-XML first, then falls back to tifffile's
+    ``imagej_metadata`` / ``description`` fields.
+    """
+    import xml.etree.ElementTree as ET
+
+    result: dict = {
+        "emission_nm": None,
+        "excitation_nm": None,
+        "na": None,
+        "pixel_size_nm": None,
+        "pixel_size_um": None,
+        "immersion_ri": None,
+        "magnification": None,
+        "objective_name": None,
+        "channel_name": None,
+        "pinhole_um": None,
+    }
+
+    path = Path(path)
+    if not path.exists():
+        return result
+
+    with tiff.TiffFile(str(path)) as tf:
+        # --- Try OME-XML ---
+        if tf.ome_metadata:
+            _parse_ome_xml(tf.ome_metadata, result)
+
+        # --- Fallback: tifffile metadata dict (imagej / description) ---
+        if result["na"] is None:
+            _parse_tiff_metadata(tf, result)
+
+    # Derive pixel_size_nm from um if needed
+    if result["pixel_size_nm"] is None and result["pixel_size_um"] is not None:
+        result["pixel_size_nm"] = result["pixel_size_um"] * 1000.0
+    if result["pixel_size_um"] is None and result["pixel_size_nm"] is not None:
+        result["pixel_size_um"] = result["pixel_size_nm"] / 1000.0
+
+    return result
+
+
+def _parse_ome_xml(ome_xml: str, result: dict) -> None:
+    """Extract metadata from OME-XML string."""
+    import xml.etree.ElementTree as ET
+
+    ns = {"ome": "http://www.openmicroscopy.org/Schemas/OME/2016-06"}
+
+    try:
+        root = ET.fromstring(ome_xml)
+    except ET.ParseError:
+        return
+
+    # Try multiple namespace patterns
+    for ns_uri in [
+        "http://www.openmicroscopy.org/Schemas/OME/2016-06",
+        "",
+    ]:
+        ns_prefix = f"{{{ns_uri}}}" if ns_uri else ""
+
+        # Pixels element — physical sizes
+        for pixels in root.iter(f"{ns_prefix}Pixels"):
+            px = pixels.get("PhysicalSizeX")
+            if px:
+                try:
+                    unit = pixels.get("PhysicalSizeXUnit", "µm")
+                    val = float(px)
+                    if "nm" in unit.lower():
+                        result["pixel_size_nm"] = val
+                    else:
+                        result["pixel_size_um"] = val
+                except (ValueError, TypeError):
+                    pass
+
+        # Channel element — wavelengths, name
+        for channel in root.iter(f"{ns_prefix}Channel"):
+            if result["channel_name"] is None:
+                result["channel_name"] = channel.get("Name")
+            em = channel.get("EmissionWavelength")
+            if em and result["emission_nm"] is None:
+                try:
+                    result["emission_nm"] = float(em)
+                except (ValueError, TypeError):
+                    pass
+            ex = channel.get("ExcitationWavelength")
+            if ex and result["excitation_nm"] is None:
+                try:
+                    result["excitation_nm"] = float(ex)
+                except (ValueError, TypeError):
+                    pass
+            ph = channel.get("PinholeSize")
+            if ph and result["pinhole_um"] is None:
+                try:
+                    result["pinhole_um"] = float(ph)
+                except (ValueError, TypeError):
+                    pass
+
+        # Objective element — NA, magnification, name, RI
+        for obj in root.iter(f"{ns_prefix}Objective"):
+            na = obj.get("LensNA")
+            if na and result["na"] is None:
+                try:
+                    result["na"] = float(na)
+                except (ValueError, TypeError):
+                    pass
+            mag = obj.get("NominalMagnification")
+            if mag and result["magnification"] is None:
+                try:
+                    result["magnification"] = float(mag)
+                except (ValueError, TypeError):
+                    pass
+            if result["objective_name"] is None:
+                result["objective_name"] = obj.get("Model") or obj.get("ID")
+            ri = obj.get("ImmersionRefractiveIndex") or obj.get("RefractiveIndex")
+            if ri and result["immersion_ri"] is None:
+                try:
+                    result["immersion_ri"] = float(ri)
+                except (ValueError, TypeError):
+                    pass
+
+        # If we found something, don't try other namespace
+        if result["na"] is not None or result["emission_nm"] is not None:
+            break
+
+
+def _parse_tiff_metadata(tf, result: dict) -> None:
+    """Fallback: parse metadata from tifffile's imagej or description dict."""
+    # Try structured OME metadata dict (tifffile >= 2021)
+    for page in tf.pages[:1]:
+        desc = page.description
+        if not desc:
+            continue
+        # Look for key=value patterns in description
+        for line in desc.replace(";", "\n").split("\n"):
+            line = line.strip()
+            kv = line.split("=", 1)
+            if len(kv) != 2:
+                continue
+            k, v = kv[0].strip().lower(), kv[1].strip()
+            try:
+                if "lensna" in k or k == "na":
+                    result["na"] = result["na"] or float(v)
+                elif "emissionwavelength" in k:
+                    result["emission_nm"] = result["emission_nm"] or float(v)
+                elif "excitationwavelength" in k:
+                    result["excitation_nm"] = result["excitation_nm"] or float(v)
+                elif "physicalsizex" in k:
+                    result["pixel_size_um"] = result["pixel_size_um"] or float(v)
+                elif "immersionrefractiveindex" in k:
+                    result["immersion_ri"] = result["immersion_ri"] or float(v)
+            except (ValueError, TypeError):
+                continue
+
+
+# ------------------------------------------------------------------ #
 #  PSF generation
 # ------------------------------------------------------------------ #
 
