@@ -7,8 +7,8 @@ Combines Training workflow and Analysis workflow in a single interface.
 Provides tabs for:
   -- Analysis Workflow --
   1. ND2 Conversion   — Convert ND2 files to OME-TIFF
-  2. Deconvolution    — Pre-processing: Huygens (commercial) or CARE/CSBDeep
-                        (deep-learning) deconvolution for fluorescence images
+  2. Deconvolution    — Pre-processing: Richardson-Lucy (with PSF, TV
+                        regularisation, pre-denoising) or CARE/CSBDeep (DL)
   3. Segmentation     — Run Cellpose (nucleus / puncta / cell / cytoplasm)
                         with model selection, channel & normalization controls
   4. Puncta Segmentation — Multi-method puncta detection & segmentation
@@ -287,23 +287,37 @@ class SegmentationGUI(tk.Tk):
     # ==================================================================
     # TAB: DECONVOLUTION (pre-processing)
     #   Two back-ends:
-    #   - Huygens (commercial, via HuCore CLI)
+    #   - Richardson-Lucy (classical, with PSF + TV regularisation)
     #   - CARE / CSBDeep (deep-learning, open-source)
     # ==================================================================
     def _build_deconv_tab(self):
         tab = self.tab_deconv
 
+        # Scrollable canvas (many parameters)
+        canvas = tk.Canvas(tab, highlightthickness=0)
+        sb_canvas = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=canvas.yview)
+        self.deconv_body = ttk.Frame(canvas)
+        self.deconv_body.bind(
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=self.deconv_body, anchor=tk.NW)
+        canvas.configure(yscrollcommand=sb_canvas.set)
+        sb_canvas.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        body = self.deconv_body
+
         info = ttk.Label(
-            tab,
+            body,
             text="Deconvolution pre-processing for fluorescence images.\n"
-                 "Huygens requires a local HuCore installation (commercial).  "
-                 "CARE/CSBDeep requires: pip install csbdeep tensorflow",
+                 "Richardson-Lucy: classical iterative (no external deps).  "
+                 "CARE/CSBDeep: pip install csbdeep tensorflow",
             foreground="gray",
         )
         info.pack(anchor=tk.W, padx=10, pady=(10, 5))
 
         # -- Input / Output --
-        io_frame = ttk.LabelFrame(tab, text="Input / Output", padding=10)
+        io_frame = ttk.LabelFrame(body, text="Input / Output", padding=10)
         io_frame.pack(fill=tk.X, padx=10, pady=5)
 
         ttk.Label(io_frame, text="Image directory:").grid(row=0, column=0, sticky=tk.W, pady=2)
@@ -320,7 +334,6 @@ class SegmentationGUI(tk.Tk):
         ttk.Button(io_frame, text="Browse...", command=self._deconv_browse_output).grid(
             row=1, column=2, pady=2)
 
-        # -- Channel / Z selection --
         ch_frame = ttk.Frame(io_frame)
         ch_frame.grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(5, 0))
         ttk.Label(ch_frame, text="Channel index:").pack(side=tk.LEFT, padx=(0, 5))
@@ -333,12 +346,12 @@ class SegmentationGUI(tk.Tk):
             side=tk.LEFT)
 
         # -- Method selection --
-        method_frame = ttk.LabelFrame(tab, text="Method", padding=10)
+        method_frame = ttk.LabelFrame(body, text="Method", padding=10)
         method_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        self.deconv_method = tk.StringVar(value="huygens")
-        ttk.Radiobutton(method_frame, text="Huygens (HuCore CLI)",
-                         variable=self.deconv_method, value="huygens",
+        self.deconv_method = tk.StringVar(value="richardson_lucy")
+        ttk.Radiobutton(method_frame, text="Richardson-Lucy (recommended)",
+                         variable=self.deconv_method, value="richardson_lucy",
                          command=self._deconv_on_method_change).pack(
             side=tk.LEFT, padx=(0, 20))
         ttk.Radiobutton(method_frame, text="CARE / CSBDeep (deep-learning)",
@@ -346,76 +359,118 @@ class SegmentationGUI(tk.Tk):
                          command=self._deconv_on_method_change).pack(
             side=tk.LEFT)
 
-        # -- Huygens parameters --
-        self.deconv_huy_frame = ttk.LabelFrame(tab, text="Huygens Parameters", padding=10)
-        self.deconv_huy_frame.pack(fill=tk.X, padx=10, pady=5)
+        # -- Pre-denoising (shared, shown for RL) --
+        self.deconv_denoise_frame = ttk.LabelFrame(
+            body, text="Pre-denoising (stabilises RL on noisy data)", padding=10)
+        self.deconv_denoise_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        huy_row0 = ttk.Frame(self.deconv_huy_frame)
-        huy_row0.pack(fill=tk.X, pady=2)
-        ttk.Label(huy_row0, text="HuCore path:").pack(side=tk.LEFT, padx=(0, 5))
-        self.deconv_hucore_path = tk.StringVar(value="hucore")
-        ttk.Entry(huy_row0, textvariable=self.deconv_hucore_path, width=30).pack(
-            side=tk.LEFT, padx=(0, 10))
-        ttk.Button(huy_row0, text="Browse...", command=self._deconv_browse_hucore).pack(
-            side=tk.LEFT, padx=(0, 20))
-        ttk.Label(huy_row0, text="Algorithm:").pack(side=tk.LEFT, padx=(0, 5))
-        self.deconv_huy_algorithm = tk.StringVar(value="cmle")
-        ttk.Combobox(huy_row0, textvariable=self.deconv_huy_algorithm,
-                      values=["cmle", "qmle", "gmle"], width=6,
-                      state="readonly").pack(side=tk.LEFT)
+        dn_row0 = ttk.Frame(self.deconv_denoise_frame)
+        dn_row0.pack(fill=tk.X, pady=2)
+        self.deconv_denoise_enabled = tk.BooleanVar(value=True)
+        ttk.Checkbutton(dn_row0, text="Enable pre-denoising",
+                         variable=self.deconv_denoise_enabled).pack(side=tk.LEFT, padx=(0, 20))
+        ttk.Label(dn_row0, text="Method:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_denoise_method = tk.StringVar(value="nlm")
+        ttk.Combobox(dn_row0, textvariable=self.deconv_denoise_method,
+                      values=["nlm", "bilateral", "gaussian", "median"],
+                      width=10, state="readonly").pack(side=tk.LEFT, padx=(0, 15))
+        ttk.Label(dn_row0, text="Sigma / radius:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_denoise_sigma = tk.DoubleVar(value=0.0)
+        ttk.Entry(dn_row0, textvariable=self.deconv_denoise_sigma, width=6).pack(
+            side=tk.LEFT, padx=(0, 5))
+        ttk.Label(dn_row0, text="(0 = auto-estimate)", foreground="gray").pack(side=tk.LEFT)
 
-        huy_row1 = ttk.Frame(self.deconv_huy_frame)
-        huy_row1.pack(fill=tk.X, pady=2)
-        ttk.Label(huy_row1, text="Iterations:").pack(side=tk.LEFT, padx=(0, 5))
-        self.deconv_huy_iterations = tk.IntVar(value=40)
-        ttk.Spinbox(huy_row1, from_=1, to=200,
-                      textvariable=self.deconv_huy_iterations, width=5).pack(
+        dn_hint = ttk.Label(
+            self.deconv_denoise_frame,
+            text="NLM (non-local means): best SNR preservation, recommended for most data.\n"
+                 "Bilateral: edge-preserving, fast.  Gaussian: fast blur.  "
+                 "Median: salt-and-pepper noise.",
+            foreground="gray",
+        )
+        dn_hint.pack(anchor=tk.W, pady=(2, 0))
+
+        # -- Richardson-Lucy parameters --
+        self.deconv_rl_frame = ttk.LabelFrame(
+            body, text="Richardson-Lucy Parameters", padding=10)
+        self.deconv_rl_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        # PSF source
+        psf_row0 = ttk.Frame(self.deconv_rl_frame)
+        psf_row0.pack(fill=tk.X, pady=2)
+        ttk.Label(psf_row0, text="PSF:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_psf_type = tk.StringVar(value="theoretical")
+        ttk.Radiobutton(psf_row0, text="Theoretical (Gaussian)",
+                         variable=self.deconv_psf_type, value="theoretical",
+                         command=self._deconv_on_psf_change).pack(side=tk.LEFT, padx=(0, 15))
+        ttk.Radiobutton(psf_row0, text="Measured PSF file",
+                         variable=self.deconv_psf_type, value="measured",
+                         command=self._deconv_on_psf_change).pack(side=tk.LEFT)
+
+        # Theoretical PSF parameters
+        self.deconv_psf_theo_frame = ttk.Frame(self.deconv_rl_frame)
+        self.deconv_psf_theo_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(self.deconv_psf_theo_frame, text="Emission (nm):").pack(
+            side=tk.LEFT, padx=(0, 5))
+        self.deconv_wavelength_em = tk.DoubleVar(value=520.0)
+        ttk.Entry(self.deconv_psf_theo_frame,
+                   textvariable=self.deconv_wavelength_em, width=6).pack(
+            side=tk.LEFT, padx=(0, 12))
+        ttk.Label(self.deconv_psf_theo_frame, text="NA:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_na = tk.DoubleVar(value=1.4)
+        ttk.Entry(self.deconv_psf_theo_frame, textvariable=self.deconv_na, width=5).pack(
+            side=tk.LEFT, padx=(0, 12))
+        ttk.Label(self.deconv_psf_theo_frame, text="Pixel size (nm):").pack(
+            side=tk.LEFT, padx=(0, 5))
+        self.deconv_pixel_size = tk.DoubleVar(value=65.0)
+        ttk.Entry(self.deconv_psf_theo_frame,
+                   textvariable=self.deconv_pixel_size, width=6).pack(
+            side=tk.LEFT, padx=(0, 12))
+        ttk.Label(self.deconv_psf_theo_frame, text="PSF size (px, 0=auto):").pack(
+            side=tk.LEFT, padx=(0, 5))
+        self.deconv_psf_size = tk.IntVar(value=0)
+        ttk.Spinbox(self.deconv_psf_theo_frame, from_=0, to=101,
+                      textvariable=self.deconv_psf_size, width=4).pack(side=tk.LEFT)
+
+        # Measured PSF path
+        self.deconv_psf_meas_frame = ttk.Frame(self.deconv_rl_frame)
+        ttk.Label(self.deconv_psf_meas_frame, text="PSF file:").pack(
+            side=tk.LEFT, padx=(0, 5))
+        self.deconv_psf_path = tk.StringVar()
+        ttk.Entry(self.deconv_psf_meas_frame,
+                   textvariable=self.deconv_psf_path, width=45).pack(
+            side=tk.LEFT, padx=(0, 5))
+        ttk.Button(self.deconv_psf_meas_frame, text="Browse...",
+                    command=self._deconv_browse_psf).pack(side=tk.LEFT)
+
+        # RL iteration parameters
+        rl_row = ttk.Frame(self.deconv_rl_frame)
+        rl_row.pack(fill=tk.X, pady=2)
+        ttk.Label(rl_row, text="Iterations:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_iterations = tk.IntVar(value=30)
+        ttk.Spinbox(rl_row, from_=1, to=200,
+                      textvariable=self.deconv_iterations, width=5).pack(
             side=tk.LEFT, padx=(0, 15))
-        ttk.Label(huy_row1, text="SNR:").pack(side=tk.LEFT, padx=(0, 5))
-        self.deconv_huy_snr = tk.DoubleVar(value=20.0)
-        ttk.Entry(huy_row1, textvariable=self.deconv_huy_snr, width=6).pack(
+        ttk.Label(rl_row, text="TV lambda:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_tv_lambda = tk.DoubleVar(value=0.002)
+        ttk.Entry(rl_row, textvariable=self.deconv_tv_lambda, width=7).pack(
             side=tk.LEFT, padx=(0, 15))
-        ttk.Label(huy_row1, text="Quality threshold:").pack(side=tk.LEFT, padx=(0, 5))
-        self.deconv_huy_quality = tk.DoubleVar(value=0.05)
-        ttk.Entry(huy_row1, textvariable=self.deconv_huy_quality, width=6).pack(side=tk.LEFT)
+        ttk.Label(rl_row, text="Early-stop delta:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_early_stop = tk.DoubleVar(value=0.001)
+        ttk.Entry(rl_row, textvariable=self.deconv_early_stop, width=7).pack(
+            side=tk.LEFT, padx=(0, 5))
+        ttk.Label(rl_row, text="(0 = disabled)", foreground="gray").pack(side=tk.LEFT)
 
-        huy_row2 = ttk.Frame(self.deconv_huy_frame)
-        huy_row2.pack(fill=tk.X, pady=2)
-        ttk.Label(huy_row2, text="Microscope type:").pack(side=tk.LEFT, padx=(0, 5))
-        self.deconv_huy_micro = tk.StringVar(value="widefield")
-        ttk.Combobox(huy_row2, textvariable=self.deconv_huy_micro,
-                      values=["widefield", "confocal", "spinning_disk", "multiphoton"],
-                      width=14, state="readonly").pack(side=tk.LEFT, padx=(0, 15))
-        ttk.Label(huy_row2, text="Background:").pack(side=tk.LEFT, padx=(0, 5))
-        self.deconv_huy_bg = tk.StringVar(value="auto")
-        ttk.Combobox(huy_row2, textvariable=self.deconv_huy_bg,
-                      values=["auto", "lowest", "manual"], width=8,
-                      state="readonly").pack(side=tk.LEFT)
-
-        huy_row3 = ttk.Frame(self.deconv_huy_frame)
-        huy_row3.pack(fill=tk.X, pady=2)
-        ttk.Label(huy_row3, text="Excitation (nm):").pack(side=tk.LEFT, padx=(0, 5))
-        self.deconv_huy_ex = tk.DoubleVar(value=488.0)
-        ttk.Entry(huy_row3, textvariable=self.deconv_huy_ex, width=6).pack(
-            side=tk.LEFT, padx=(0, 10))
-        ttk.Label(huy_row3, text="Emission (nm):").pack(side=tk.LEFT, padx=(0, 5))
-        self.deconv_huy_em = tk.DoubleVar(value=520.0)
-        ttk.Entry(huy_row3, textvariable=self.deconv_huy_em, width=6).pack(
-            side=tk.LEFT, padx=(0, 10))
-        ttk.Label(huy_row3, text="NA:").pack(side=tk.LEFT, padx=(0, 5))
-        self.deconv_huy_na = tk.DoubleVar(value=1.4)
-        ttk.Entry(huy_row3, textvariable=self.deconv_huy_na, width=5).pack(
-            side=tk.LEFT, padx=(0, 10))
-        ttk.Label(huy_row3, text="RI medium:").pack(side=tk.LEFT, padx=(0, 5))
-        self.deconv_huy_ri_medium = tk.DoubleVar(value=1.515)
-        ttk.Entry(huy_row3, textvariable=self.deconv_huy_ri_medium, width=6).pack(
-            side=tk.LEFT, padx=(0, 10))
-        ttk.Label(huy_row3, text="RI lens:").pack(side=tk.LEFT, padx=(0, 5))
-        self.deconv_huy_ri_lens = tk.DoubleVar(value=1.515)
-        ttk.Entry(huy_row3, textvariable=self.deconv_huy_ri_lens, width=6).pack(side=tk.LEFT)
+        rl_hint = ttk.Label(
+            self.deconv_rl_frame,
+            text="10-50 iterations typical.  TV lambda 0.001-0.01 suppresses noise amplification.\n"
+                 "Early-stop halts when relative change per iteration < delta.",
+            foreground="gray",
+        )
+        rl_hint.pack(anchor=tk.W, pady=(2, 0))
 
         # -- CARE / CSBDeep parameters --
-        self.deconv_care_frame = ttk.LabelFrame(tab, text="CARE / CSBDeep Parameters", padding=10)
+        self.deconv_care_frame = ttk.LabelFrame(
+            body, text="CARE / CSBDeep Parameters", padding=10)
 
         care_row0 = ttk.Frame(self.deconv_care_frame)
         care_row0.pack(fill=tk.X, pady=2)
@@ -464,7 +519,7 @@ class SegmentationGUI(tk.Tk):
         ttk.Entry(care_row2, textvariable=self.deconv_care_pmax, width=5).pack(side=tk.LEFT)
 
         # -- Run / progress --
-        btn_frame = ttk.Frame(tab)
+        btn_frame = ttk.Frame(body)
         btn_frame.pack(fill=tk.X, padx=10, pady=10)
         self.btn_deconv_run = ttk.Button(btn_frame, text="Run Deconvolution",
                                           command=self._deconv_run)
@@ -477,7 +532,7 @@ class SegmentationGUI(tk.Tk):
         ttk.Label(btn_frame, textvariable=self.deconv_status).pack(side=tk.LEFT, padx=5)
 
         # -- Results table --
-        tree_frame = ttk.Frame(tab)
+        tree_frame = ttk.Frame(body)
         tree_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=(0, 5))
         self.deconv_tree = ttk.Treeview(
             tree_frame, columns=("file", "status", "message"), show="headings", height=6)
@@ -493,7 +548,7 @@ class SegmentationGUI(tk.Tk):
         sb.pack(side=tk.RIGHT, fill=tk.Y)
 
         # -- Log --
-        log_frame = ttk.LabelFrame(tab, text="Log", padding=5)
+        log_frame = ttk.LabelFrame(body, text="Log", padding=5)
         log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         self.deconv_log = scrolledtext.ScrolledText(
             log_frame, wrap=tk.WORD, height=8, state=tk.DISABLED, font=("Courier", 9))
@@ -501,19 +556,29 @@ class SegmentationGUI(tk.Tk):
 
         # Show the correct parameter panel
         self._deconv_on_method_change()
+        self._deconv_on_psf_change()
 
     # ---- Deconvolution helpers ----
 
     def _deconv_on_method_change(self):
         method = self.deconv_method.get()
-        if method == "huygens":
-            self.deconv_huy_frame.pack(fill=tk.X, padx=10, pady=5,
-                                        after=self.tab_deconv.winfo_children()[2])
+        if method == "richardson_lucy":
+            self.deconv_denoise_frame.pack(fill=tk.X, padx=10, pady=5,
+                                            before=self.deconv_rl_frame)
+            self.deconv_rl_frame.pack(fill=tk.X, padx=10, pady=5)
             self.deconv_care_frame.pack_forget()
         else:
-            self.deconv_care_frame.pack(fill=tk.X, padx=10, pady=5,
-                                         after=self.tab_deconv.winfo_children()[2])
-            self.deconv_huy_frame.pack_forget()
+            self.deconv_denoise_frame.pack_forget()
+            self.deconv_rl_frame.pack_forget()
+            self.deconv_care_frame.pack(fill=tk.X, padx=10, pady=5)
+
+    def _deconv_on_psf_change(self):
+        if self.deconv_psf_type.get() == "theoretical":
+            self.deconv_psf_theo_frame.pack(fill=tk.X, pady=2)
+            self.deconv_psf_meas_frame.pack_forget()
+        else:
+            self.deconv_psf_meas_frame.pack(fill=tk.X, pady=2)
+            self.deconv_psf_theo_frame.pack_forget()
 
     def _deconv_browse_input(self):
         d = filedialog.askdirectory(title="Select Image Directory")
@@ -525,13 +590,13 @@ class SegmentationGUI(tk.Tk):
         if d:
             self.deconv_out_dir.set(d)
 
-    def _deconv_browse_hucore(self):
+    def _deconv_browse_psf(self):
         path = filedialog.askopenfilename(
-            title="Select HuCore Executable",
-            filetypes=[("Executables", "*"), ("All files", "*.*")],
+            title="Select Measured PSF File",
+            filetypes=[("TIFF files", "*.tif *.tiff"), ("All files", "*.*")],
         )
         if path:
-            self.deconv_hucore_path.set(path)
+            self.deconv_psf_path.set(path)
 
     def _deconv_browse_care_model(self):
         d = filedialog.askdirectory(title="Select CARE Model Directory")
@@ -565,7 +630,7 @@ class SegmentationGUI(tk.Tk):
         def task():
             try:
                 from preprocessing.deconvolution import (
-                    deconvolve_huygens, deconvolve_care,
+                    deconvolve_richardson_lucy, deconvolve_care,
                 )
 
                 def _on_progress(idx, total, fname):
@@ -573,22 +638,22 @@ class SegmentationGUI(tk.Tk):
                     self.log_queue.put(f"__DECONV_PROGRESS__{pct}")
                     self.log_queue.put(f"__DECONV_LOG__  [{idx}/{total}] {fname}")
 
-                if method == "huygens":
-                    results = deconvolve_huygens(
+                if method == "richardson_lucy":
+                    results = deconvolve_richardson_lucy(
                         image_dir=img_dir,
                         out_dir=out_dir,
-                        hucore_path=self.deconv_hucore_path.get(),
-                        algorithm=self.deconv_huy_algorithm.get(),
-                        iterations=self.deconv_huy_iterations.get(),
-                        snr=self.deconv_huy_snr.get(),
-                        microscope_type=self.deconv_huy_micro.get(),
-                        wavelength_ex=self.deconv_huy_ex.get(),
-                        wavelength_em=self.deconv_huy_em.get(),
-                        na=self.deconv_huy_na.get(),
-                        refractive_index_medium=self.deconv_huy_ri_medium.get(),
-                        refractive_index_lens=self.deconv_huy_ri_lens.get(),
-                        background_mode=self.deconv_huy_bg.get(),
-                        quality_threshold=self.deconv_huy_quality.get(),
+                        psf_type=self.deconv_psf_type.get(),
+                        psf_path=self.deconv_psf_path.get(),
+                        wavelength_em=self.deconv_wavelength_em.get(),
+                        na=self.deconv_na.get(),
+                        pixel_size_nm=self.deconv_pixel_size.get(),
+                        psf_size=self.deconv_psf_size.get(),
+                        iterations=self.deconv_iterations.get(),
+                        tv_lambda=self.deconv_tv_lambda.get(),
+                        early_stop_delta=self.deconv_early_stop.get(),
+                        predenoise_enabled=self.deconv_denoise_enabled.get(),
+                        predenoise_method=self.deconv_denoise_method.get(),
+                        predenoise_sigma=self.deconv_denoise_sigma.get(),
                         channel_index=channel,
                         z_index=z_idx,
                         progress_callback=_on_progress,
@@ -611,7 +676,6 @@ class SegmentationGUI(tk.Tk):
                         progress_callback=_on_progress,
                     )
 
-                # Send per-file results
                 for r in results:
                     self.log_queue.put(
                         f"__DECONV_RESULT__{r['file']}||{r['status']}||{r['message']}"
@@ -3204,7 +3268,7 @@ class SegmentationGUI(tk.Tk):
             "Unified GUI for analysis and training workflows.\n\n"
             "Analysis Workflow:\n"
             "  - ND2 to OME-TIFF conversion\n"
-            "  - Deconvolution pre-processing (Huygens / CARE-CSBDeep)\n"
+            "  - Deconvolution pre-processing (Richardson-Lucy / CARE-CSBDeep)\n"
             "  - Cellpose segmentation (nucleus / puncta / cell / cytoplasm)\n"
             "    with model selection (cyto3 / cpsam / custom / BioImage.io)\n"
             "    and channel & normalization controls\n"

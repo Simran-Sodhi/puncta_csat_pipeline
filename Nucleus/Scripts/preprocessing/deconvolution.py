@@ -4,15 +4,15 @@ deconvolution.py — Deconvolution pre-processing for fluorescence microscopy.
 
 Two back-ends:
 
-1. **Huygens** (Commercial — requires a local HuCore installation)
-   Generates a Tcl batch script and runs ``hucore`` on each image.
-   Supports Classic Maximum Likelihood Estimation (CMLE) and
-   Quick Maximum Likelihood Estimation (QMLE).
+1. **Richardson-Lucy** (classical, open-source, no external dependencies)
+   Iterative RL deconvolution with a theoretical or measured PSF.
+   Supports early-stopping and Total-Variation (TV) regularisation.
+   Optional pre-denoising step for noisy data (NLM, bilateral,
+   Gaussian, or median) to stabilise convergence.
 
 2. **CARE / CSBDeep** (Deep-learning — open-source, ``pip install csbdeep``)
    Applies a pre-trained CARE model for content-aware image restoration /
-   deconvolution.  Users can supply their own model directory or use
-   one of the bundled model names recognised by CSBDeep.
+   deconvolution.
 
 Both back-ends accept a directory of TIFF images, process each one, and
 write the results into an output directory, calling an optional
@@ -21,10 +21,6 @@ write the results into an output directory, calling an optional
 
 from __future__ import annotations
 
-import os
-import shutil
-import subprocess
-import tempfile
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -45,7 +41,6 @@ def collect_tiffs(directory: str | Path) -> list[Path]:
     paths: list[Path] = []
     for g in _TIFF_GLOBS:
         paths.extend(d.glob(g))
-    # deduplicate (case-insensitive systems) then sort
     seen: set[str] = set()
     unique: list[Path] = []
     for p in sorted(paths):
@@ -57,93 +52,238 @@ def collect_tiffs(directory: str | Path) -> list[Path]:
 
 
 # ------------------------------------------------------------------ #
-#  1.  Huygens deconvolution  (via HuCore CLI)
+#  PSF generation
 # ------------------------------------------------------------------ #
 
-def _build_huygens_tcl(
-    input_path: str,
-    output_path: str,
-    *,
-    algorithm: str = "cmle",
-    iterations: int = 40,
-    snr: float = 20.0,
-    microscope_type: str = "widefield",
-    wavelength_ex: float = 488.0,
+def generate_gaussian_psf(
     wavelength_em: float = 520.0,
     na: float = 1.4,
-    refractive_index_medium: float = 1.515,
-    refractive_index_lens: float = 1.515,
-    background_mode: str = "auto",
-    quality_threshold: float = 0.05,
-    brick_mode: str = "auto",
-) -> str:
-    """Return a HuCore Tcl batch script as a string."""
-    alg_map = {"cmle": "cmle", "qmle": "qmle", "gmle": "gmle"}
-    alg = alg_map.get(algorithm.lower(), "cmle")
+    pixel_size_nm: float = 65.0,
+    psf_size: int = 0,
+) -> np.ndarray:
+    """Generate a 2-D Gaussian approximation of the PSF.
 
-    micro_map = {
-        "widefield": "widefield",
-        "confocal": "confocal",
-        "spinning_disk": "nipkow",
-        "multiphoton": "multiphoton",
-    }
-    micro = micro_map.get(microscope_type.lower(), "widefield")
+    The Gaussian sigma is derived from the Rayleigh criterion:
+        sigma_nm ≈ 0.21 * wavelength_em / NA
+    which is then converted to pixels.
 
-    bg_map = {"auto": "auto", "lowest": "lowest", "manual": "manual"}
-    bg = bg_map.get(background_mode.lower(), "auto")
+    Parameters
+    ----------
+    wavelength_em : float
+        Emission wavelength in nm.
+    na : float
+        Numerical aperture.
+    pixel_size_nm : float
+        Pixel size in nm.
+    psf_size : int
+        Kernel diameter in pixels.  0 = auto (6*sigma, forced odd).
+    """
+    sigma_nm = 0.21 * wavelength_em / na
+    sigma_px = sigma_nm / pixel_size_nm
 
-    tcl = f"""\
-# Auto-generated HuCore batch script
-set img [img open "{input_path}"]
-
-$img setp -micr {micro}
-$img setp -ex {wavelength_ex}
-$img setp -em {wavelength_em}
-$img setp -na {na}
-$img setp -ri {refractive_index_medium}
-$img setp -ril {refractive_index_lens}
-
-set result [$img decon -{alg} \\
-    -it {iterations} \\
-    -snr {snr} \\
-    -bgMode {bg} \\
-    -q {quality_threshold} \\
-    -brMode {brick_mode}]
-
-$result save "{output_path}" -type tiff
-$img del
-$result del
-"""
-    return tcl
+    if psf_size <= 0:
+        psf_size = max(3, int(np.ceil(6 * sigma_px)) | 1)  # force odd
+    half = psf_size // 2
+    y, x = np.mgrid[-half:half + 1, -half:half + 1].astype(np.float64)
+    psf = np.exp(-(x ** 2 + y ** 2) / (2 * sigma_px ** 2))
+    psf /= psf.sum()
+    return psf.astype(np.float32)
 
 
-def deconvolve_huygens(
+def load_measured_psf(path: str | Path) -> np.ndarray:
+    """Load a measured PSF from a TIFF file and normalise to sum=1."""
+    psf = tiff.imread(str(path)).astype(np.float32)
+    if psf.ndim == 3:
+        # Take the middle Z-plane of a 3-D PSF
+        psf = psf[psf.shape[0] // 2]
+    psf = np.clip(psf, 0, None)
+    total = psf.sum()
+    if total > 0:
+        psf /= total
+    return psf
+
+
+# ------------------------------------------------------------------ #
+#  Pre-denoising  (run before RL to stabilise noisy inputs)
+# ------------------------------------------------------------------ #
+
+def predenoise(
+    image: np.ndarray,
+    method: str = "nlm",
+    sigma_est: float = 0.0,
+    **kwargs,
+) -> np.ndarray:
+    """Denoise *image* prior to deconvolution.
+
+    Parameters
+    ----------
+    method : {"nlm", "bilateral", "gaussian", "median"}
+        * **nlm** — Non-local means (best SNR preservation; recommended).
+        * **bilateral** — Edge-preserving bilateral filter.
+        * **gaussian** — Gaussian blur (fast but blurs edges).
+        * **median** — Median filter (good for salt-and-pepper noise).
+    sigma_est : float
+        Estimated noise standard deviation.
+        - For *nlm*: used as ``sigma`` if > 0; otherwise auto-estimated.
+        - For *gaussian*: used as Gaussian sigma in pixels.
+        - For *bilateral*: used as ``sigma_spatial``.
+        - For *median*: disk radius (rounded to int, min 1).
+    """
+    from skimage import restoration, filters, morphology
+
+    img = image.astype(np.float32)
+
+    if method == "nlm":
+        if sigma_est <= 0:
+            sigma_est = _estimate_sigma(img)
+        # patch_size and patch_distance are standard defaults for 2-D
+        return restoration.denoise_nl_means(
+            img,
+            h=1.15 * sigma_est,
+            patch_size=5,
+            patch_distance=6,
+            fast_mode=True,
+        ).astype(np.float32)
+
+    if method == "bilateral":
+        from skimage.restoration import denoise_bilateral
+        sigma_sp = max(1.0, sigma_est) if sigma_est > 0 else 1.0
+        return denoise_bilateral(
+            img,
+            sigma_color=None,  # auto
+            sigma_spatial=sigma_sp,
+        ).astype(np.float32)
+
+    if method == "gaussian":
+        sigma = max(0.5, sigma_est) if sigma_est > 0 else 0.7
+        return filters.gaussian(img, sigma=sigma).astype(np.float32)
+
+    if method == "median":
+        r = max(1, int(round(sigma_est))) if sigma_est > 0 else 1
+        se = morphology.disk(r)
+        return filters.median(img, se).astype(np.float32)
+
+    raise ValueError(f"Unknown pre-denoise method: {method!r}")
+
+
+def _estimate_sigma(image: np.ndarray) -> float:
+    """Robust noise estimate (MAD of Laplacian)."""
+    from scipy.ndimage import laplace
+    lap = laplace(image.astype(np.float64))
+    mad = np.median(np.abs(lap - np.median(lap)))
+    return float(mad * 1.4826 / np.sqrt(20))
+
+
+# ------------------------------------------------------------------ #
+#  Richardson-Lucy deconvolution
+# ------------------------------------------------------------------ #
+
+def _richardson_lucy_tv(
+    image: np.ndarray,
+    psf: np.ndarray,
+    iterations: int = 30,
+    tv_lambda: float = 0.0,
+    early_stop_delta: float = 0.0,
+) -> np.ndarray:
+    """RL deconvolution with optional TV regularisation and early stopping.
+
+    Parameters
+    ----------
+    tv_lambda : float
+        Strength of Total-Variation regularisation.  0 = disabled.
+        Values around 0.001–0.01 are typical.
+    early_stop_delta : float
+        If the relative change between iterations drops below this
+        threshold the loop terminates.  0 = run all iterations.
+    """
+    from scipy.signal import fftconvolve
+
+    img = np.clip(image.astype(np.float64), 1e-12, None)
+    psf64 = psf.astype(np.float64)
+    psf_mirror = psf64[::-1, ::-1]
+
+    estimate = img.copy()
+    prev_estimate = estimate.copy()
+
+    for i in range(iterations):
+        reblurred = fftconvolve(estimate, psf64, mode="same")
+        reblurred = np.clip(reblurred, 1e-12, None)
+        ratio = img / reblurred
+        correction = fftconvolve(ratio, psf_mirror, mode="same")
+
+        if tv_lambda > 0:
+            tv_grad = _tv_gradient(estimate)
+            correction = correction / (1.0 + tv_lambda * tv_grad)
+
+        estimate *= correction
+        estimate = np.clip(estimate, 0, None)
+
+        if early_stop_delta > 0:
+            delta = np.mean(np.abs(estimate - prev_estimate)) / (np.mean(estimate) + 1e-12)
+            if delta < early_stop_delta:
+                break
+            prev_estimate = estimate.copy()
+
+    return estimate.astype(np.float32)
+
+
+def _tv_gradient(image: np.ndarray) -> np.ndarray:
+    """Gradient magnitude for isotropic TV regularisation."""
+    gy = np.zeros_like(image)
+    gx = np.zeros_like(image)
+    gy[:-1, :] = np.diff(image, axis=0)
+    gx[:, :-1] = np.diff(image, axis=1)
+    return np.sqrt(gy ** 2 + gx ** 2 + 1e-12)
+
+
+# ------------------------------------------------------------------ #
+#  1.  Batch Richardson-Lucy deconvolution
+# ------------------------------------------------------------------ #
+
+def deconvolve_richardson_lucy(
     image_dir: str | Path,
     out_dir: str | Path,
     *,
-    hucore_path: str = "hucore",
-    algorithm: str = "cmle",
-    iterations: int = 40,
-    snr: float = 20.0,
-    microscope_type: str = "widefield",
-    wavelength_ex: float = 488.0,
+    # PSF parameters
+    psf_type: str = "theoretical",
+    psf_path: str = "",
     wavelength_em: float = 520.0,
     na: float = 1.4,
-    refractive_index_medium: float = 1.515,
-    refractive_index_lens: float = 1.515,
-    background_mode: str = "auto",
-    quality_threshold: float = 0.05,
+    pixel_size_nm: float = 65.0,
+    psf_size: int = 0,
+    # RL parameters
+    iterations: int = 30,
+    tv_lambda: float = 0.0,
+    early_stop_delta: float = 0.001,
+    # Pre-denoising
+    predenoise_enabled: bool = True,
+    predenoise_method: str = "nlm",
+    predenoise_sigma: float = 0.0,
+    # Image slicing
     channel_index: int = 0,
     z_index: int = 0,
     progress_callback: Optional[Callable] = None,
 ) -> list[dict]:
-    """Run Huygens deconvolution on every TIFF in *image_dir*.
+    """Run Richardson-Lucy deconvolution on every TIFF in *image_dir*.
 
     Parameters
     ----------
-    hucore_path : str
-        Path to the ``hucore`` executable.  If it is on ``$PATH`` the
-        bare name ``"hucore"`` suffices.
+    psf_type : {"theoretical", "measured"}
+        Use a Gaussian PSF approximation or load a measured PSF file.
+    psf_path : str
+        Path to a measured PSF TIFF (only when ``psf_type="measured"``).
+    iterations : int
+        Number of RL iterations (10–50 recommended).
+    tv_lambda : float
+        TV-regularisation weight.  0 disables it.
+    early_stop_delta : float
+        Relative convergence threshold for early stopping.  0 = disabled.
+    predenoise_enabled : bool
+        Apply a denoising filter before RL to stabilise convergence.
+    predenoise_method : {"nlm", "bilateral", "gaussian", "median"}
+        Which denoiser to apply.  NLM is recommended for most data.
+    predenoise_sigma : float
+        Noise estimate or filter parameter.  0 = auto-estimate.
     progress_callback : callable, optional
         ``callback(index, total, filename)`` called after each image.
 
@@ -156,13 +296,17 @@ def deconvolve_huygens(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Verify hucore is available
-    resolved = shutil.which(hucore_path)
-    if resolved is None:
-        raise FileNotFoundError(
-            f"HuCore executable not found: {hucore_path!r}\n"
-            "Install Huygens Professional / HuCore and ensure it is on your PATH,\n"
-            "or provide the full path via the 'HuCore path' setting."
+    # Build / load PSF once
+    if psf_type == "measured":
+        if not psf_path:
+            raise ValueError("psf_path must be set when psf_type='measured'")
+        psf = load_measured_psf(psf_path)
+    else:
+        psf = generate_gaussian_psf(
+            wavelength_em=wavelength_em,
+            na=na,
+            pixel_size_nm=pixel_size_nm,
+            psf_size=psf_size,
         )
 
     paths = collect_tiffs(image_dir)
@@ -173,61 +317,32 @@ def deconvolve_huygens(
         stem = img_path.stem
         out_path = out_dir / f"{stem}_decon.tif"
 
-        tcl = _build_huygens_tcl(
-            str(img_path),
-            str(out_path),
-            algorithm=algorithm,
-            iterations=iterations,
-            snr=snr,
-            microscope_type=microscope_type,
-            wavelength_ex=wavelength_ex,
-            wavelength_em=wavelength_em,
-            na=na,
-            refractive_index_medium=refractive_index_medium,
-            refractive_index_lens=refractive_index_lens,
-            background_mode=background_mode,
-            quality_threshold=quality_threshold,
-        )
-
-        # Write Tcl script to a temp file and invoke hucore
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".tcl", delete=False
-            ) as fp:
-                fp.write(tcl)
-                tcl_path = fp.name
+            raw = tiff.imread(str(img_path))
+            img2d = _extract_2d(raw, channel_index, z_index)
+            img_in = img2d.astype(np.float32)
 
-            proc = subprocess.run(
-                [resolved, "-noExecLog", "-script", tcl_path],
-                capture_output=True,
-                text=True,
-                timeout=1800,  # 30 min per image
+            # Optional pre-denoising
+            if predenoise_enabled:
+                img_in = predenoise(
+                    img_in,
+                    method=predenoise_method,
+                    sigma_est=predenoise_sigma,
+                )
+
+            # Richardson-Lucy
+            restored = _richardson_lucy_tv(
+                img_in, psf,
+                iterations=iterations,
+                tv_lambda=tv_lambda,
+                early_stop_delta=early_stop_delta,
             )
 
-            if proc.returncode != 0:
-                results.append({
-                    "file": stem, "status": "FAILED",
-                    "message": proc.stderr[:500] or proc.stdout[:500],
-                })
-            else:
-                results.append({
-                    "file": stem, "status": "OK", "message": "",
-                })
+            tiff.imwrite(str(out_path), restored.astype(np.float32))
+            results.append({"file": stem, "status": "OK", "message": ""})
 
-        except subprocess.TimeoutExpired:
-            results.append({
-                "file": stem, "status": "FAILED",
-                "message": "Timeout (>30 min)",
-            })
         except Exception as exc:
-            results.append({
-                "file": stem, "status": "FAILED", "message": str(exc),
-            })
-        finally:
-            try:
-                os.unlink(tcl_path)
-            except OSError:
-                pass
+            results.append({"file": stem, "status": "FAILED", "message": str(exc)})
 
         if progress_callback is not None:
             progress_callback(idx, total, img_path.name)
@@ -278,7 +393,6 @@ def deconvolve_care(
     """
     try:
         from csbdeep.models import CARE
-        from csbdeep.io import normalize as csb_normalize
     except ImportError:
         raise ImportError(
             "CSBDeep / CARE is not installed.\n"
@@ -314,17 +428,11 @@ def deconvolve_care(
             restored = model.predict(img_in, axes, n_tiles=n_tiles)
             restored = np.clip(restored, 0, None)
 
-            # Save as 32-bit float TIFF
             tiff.imwrite(str(out_path), restored.astype(np.float32))
-
-            results.append({
-                "file": stem, "status": "OK", "message": "",
-            })
+            results.append({"file": stem, "status": "OK", "message": ""})
 
         except Exception as exc:
-            results.append({
-                "file": stem, "status": "FAILED", "message": str(exc),
-            })
+            results.append({"file": stem, "status": "FAILED", "message": str(exc)})
 
         if progress_callback is not None:
             progress_callback(idx, total, img_path.name)
@@ -345,19 +453,15 @@ def _extract_2d(
     if data.ndim == 2:
         return data
     if data.ndim == 3:
-        # (C, Y, X) or (Z, Y, X)
         if data.shape[0] <= 6:
             return data[channel_index]
         return data[z_index]
     if data.ndim == 4:
-        # (Z, C, Y, X) or (C, Z, Y, X)
         if data.shape[1] <= 6:
             return data[z_index, channel_index]
         return data[channel_index, z_index]
     if data.ndim == 5:
-        # (T, Z, C, Y, X) — take first time-point
         return data[0, z_index, channel_index]
-    # Fallback: squeeze and hope for the best
     squeezed = np.squeeze(data)
     if squeezed.ndim == 2:
         return squeezed
