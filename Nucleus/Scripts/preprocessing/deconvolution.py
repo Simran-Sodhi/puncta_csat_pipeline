@@ -219,17 +219,26 @@ def _parse_tiff_metadata(tf, result: dict) -> None:
 #  PSF generation
 # ------------------------------------------------------------------ #
 
-def generate_gaussian_psf(
+def generate_widefield_psf(
     wavelength_em: float = 520.0,
     na: float = 1.4,
     pixel_size_nm: float = 65.0,
+    n_immersion: float = 1.515,
+    magnification: float = 0.0,
     psf_size: int = 0,
 ) -> np.ndarray:
-    """Generate a 2-D Gaussian approximation of the PSF.
+    """Generate a 2-D widefield PSF using the scalar diffraction Airy model.
 
-    The Gaussian sigma is derived from the Rayleigh criterion:
-        sigma_nm ≈ 0.21 * wavelength_em / NA
-    which is then converted to pixels.
+    Uses the Born & Wolf scalar diffraction formula for a widefield
+    fluorescence microscope.  The PSF is the squared Airy pattern:
+
+        PSF(r) = [ 2 * J1(v) / v ]²
+
+    where ``v = 2 * pi * NA * r / wavelength_em`` and *r* is the radial
+    distance in the sample plane (nm).
+
+    This is the same physical model used by commercial software (e.g.
+    NIS Elements "Widefield" modality).
 
     Parameters
     ----------
@@ -238,15 +247,72 @@ def generate_gaussian_psf(
     na : float
         Numerical aperture.
     pixel_size_nm : float
-        Pixel size in nm.
+        Pixel size in nm.  If *magnification* > 0 this is treated as the
+        **camera** pixel size and divided by magnification to get the
+        sample-plane pixel size.  Otherwise it is used directly as the
+        sample-plane pixel size.
+    n_immersion : float
+        Refractive index of the immersion medium (oil ≈ 1.515,
+        water ≈ 1.33, air ≈ 1.0).  NA is clamped to this value
+        (physical limit).
+    magnification : float
+        Objective magnification (e.g. 60, 100).  When > 0, pixel_size_nm
+        is divided by this value.  Set to 0 to use pixel_size_nm as-is
+        (i.e. already at the sample plane).
     psf_size : int
-        Kernel diameter in pixels.  0 = auto (6*sigma, forced odd).
+        Kernel diameter in pixels.  0 = auto (covers ~4 Airy rings).
+    """
+    from scipy.special import j1
+
+    # Clamp NA to the physical limit imposed by the immersion medium
+    if na > n_immersion:
+        na = n_immersion
+
+    # Sample-plane pixel size
+    sample_px_nm = pixel_size_nm
+    if magnification > 0:
+        sample_px_nm = pixel_size_nm / magnification
+
+    # Airy radius (first zero of J1) = 0.61 * lambda / NA
+    airy_radius_nm = 0.61 * wavelength_em / na
+    airy_radius_px = airy_radius_nm / sample_px_nm
+
+    if psf_size <= 0:
+        # Cover ~4 Airy rings for accurate deconvolution
+        psf_size = max(5, int(np.ceil(8 * airy_radius_px)) | 1)
+    half = psf_size // 2
+    y, x = np.mgrid[-half:half + 1, -half:half + 1].astype(np.float64)
+
+    # Radial distance in nm at the sample plane
+    r_nm = np.sqrt(x ** 2 + y ** 2) * sample_px_nm
+
+    # Normalised radial coordinate: v = 2*pi*NA*r / lambda
+    v = 2.0 * np.pi * na * r_nm / wavelength_em
+
+    # Airy pattern: [2*J1(v)/v]^2   (value at v=0 is 1 by L'Hôpital)
+    psf = np.ones_like(v)
+    mask = v > 0
+    psf[mask] = (2.0 * j1(v[mask]) / v[mask]) ** 2
+
+    psf /= psf.sum()
+    return psf.astype(np.float32)
+
+
+def generate_gaussian_psf(
+    wavelength_em: float = 520.0,
+    na: float = 1.4,
+    pixel_size_nm: float = 65.0,
+    psf_size: int = 0,
+) -> np.ndarray:
+    """Generate a 2-D Gaussian approximation of the PSF (legacy).
+
+    Kept for backward compatibility.  Prefer :func:`generate_widefield_psf`.
     """
     sigma_nm = 0.21 * wavelength_em / na
     sigma_px = sigma_nm / pixel_size_nm
 
     if psf_size <= 0:
-        psf_size = max(3, int(np.ceil(6 * sigma_px)) | 1)  # force odd
+        psf_size = max(3, int(np.ceil(6 * sigma_px)) | 1)
     half = psf_size // 2
     y, x = np.mgrid[-half:half + 1, -half:half + 1].astype(np.float64)
     psf = np.exp(-(x ** 2 + y ** 2) / (2 * sigma_px ** 2))
@@ -414,6 +480,8 @@ def deconvolve_richardson_lucy(
     wavelength_em: float = 520.0,
     na: float = 1.4,
     pixel_size_nm: float = 65.0,
+    n_immersion: float = 1.515,
+    magnification: float = 0.0,
     psf_size: int = 0,
     # RL parameters
     iterations: int = 30,
@@ -433,9 +501,16 @@ def deconvolve_richardson_lucy(
     Parameters
     ----------
     psf_type : {"theoretical", "measured"}
-        Use a Gaussian PSF approximation or load a measured PSF file.
+        Use a widefield Airy PSF or load a measured PSF file.
     psf_path : str
         Path to a measured PSF TIFF (only when ``psf_type="measured"``).
+    n_immersion : float
+        Refractive index of the immersion medium (oil ≈ 1.515,
+        water ≈ 1.33, air ≈ 1.0).
+    magnification : float
+        Objective magnification.  When > 0, *pixel_size_nm* is treated as
+        camera pixel size and divided by magnification.  0 = pixel_size_nm
+        is already the sample-plane pixel size.
     iterations : int
         Number of RL iterations (10–50 recommended).
     tv_lambda : float
@@ -466,10 +541,12 @@ def deconvolve_richardson_lucy(
             raise ValueError("psf_path must be set when psf_type='measured'")
         psf = load_measured_psf(psf_path)
     else:
-        psf = generate_gaussian_psf(
+        psf = generate_widefield_psf(
             wavelength_em=wavelength_em,
             na=na,
             pixel_size_nm=pixel_size_nm,
+            n_immersion=n_immersion,
+            magnification=magnification,
             psf_size=psf_size,
         )
 

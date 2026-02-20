@@ -399,7 +399,7 @@ class SegmentationGUI(tk.Tk):
         psf_row0.pack(fill=tk.X, pady=2)
         ttk.Label(psf_row0, text="PSF:").pack(side=tk.LEFT, padx=(0, 5))
         self.deconv_psf_type = tk.StringVar(value="theoretical")
-        ttk.Radiobutton(psf_row0, text="Theoretical (Gaussian)",
+        ttk.Radiobutton(psf_row0, text="Theoretical (Widefield)",
                          variable=self.deconv_psf_type, value="theoretical",
                          command=self._deconv_on_psf_change).pack(side=tk.LEFT, padx=(0, 15))
         ttk.Radiobutton(psf_row0, text="Measured PSF file",
@@ -408,7 +408,7 @@ class SegmentationGUI(tk.Tk):
         ttk.Button(psf_row0, text="Auto-detect from images",
                     command=self._deconv_autodetect_metadata).pack(side=tk.LEFT)
 
-        # Theoretical PSF parameters
+        # Theoretical PSF parameters — row 1: optical params
         self.deconv_psf_theo_frame = ttk.Frame(self.deconv_rl_frame)
         self.deconv_psf_theo_frame.pack(fill=tk.X, pady=2)
         ttk.Label(self.deconv_psf_theo_frame, text="Emission (nm):").pack(
@@ -432,6 +432,31 @@ class SegmentationGUI(tk.Tk):
         self.deconv_psf_size = tk.IntVar(value=0)
         ttk.Spinbox(self.deconv_psf_theo_frame, from_=0, to=101,
                       textvariable=self.deconv_psf_size, width=4).pack(side=tk.LEFT)
+
+        # Theoretical PSF parameters — row 2: immersion RI & magnification
+        self.deconv_psf_theo_frame2 = ttk.Frame(self.deconv_rl_frame)
+        self.deconv_psf_theo_frame2.pack(fill=tk.X, pady=2)
+        ttk.Label(self.deconv_psf_theo_frame2, text="Immersion RI:").pack(
+            side=tk.LEFT, padx=(0, 5))
+        self.deconv_n_immersion = tk.DoubleVar(value=1.515)
+        imm_combo = ttk.Combobox(
+            self.deconv_psf_theo_frame2,
+            textvariable=self.deconv_n_immersion, width=6,
+            values=["1.515", "1.33", "1.0"],
+        )
+        imm_combo.pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(self.deconv_psf_theo_frame2,
+                   text="(oil=1.515, water=1.33, air=1.0)",
+                   foreground="gray").pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(self.deconv_psf_theo_frame2, text="Magnification:").pack(
+            side=tk.LEFT, padx=(0, 5))
+        self.deconv_magnification = tk.DoubleVar(value=0.0)
+        ttk.Entry(self.deconv_psf_theo_frame2,
+                   textvariable=self.deconv_magnification, width=6).pack(
+            side=tk.LEFT, padx=(0, 5))
+        ttk.Label(self.deconv_psf_theo_frame2,
+                   text="(0 = pixel size is already at sample plane)",
+                   foreground="gray").pack(side=tk.LEFT)
 
         # Measured PSF path
         self.deconv_psf_meas_frame = ttk.Frame(self.deconv_rl_frame)
@@ -577,10 +602,12 @@ class SegmentationGUI(tk.Tk):
     def _deconv_on_psf_change(self):
         if self.deconv_psf_type.get() == "theoretical":
             self.deconv_psf_theo_frame.pack(fill=tk.X, pady=2)
+            self.deconv_psf_theo_frame2.pack(fill=tk.X, pady=2)
             self.deconv_psf_meas_frame.pack_forget()
         else:
             self.deconv_psf_meas_frame.pack(fill=tk.X, pady=2)
             self.deconv_psf_theo_frame.pack_forget()
+            self.deconv_psf_theo_frame2.pack_forget()
 
     def _deconv_browse_input(self):
         d = filedialog.askdirectory(title="Select Image Directory")
@@ -638,6 +665,13 @@ class SegmentationGUI(tk.Tk):
             self.deconv_pixel_size.set(round(nm, 2))
             populated.append(f"pixel={nm:.1f} nm")
 
+        if meta.get("immersion_ri"):
+            self.deconv_n_immersion.set(meta["immersion_ri"])
+            populated.append(f"immersion RI={meta['immersion_ri']}")
+        if meta.get("magnification"):
+            self.deconv_magnification.set(meta["magnification"])
+            populated.append(f"magnification={meta['magnification']}x")
+
         if populated:
             summary = ", ".join(populated)
             self._deconv_log_append(
@@ -645,8 +679,6 @@ class SegmentationGUI(tk.Tk):
             extra = []
             if meta.get("excitation_nm"):
                 extra.append(f"excitation={meta['excitation_nm']} nm")
-            if meta.get("immersion_ri"):
-                extra.append(f"immersion RI={meta['immersion_ri']}")
             if meta.get("objective_name"):
                 extra.append(f"objective={meta['objective_name']}")
             if meta.get("channel_name"):
@@ -707,6 +739,8 @@ class SegmentationGUI(tk.Tk):
                         wavelength_em=self.deconv_wavelength_em.get(),
                         na=self.deconv_na.get(),
                         pixel_size_nm=self.deconv_pixel_size.get(),
+                        n_immersion=self.deconv_n_immersion.get(),
+                        magnification=self.deconv_magnification.get(),
                         psf_size=self.deconv_psf_size.get(),
                         iterations=self.deconv_iterations.get(),
                         tv_lambda=self.deconv_tv_lambda.get(),
