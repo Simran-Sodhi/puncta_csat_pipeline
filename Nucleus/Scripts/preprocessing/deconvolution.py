@@ -298,6 +298,120 @@ def generate_widefield_psf(
     return psf.astype(np.float32)
 
 
+def generate_confocal_psf(
+    wavelength_em: float = 520.0,
+    wavelength_ex: float = 488.0,
+    na: float = 1.4,
+    pixel_size_nm: float = 65.0,
+    n_immersion: float = 1.515,
+    magnification: float = 0.0,
+    pinhole_um: float = 50.0,
+    psf_size: int = 0,
+) -> np.ndarray:
+    """Generate a 2-D spinning-disc confocal PSF.
+
+    The confocal PSF is modelled as:
+
+        PSF_conf(r) = PSF_ex(r) * [ PSF_det(r) ⊗ D(r) ]
+
+    where *PSF_ex* is the excitation Airy pattern (at ``wavelength_ex``),
+    *PSF_det* is the detection Airy pattern (at ``wavelength_em``), *D* is
+    the pinhole disk function projected to the sample plane, and ⊗ denotes
+    convolution.
+
+    * Small pinhole (< 0.5 AU): approaches true confocal
+      ``PSF ≈ PSF_ex * PSF_det`` — tightest resolution.
+    * Large pinhole (>> 1 AU): ``PSF_det ⊗ D`` → constant, so
+      ``PSF_conf → PSF_ex`` — approaches widefield excitation PSF.
+
+    This matches the model used by NIS Elements "Spinning Disc" modality.
+
+    Parameters
+    ----------
+    wavelength_em : float
+        Emission wavelength in nm.
+    wavelength_ex : float
+        Excitation wavelength in nm.
+    na : float
+        Numerical aperture.
+    pixel_size_nm : float
+        Pixel size in nm (sample-plane, or camera pixel if
+        *magnification* > 0).
+    n_immersion : float
+        Refractive index of immersion medium.
+    magnification : float
+        Objective magnification.  When > 0, *pixel_size_nm* is divided
+        by this value.  0 = already at sample plane.
+    pinhole_um : float
+        Physical pinhole diameter in µm.  Typical spinning-disc values:
+        25–70 µm (Yokogawa CSU: 25 or 50 µm).
+    psf_size : int
+        Kernel diameter in pixels.  0 = auto.
+    """
+    from scipy.special import j1
+    from scipy.signal import fftconvolve
+
+    if na > n_immersion:
+        na = n_immersion
+
+    # Sample-plane pixel size — pixel_size_nm is always treated as
+    # sample-plane (OME-TIFF PhysicalSizeX already accounts for
+    # magnification).  The magnification parameter is used ONLY for
+    # projecting the physical pinhole to the sample plane.
+    sample_px_nm = pixel_size_nm
+
+    # Determine kernel size from emission Airy radius
+    airy_radius_nm = 0.61 * wavelength_em / na
+    airy_radius_px = airy_radius_nm / sample_px_nm
+
+    if psf_size <= 0:
+        psf_size = max(5, int(np.ceil(8 * airy_radius_px)) | 1)
+    half = psf_size // 2
+    y, x = np.mgrid[-half:half + 1, -half:half + 1].astype(np.float64)
+    r_nm = np.sqrt(x ** 2 + y ** 2) * sample_px_nm
+
+    # --- Excitation Airy PSF ---
+    v_ex = 2.0 * np.pi * na * r_nm / wavelength_ex
+    psf_ex = np.ones_like(v_ex)
+    m = v_ex > 0
+    psf_ex[m] = (2.0 * j1(v_ex[m]) / v_ex[m]) ** 2
+
+    # --- Detection Airy PSF ---
+    v_det = 2.0 * np.pi * na * r_nm / wavelength_em
+    psf_det = np.ones_like(v_det)
+    m = v_det > 0
+    psf_det[m] = (2.0 * j1(v_det[m]) / v_det[m]) ** 2
+
+    # --- Pinhole disk function (projected to sample plane) ---
+    # Magnification is needed to project the physical pinhole diameter
+    # from the disc to the sample plane.  If magnification = 0
+    # (auto-detect leaves it at 0), estimate from NA / pixel_size.
+    mag_eff = magnification if magnification > 0 else (na / 0.014)
+    pinhole_nm = pinhole_um * 1000.0 / mag_eff  # project to sample
+    pinhole_radius_px = (pinhole_nm / 2.0) / sample_px_nm
+
+    # Build circular disk
+    disk = np.zeros_like(r_nm)
+    r_px = np.sqrt(x ** 2 + y ** 2)
+    disk[r_px <= pinhole_radius_px] = 1.0
+    # Ensure at least the centre pixel is set
+    if disk.sum() == 0:
+        disk[half, half] = 1.0
+    disk /= disk.sum()
+
+    # --- Confocal PSF = PSF_ex * (PSF_det ⊗ Disk) ---
+    det_conv_disk = fftconvolve(psf_det, disk, mode="same")
+    det_conv_disk = np.clip(det_conv_disk, 0, None)
+
+    psf_conf = psf_ex * det_conv_disk
+    psf_conf = np.clip(psf_conf, 0, None)
+    total = psf_conf.sum()
+    if total > 0:
+        psf_conf /= total
+
+    return psf_conf.astype(np.float32)
+
+
 def generate_gaussian_psf(
     wavelength_em: float = 520.0,
     na: float = 1.4,
@@ -483,11 +597,14 @@ def deconvolve_richardson_lucy(
     # PSF parameters
     psf_type: str = "theoretical",
     psf_path: str = "",
+    modality: str = "widefield",
     wavelength_em: float = 520.0,
+    wavelength_ex: float = 488.0,
     na: float = 1.4,
     pixel_size_nm: float = 65.0,
     n_immersion: float = 1.515,
     magnification: float = 0.0,
+    pinhole_um: float = 50.0,
     psf_size: int = 0,
     # RL parameters
     iterations: int = 30,
@@ -508,9 +625,15 @@ def deconvolve_richardson_lucy(
     Parameters
     ----------
     psf_type : {"theoretical", "measured"}
-        Use a widefield Airy PSF or load a measured PSF file.
+        Use a theoretical PSF or load a measured PSF file.
     psf_path : str
         Path to a measured PSF TIFF (only when ``psf_type="measured"``).
+    modality : {"widefield", "spinning_disc"}
+        Microscope modality.  Determines the PSF model:
+        * *widefield* — standard Airy pattern.
+        * *spinning_disc* — confocal PSF with pinhole rejection.
+    wavelength_ex : float
+        Excitation wavelength in nm (used only for spinning disc).
     n_immersion : float
         Refractive index of the immersion medium (oil ≈ 1.515,
         water ≈ 1.33, air ≈ 1.0).
@@ -518,6 +641,9 @@ def deconvolve_richardson_lucy(
         Objective magnification.  When > 0, *pixel_size_nm* is treated as
         camera pixel size and divided by magnification.  0 = pixel_size_nm
         is already the sample-plane pixel size.
+    pinhole_um : float
+        Physical pinhole diameter in µm (spinning disc only).
+        Yokogawa CSU-X1: 50 µm, CSU-W1: 25 or 50 µm.
     iterations : int
         Number of RL iterations (10–50 recommended).
     tv_lambda : float
@@ -552,6 +678,17 @@ def deconvolve_richardson_lucy(
         if not psf_path:
             raise ValueError("psf_path must be set when psf_type='measured'")
         psf = load_measured_psf(psf_path)
+    elif modality == "spinning_disc":
+        psf = generate_confocal_psf(
+            wavelength_em=wavelength_em,
+            wavelength_ex=wavelength_ex,
+            na=na,
+            pixel_size_nm=pixel_size_nm,
+            n_immersion=n_immersion,
+            magnification=magnification,
+            pinhole_um=pinhole_um,
+            psf_size=psf_size,
+        )
     else:
         psf = generate_widefield_psf(
             wavelength_em=wavelength_em,

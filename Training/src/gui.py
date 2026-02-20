@@ -394,12 +394,26 @@ class SegmentationGUI(tk.Tk):
             body, text="Richardson-Lucy Parameters", padding=10)
         self.deconv_rl_frame.pack(fill=tk.X, padx=10, pady=5)
 
+        # Modality selector
+        mod_row = ttk.Frame(self.deconv_rl_frame)
+        mod_row.pack(fill=tk.X, pady=2)
+        ttk.Label(mod_row, text="Modality:").pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_modality = tk.StringVar(value="widefield")
+        ttk.Radiobutton(mod_row, text="Widefield",
+                         variable=self.deconv_modality, value="widefield",
+                         command=self._deconv_on_modality_change).pack(
+            side=tk.LEFT, padx=(0, 15))
+        ttk.Radiobutton(mod_row, text="Spinning Disc",
+                         variable=self.deconv_modality, value="spinning_disc",
+                         command=self._deconv_on_modality_change).pack(
+            side=tk.LEFT)
+
         # PSF source
         psf_row0 = ttk.Frame(self.deconv_rl_frame)
         psf_row0.pack(fill=tk.X, pady=2)
         ttk.Label(psf_row0, text="PSF:").pack(side=tk.LEFT, padx=(0, 5))
         self.deconv_psf_type = tk.StringVar(value="theoretical")
-        ttk.Radiobutton(psf_row0, text="Theoretical (Widefield)",
+        ttk.Radiobutton(psf_row0, text="Theoretical",
                          variable=self.deconv_psf_type, value="theoretical",
                          command=self._deconv_on_psf_change).pack(side=tk.LEFT, padx=(0, 15))
         ttk.Radiobutton(psf_row0, text="Measured PSF file",
@@ -456,6 +470,27 @@ class SegmentationGUI(tk.Tk):
             side=tk.LEFT, padx=(0, 5))
         ttk.Label(self.deconv_psf_theo_frame2,
                    text="(0 = pixel size is already at sample plane)",
+                   foreground="gray").pack(side=tk.LEFT)
+
+        # Spinning disc parameters — row 3: excitation & pinhole
+        self.deconv_psf_sd_frame = ttk.Frame(self.deconv_rl_frame)
+        ttk.Label(self.deconv_psf_sd_frame, text="Excitation (nm):").pack(
+            side=tk.LEFT, padx=(0, 5))
+        self.deconv_wavelength_ex = tk.DoubleVar(value=488.0)
+        ttk.Entry(self.deconv_psf_sd_frame,
+                   textvariable=self.deconv_wavelength_ex, width=6).pack(
+            side=tk.LEFT, padx=(0, 12))
+        ttk.Label(self.deconv_psf_sd_frame, text="Pinhole (\u00b5m):").pack(
+            side=tk.LEFT, padx=(0, 5))
+        self.deconv_pinhole_um = tk.DoubleVar(value=50.0)
+        pinhole_combo = ttk.Combobox(
+            self.deconv_psf_sd_frame,
+            textvariable=self.deconv_pinhole_um, width=5,
+            values=["25", "50", "70"],
+        )
+        pinhole_combo.pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(self.deconv_psf_sd_frame,
+                   text="(Yokogawa CSU-X1: 50, CSU-W1: 25 or 50)",
                    foreground="gray").pack(side=tk.LEFT)
 
         # Measured PSF path
@@ -609,15 +644,23 @@ class SegmentationGUI(tk.Tk):
             self.deconv_rl_frame.pack_forget()
             self.deconv_care_frame.pack(fill=tk.X, padx=10, pady=5)
 
+    def _deconv_on_modality_change(self):
+        self._deconv_on_psf_change()
+
     def _deconv_on_psf_change(self):
         if self.deconv_psf_type.get() == "theoretical":
             self.deconv_psf_theo_frame.pack(fill=tk.X, pady=2)
             self.deconv_psf_theo_frame2.pack(fill=tk.X, pady=2)
+            if self.deconv_modality.get() == "spinning_disc":
+                self.deconv_psf_sd_frame.pack(fill=tk.X, pady=2)
+            else:
+                self.deconv_psf_sd_frame.pack_forget()
             self.deconv_psf_meas_frame.pack_forget()
         else:
             self.deconv_psf_meas_frame.pack(fill=tk.X, pady=2)
             self.deconv_psf_theo_frame.pack_forget()
             self.deconv_psf_theo_frame2.pack_forget()
+            self.deconv_psf_sd_frame.pack_forget()
 
     def _deconv_browse_input(self):
         d = filedialog.askdirectory(title="Select Image Directory")
@@ -678,6 +721,16 @@ class SegmentationGUI(tk.Tk):
         if meta.get("immersion_ri"):
             self.deconv_n_immersion.set(meta["immersion_ri"])
             populated.append(f"immersion RI={meta['immersion_ri']}")
+        if meta.get("excitation_nm"):
+            self.deconv_wavelength_ex.set(meta["excitation_nm"])
+            populated.append(f"excitation={meta['excitation_nm']} nm")
+        if meta.get("pinhole_um"):
+            self.deconv_pinhole_um.set(meta["pinhole_um"])
+            populated.append(f"pinhole={meta['pinhole_um']} \u00b5m")
+            # If a pinhole is present, auto-select spinning disc modality
+            self.deconv_modality.set("spinning_disc")
+            self._deconv_on_modality_change()
+            populated.append("modality=Spinning Disc")
         # NOTE: Do NOT auto-fill magnification — OME-TIFF pixel sizes are
         # already at the sample plane (PhysicalSizeX already accounts for
         # magnification).  Setting magnification here would double-correct,
@@ -690,8 +743,6 @@ class SegmentationGUI(tk.Tk):
             self._deconv_log_append(
                 f"[AUTO] From {paths[0].name}: {summary}")
             extra = []
-            if meta.get("excitation_nm"):
-                extra.append(f"excitation={meta['excitation_nm']} nm")
             if meta.get("magnification"):
                 extra.append(f"magnification={meta['magnification']}x (pixel size already at sample plane)")
             if meta.get("objective_name"):
@@ -751,11 +802,14 @@ class SegmentationGUI(tk.Tk):
                         out_dir=out_dir,
                         psf_type=self.deconv_psf_type.get(),
                         psf_path=self.deconv_psf_path.get(),
+                        modality=self.deconv_modality.get(),
                         wavelength_em=self.deconv_wavelength_em.get(),
+                        wavelength_ex=self.deconv_wavelength_ex.get(),
                         na=self.deconv_na.get(),
                         pixel_size_nm=self.deconv_pixel_size.get(),
                         n_immersion=self.deconv_n_immersion.get(),
                         magnification=self.deconv_magnification.get(),
+                        pinhole_um=self.deconv_pinhole_um.get(),
                         psf_size=self.deconv_psf_size.get(),
                         iterations=self.deconv_iterations.get(),
                         tv_lambda=self.deconv_tv_lambda.get(),
