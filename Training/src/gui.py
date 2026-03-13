@@ -2492,41 +2492,61 @@ class SegmentationGUI(tk.Tk):
             side=tk.LEFT, padx=5
         )
 
-        # ---- Convert _seg.npy to TIFF ----
+        # ---- Split mixed folder (images + _seg.npy in same dir) ----
         npy_frame = ttk.LabelFrame(
-            tab, text="Convert Cellpose _seg.npy to TIFF masks", padding=10)
+            tab,
+            text="Split Mixed Folder (images + Cellpose _seg.npy in same directory)",
+            padding=10,
+        )
         npy_frame.pack(fill=tk.X, padx=10, pady=5)
 
         npy_hint = ttk.Label(
             npy_frame,
-            text="Convert Cellpose GUI-curated _seg.npy masks to TIFF for training.\n"
-                 "Each <name>_seg.npy produces <name>_masks.tif with the label mask.",
+            text="For the common Cellpose workflow: images (.tif) and masks (_seg.npy) in the same folder.\n"
+                 "Pairs each <name>.tif with <name>_seg.npy, converts masks to TIFF, and renames both\n"
+                 "to pipeline convention (<prefix><NNN>_img.tif / <prefix><NNN>_masks.tif).",
             foreground="gray",
         )
-        npy_hint.grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 5))
+        npy_hint.grid(row=0, column=0, columnspan=4, sticky=tk.W, pady=(0, 5))
 
-        ttk.Label(npy_frame, text="Input dir (_seg.npy):").grid(
+        ttk.Label(npy_frame, text="Source folder:").grid(
             row=1, column=0, sticky=tk.W, pady=2)
         self.npy_input_dir = tk.StringVar()
         ttk.Entry(npy_frame, textvariable=self.npy_input_dir, width=50).grid(
-            row=1, column=1, padx=5, pady=2)
+            row=1, column=1, columnspan=2, padx=5, pady=2, sticky=tk.W)
         ttk.Button(npy_frame, text="Browse...",
                     command=lambda: self._browse_set(self.npy_input_dir)).grid(
-            row=1, column=2, pady=2)
+            row=1, column=3, pady=2)
 
-        ttk.Label(npy_frame, text="Output dir (TIFF):").grid(
+        ttk.Label(npy_frame, text="Image output dir:").grid(
             row=2, column=0, sticky=tk.W, pady=2)
-        self.npy_output_dir = tk.StringVar()
-        ttk.Entry(npy_frame, textvariable=self.npy_output_dir, width=50).grid(
-            row=2, column=1, padx=5, pady=2)
+        self.npy_img_out = tk.StringVar()
+        ttk.Entry(npy_frame, textvariable=self.npy_img_out, width=50).grid(
+            row=2, column=1, columnspan=2, padx=5, pady=2, sticky=tk.W)
         ttk.Button(npy_frame, text="Browse...",
-                    command=lambda: self._browse_set(self.npy_output_dir)).grid(
-            row=2, column=2, pady=2)
-        ttk.Label(npy_frame, text="(empty = same as input)",
-                   foreground="gray").grid(row=2, column=3, sticky=tk.W)
+                    command=lambda: self._browse_set(self.npy_img_out)).grid(
+            row=2, column=3, pady=2)
 
-        ttk.Button(npy_frame, text="Convert", command=self._convert_seg_npy).grid(
-            row=3, column=0, pady=(5, 0), sticky=tk.W)
+        ttk.Label(npy_frame, text="Mask output dir:").grid(
+            row=3, column=0, sticky=tk.W, pady=2)
+        self.npy_mask_out = tk.StringVar()
+        ttk.Entry(npy_frame, textvariable=self.npy_mask_out, width=50).grid(
+            row=3, column=1, columnspan=2, padx=5, pady=2, sticky=tk.W)
+        ttk.Button(npy_frame, text="Browse...",
+                    command=lambda: self._browse_set(self.npy_mask_out)).grid(
+            row=3, column=3, pady=2)
+
+        npy_btn_row = ttk.Frame(npy_frame)
+        npy_btn_row.grid(row=4, column=0, columnspan=4, sticky=tk.W, pady=(5, 0))
+        ttk.Button(npy_btn_row, text="Preview",
+                    command=self._split_mixed_preview).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(npy_btn_row, text="Split & Convert",
+                    command=self._split_mixed_execute).pack(side=tk.LEFT, padx=(0, 15))
+        ttk.Button(npy_btn_row, text="Convert _seg.npy only",
+                    command=self._convert_seg_npy).pack(side=tk.LEFT)
+        ttk.Label(npy_btn_row,
+                   text="(convert in-place without renaming)",
+                   foreground="gray").pack(side=tk.LEFT, padx=(5, 0))
 
         # ---- Preview table ----
         table_frame = ttk.LabelFrame(tab, text="Preview", padding=5)
@@ -2659,20 +2679,79 @@ class SegmentationGUI(tk.Tk):
         if d:
             var.set(d)
 
+    def _split_mixed_preview(self):
+        """Preview split of mixed folder (images + _seg.npy)."""
+        self.rename_tree.delete(*self.rename_tree.get_children())
+        src = self.npy_input_dir.get()
+        if not src:
+            messagebox.showwarning("Missing", "Select the source folder.")
+            return
+        try:
+            from rename_files import split_mixed_folder
+            prefix = self.rename_prefix.get()
+            img_r, mask_r = split_mixed_folder(
+                source_dir=src,
+                image_output_dir=self.npy_img_out.get() or src,
+                mask_output_dir=self.npy_mask_out.get() or src,
+                prefix=prefix,
+                dry_run=True,
+            )
+            for old, new in img_r:
+                self.rename_tree.insert("", tk.END, values=("Image", old, new))
+            for old, new in mask_r:
+                self.rename_tree.insert("", tk.END, values=("Mask (.npy)", old, new))
+            if not img_r:
+                messagebox.showinfo("No pairs", "No image/_seg.npy pairs found.")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def _split_mixed_execute(self):
+        """Split mixed folder: copy images + convert _seg.npy to TIFF."""
+        src = self.npy_input_dir.get()
+        img_out = self.npy_img_out.get()
+        mask_out = self.npy_mask_out.get()
+        if not src or not img_out or not mask_out:
+            messagebox.showwarning(
+                "Missing",
+                "Set source folder and both output directories.")
+            return
+        try:
+            from rename_files import split_mixed_folder
+            prefix = self.rename_prefix.get()
+            img_r, mask_r = split_mixed_folder(
+                source_dir=src,
+                image_output_dir=img_out,
+                mask_output_dir=mask_out,
+                prefix=prefix,
+                dry_run=False,
+            )
+            if img_r:
+                messagebox.showinfo(
+                    "Done",
+                    f"Split {len(img_r)} pairs:\n"
+                    f"  Images -> {img_out}\n"
+                    f"  Masks  -> {mask_out}",
+                )
+                self._split_mixed_preview()
+            else:
+                messagebox.showinfo("No pairs", "No image/_seg.npy pairs found.")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
     def _convert_seg_npy(self):
-        """Convert _seg.npy files to TIFF masks."""
+        """Convert _seg.npy files to TIFF masks in-place."""
         in_dir = self.npy_input_dir.get()
         if not in_dir:
-            messagebox.showwarning("Missing", "Select the input directory containing _seg.npy files.")
+            messagebox.showwarning("Missing", "Select the source folder.")
             return
-        out_dir = self.npy_output_dir.get() or None
         try:
             from data_preparation import convert_seg_npy_to_tif
-            converted = convert_seg_npy_to_tif(in_dir, out_dir)
+            converted = convert_seg_npy_to_tif(in_dir)
             if converted:
                 messagebox.showinfo(
                     "Done",
-                    f"Converted {len(converted)} _seg.npy files to TIFF masks.",
+                    f"Converted {len(converted)} _seg.npy files to TIFF masks\n"
+                    f"in {in_dir}",
                 )
             else:
                 messagebox.showinfo(

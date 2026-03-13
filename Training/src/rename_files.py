@@ -17,11 +17,20 @@ logger = logging.getLogger(__name__)
 SUPPORTED_EXTENSIONS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".nd2"}
 
 
-def list_image_files(directory: str) -> list[str]:
-    """List all supported image files in a directory, sorted."""
+def list_image_files(directory: str, include_npy: bool = False) -> list[str]:
+    """List all supported image files in a directory, sorted.
+
+    Parameters
+    ----------
+    include_npy : bool
+        If True, also include ``_seg.npy`` files (Cellpose masks).
+    """
     files = []
     for f in sorted(os.listdir(directory)):
-        if Path(f).suffix.lower() in SUPPORTED_EXTENSIONS:
+        ext = Path(f).suffix.lower()
+        if ext in SUPPORTED_EXTENSIONS:
+            files.append(f)
+        elif include_npy and f.endswith("_seg.npy"):
             files.append(f)
     return files
 
@@ -141,6 +150,106 @@ def auto_sort_and_rename(
         target_extension=".tif", dry_run=dry_run, copy_mode=True,
         image_output_dir=img_output, mask_output_dir=mask_output,
     )
+
+
+def split_mixed_folder(
+    source_dir,
+    image_output_dir,
+    mask_output_dir,
+    prefix="",
+    target_extension=".tif",
+    dry_run=False,
+):
+    """Split a folder containing images + Cellpose ``_seg.npy`` masks.
+
+    Handles the common Cellpose workflow where images (``*.tif``) and masks
+    (``*_seg.npy``) live in the same directory.  Each ``<name>_seg.npy`` is
+    paired with ``<name>.tif`` (or ``.tiff``, ``.png``, etc.).
+
+    The function copies images and converts `_seg.npy` masks to TIFF,
+    renaming both to the pipeline convention:
+      - Images: ``<prefix><NNN>_img.tif``
+      - Masks:  ``<prefix><NNN>_masks.tif``
+
+    Parameters
+    ----------
+    source_dir : str
+        Folder with mixed image + ``_seg.npy`` files.
+    image_output_dir, mask_output_dir : str
+        Where to write the separated & renamed files.
+    prefix : str
+        Naming prefix (e.g. ``"dic_"``).
+    target_extension : str
+        Output extension for both images and masks.
+    dry_run : bool
+        If True, only preview — don't write files.
+
+    Returns
+    -------
+    img_renames : list of (old_name, new_name)
+    mask_renames : list of (old_name, new_name)
+    """
+    import numpy as np
+    import tifffile
+
+    source = Path(source_dir)
+
+    # Find all _seg.npy files
+    npy_files = sorted(source.glob("*_seg.npy"))
+    if not npy_files:
+        logger.warning(f"No _seg.npy files found in {source_dir}")
+        return [], []
+
+    # Match each _seg.npy with its image
+    pairs = []
+    for npy_path in npy_files:
+        # <name>_seg.npy → look for <name>.tif/tiff/png/...
+        base = npy_path.name[:-len("_seg.npy")]
+        img_path = None
+        for ext in (".tif", ".tiff", ".png", ".jpg", ".jpeg", ".nd2"):
+            candidate = source / (base + ext)
+            if candidate.exists():
+                img_path = candidate
+                break
+        if img_path is None:
+            logger.warning(f"No image found for {npy_path.name}, skipping")
+            continue
+        pairs.append((img_path, npy_path))
+
+    logger.info(f"Found {len(pairs)} image/_seg.npy pairs in {source_dir}")
+
+    img_renames = []
+    mask_renames = []
+    ext = target_extension or ".tif"
+
+    for i, (img_path, npy_path) in enumerate(pairs, start=1):
+        img_new = generate_new_name(i, prefix, "_img", ext)
+        mask_new = generate_new_name(i, prefix, "_masks", ext)
+
+        img_renames.append((img_path.name, img_new))
+        mask_renames.append((npy_path.name, mask_new))
+
+    if dry_run:
+        return img_renames, mask_renames
+
+    os.makedirs(image_output_dir, exist_ok=True)
+    os.makedirs(mask_output_dir, exist_ok=True)
+
+    for i, (img_path, npy_path) in enumerate(pairs, start=1):
+        img_new = generate_new_name(i, prefix, "_img", ext)
+        mask_new = generate_new_name(i, prefix, "_masks", ext)
+
+        # Copy image
+        shutil.copy2(str(img_path), os.path.join(image_output_dir, img_new))
+        logger.info(f"Copied image: {img_path.name} -> {img_new}")
+
+        # Convert _seg.npy mask to TIFF
+        dat = np.load(str(npy_path), allow_pickle=True).item()
+        masks = np.asarray(dat["masks"]).astype(np.uint16)
+        tifffile.imwrite(os.path.join(mask_output_dir, mask_new), masks)
+        logger.info(f"Converted mask: {npy_path.name} -> {mask_new}")
+
+    return img_renames, mask_renames
 
 
 if __name__ == "__main__":
