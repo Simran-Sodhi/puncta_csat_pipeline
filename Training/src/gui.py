@@ -2492,6 +2492,42 @@ class SegmentationGUI(tk.Tk):
             side=tk.LEFT, padx=5
         )
 
+        # ---- Convert _seg.npy to TIFF ----
+        npy_frame = ttk.LabelFrame(
+            tab, text="Convert Cellpose _seg.npy to TIFF masks", padding=10)
+        npy_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        npy_hint = ttk.Label(
+            npy_frame,
+            text="Convert Cellpose GUI-curated _seg.npy masks to TIFF for training.\n"
+                 "Each <name>_seg.npy produces <name>_masks.tif with the label mask.",
+            foreground="gray",
+        )
+        npy_hint.grid(row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 5))
+
+        ttk.Label(npy_frame, text="Input dir (_seg.npy):").grid(
+            row=1, column=0, sticky=tk.W, pady=2)
+        self.npy_input_dir = tk.StringVar()
+        ttk.Entry(npy_frame, textvariable=self.npy_input_dir, width=50).grid(
+            row=1, column=1, padx=5, pady=2)
+        ttk.Button(npy_frame, text="Browse...",
+                    command=lambda: self._browse_set(self.npy_input_dir)).grid(
+            row=1, column=2, pady=2)
+
+        ttk.Label(npy_frame, text="Output dir (TIFF):").grid(
+            row=2, column=0, sticky=tk.W, pady=2)
+        self.npy_output_dir = tk.StringVar()
+        ttk.Entry(npy_frame, textvariable=self.npy_output_dir, width=50).grid(
+            row=2, column=1, padx=5, pady=2)
+        ttk.Button(npy_frame, text="Browse...",
+                    command=lambda: self._browse_set(self.npy_output_dir)).grid(
+            row=2, column=2, pady=2)
+        ttk.Label(npy_frame, text="(empty = same as input)",
+                   foreground="gray").grid(row=2, column=3, sticky=tk.W)
+
+        ttk.Button(npy_frame, text="Convert", command=self._convert_seg_npy).grid(
+            row=3, column=0, pady=(5, 0), sticky=tk.W)
+
         # ---- Preview table ----
         table_frame = ttk.LabelFrame(tab, text="Preview", padding=5)
         table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
@@ -2617,6 +2653,34 @@ class SegmentationGUI(tk.Tk):
         except Exception as e:
             messagebox.showerror("Error", str(e))
             logger.exception("Rename failed")
+
+    def _browse_set(self, var):
+        d = filedialog.askdirectory(title="Select Directory")
+        if d:
+            var.set(d)
+
+    def _convert_seg_npy(self):
+        """Convert _seg.npy files to TIFF masks."""
+        in_dir = self.npy_input_dir.get()
+        if not in_dir:
+            messagebox.showwarning("Missing", "Select the input directory containing _seg.npy files.")
+            return
+        out_dir = self.npy_output_dir.get() or None
+        try:
+            from data_preparation import convert_seg_npy_to_tif
+            converted = convert_seg_npy_to_tif(in_dir, out_dir)
+            if converted:
+                messagebox.showinfo(
+                    "Done",
+                    f"Converted {len(converted)} _seg.npy files to TIFF masks.",
+                )
+            else:
+                messagebox.showinfo(
+                    "No files",
+                    "No _seg.npy files found in the selected directory.",
+                )
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
 
     # ==================================================================
     # TAB 2: CONFIGURATION

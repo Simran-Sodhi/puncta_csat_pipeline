@@ -19,8 +19,16 @@ logger = logging.getLogger(__name__)
 
 
 def load_image(path: str, z_slice: int | None = None) -> np.ndarray:
-    """Load an image from disk (supports TIFF, PNG, JPG, ND2)."""
+    """Load an image from disk (supports TIFF, PNG, JPG, ND2, _seg.npy).
+
+    For Cellpose ``_seg.npy`` files, the ``masks`` array is extracted
+    from the saved dictionary.
+    """
     ext = Path(path).suffix.lower()
+    if ext == ".npy":
+        # Cellpose _seg.npy format: dict with "masks" key
+        dat = np.load(path, allow_pickle=True).item()
+        return np.asarray(dat["masks"])
     if ext in (".tif", ".tiff"):
         return tifffile.imread(path)
     if ext == ".nd2":
@@ -111,8 +119,58 @@ def save_image(path, image):
         skio.imsave(path, image, check_contrast=False)
 
 
+def convert_seg_npy_to_tif(input_dir, output_dir=None):
+    """Convert all Cellpose ``_seg.npy`` files in *input_dir* to TIFF masks.
+
+    Each ``<name>_seg.npy`` produces a ``<name>_masks.tif`` containing the
+    uint16 label mask.  This is useful for preparing Cellpose GUI-curated
+    masks for the training pipeline.
+
+    Parameters
+    ----------
+    input_dir : str
+        Directory containing ``_seg.npy`` files.
+    output_dir : str or None
+        Where to write the TIFF masks.  ``None`` = same as *input_dir*.
+
+    Returns
+    -------
+    list of str
+        Paths to the converted TIFF files.
+    """
+    input_dir = Path(input_dir)
+    out = Path(output_dir) if output_dir else input_dir
+    out.mkdir(parents=True, exist_ok=True)
+
+    converted = []
+    for npy_path in sorted(input_dir.glob("*_seg.npy")):
+        try:
+            dat = np.load(str(npy_path), allow_pickle=True).item()
+            masks = np.asarray(dat["masks"])
+            if masks.dtype != np.uint16:
+                masks = masks.astype(np.uint16)
+            # Strip the _seg suffix to get the base name
+            stem = npy_path.stem  # e.g. "image_seg"
+            if stem.endswith("_seg"):
+                stem = stem[:-4]
+            out_path = out / f"{stem}_masks.tif"
+            tifffile.imwrite(str(out_path), masks)
+            converted.append(str(out_path))
+            logger.info(f"Converted {npy_path.name} -> {out_path.name}")
+        except Exception as exc:
+            logger.warning(f"Failed to convert {npy_path.name}: {exc}")
+
+    logger.info(f"Converted {len(converted)} _seg.npy files to TIFF in {out}")
+    return converted
+
+
 def find_image_pairs(image_dir, mask_dir, image_filter="_img", mask_filter="_masks"):
-    """Find matching image/mask pairs by filename convention."""
+    """Find matching image/mask pairs by filename convention.
+
+    Masks can be TIFF/PNG/JPG files *or* Cellpose ``_seg.npy`` files.
+    When a ``_seg.npy`` file is found, the ``masks`` array is extracted
+    automatically during loading.
+    """
     extensions = ("*.tif", "*.tiff", "*.png", "*.jpg", "*.jpeg", "*.nd2")
     image_files = []
     for ext in extensions:
@@ -127,11 +185,24 @@ def find_image_pairs(image_dir, mask_dir, image_filter="_img", mask_filter="_mas
             mask_stem = stem + mask_filter
 
         mask_path = None
+        # Check standard image formats first
         for ext in (".tif", ".tiff", ".png", ".jpg", ".jpeg", ".nd2"):
             candidate = os.path.join(mask_dir, mask_stem + ext)
             if os.path.exists(candidate):
                 mask_path = candidate
                 break
+
+        # Fallback: look for Cellpose _seg.npy files
+        if mask_path is None:
+            # Try: <mask_stem>_seg.npy  (e.g. sample_masks_seg.npy)
+            candidate = os.path.join(mask_dir, mask_stem + "_seg.npy")
+            if os.path.exists(candidate):
+                mask_path = candidate
+            else:
+                # Try: <original_stem>_seg.npy  (Cellpose default naming)
+                candidate = os.path.join(mask_dir, stem + "_seg.npy")
+                if os.path.exists(candidate):
+                    mask_path = candidate
 
         if mask_path is not None:
             pairs.append((img_path, mask_path))
