@@ -2773,13 +2773,13 @@ class SegmentationGUI(tk.Tk):
 
         ttk.Label(top, text="Config File:").pack(side=tk.LEFT)
         self.cfg_path_var = tk.StringVar()
-        ttk.Entry(top, textvariable=self.cfg_path_var, width=50).pack(
+        ttk.Entry(top, textvariable=self.cfg_path_var, width=45).pack(
             side=tk.LEFT, padx=5
         )
-        ttk.Button(top, text="Open...", command=self._open_config).pack(side=tk.LEFT)
-        ttk.Button(top, text="Save", command=self._save_config).pack(
-            side=tk.LEFT, padx=5
-        )
+        ttk.Button(top, text="New", command=self._new_config).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="Open...", command=self._open_config).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="Save", command=self._save_config).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="Save As...", command=self._save_config_as).pack(side=tk.LEFT, padx=2)
 
         # Preset buttons
         preset_frame = ttk.Frame(tab)
@@ -2887,6 +2887,101 @@ class SegmentationGUI(tk.Tk):
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load config:\n{e}")
 
+    def _new_config(self):
+        """Create a new blank config with sensible defaults."""
+        self.yaml_config = {
+            "SYSTEM": {"NUM_GPUS": 1, "NUM_CPUS": 4, "SEED": 42},
+            "PROBLEM": {"TYPE": "SEMANTIC_SEG", "NDIM": "2D", "DESCRIPTION": ""},
+            "DATA": {
+                "TRAIN": {
+                    "PATH": "data/train/raw",
+                    "MASK_PATH": "data/train/labels",
+                    "IMAGE_FILTER": "_img",
+                    "MASK_FILTER": "_masks",
+                },
+                "TEST": {
+                    "PATH": "data/test/raw",
+                    "MASK_PATH": "data/test/labels",
+                    "IMAGE_FILTER": "_img",
+                    "MASK_FILTER": "_masks",
+                },
+                "PATCH_SIZE": [256, 256],
+                "CHANNELS": [0, 0],
+                "Z_SLICE": None,
+                "NORMALIZE": True,
+            },
+            "AUGMENTATION": {
+                "ENABLE": True,
+                "RANDOM_FLIP": True,
+                "RANDOM_ROTATION": {"ENABLE": True, "DEGREES": 180},
+                "ELASTIC_DEFORM": {"ENABLE": True, "ALPHA": [20, 40], "SIGMA": [5, 7]},
+                "GAUSSIAN_NOISE": {"ENABLE": True, "MEAN": 0.0, "STD": 0.05},
+                "BRIGHTNESS_CONTRAST": {
+                    "ENABLE": True,
+                    "BRIGHTNESS_RANGE": [-0.1, 0.1],
+                    "CONTRAST_RANGE": [0.9, 1.1],
+                },
+            },
+            "MODEL": {
+                "BACKEND": "cellpose",
+                "PRETRAINED_MODEL": None,
+                "ARCHITECTURE": "cpsam",
+            },
+            "TRAIN": {
+                "ENABLE": True,
+                "EPOCHS": 100,
+                "LEARNING_RATE": 1e-5,
+                "WEIGHT_DECAY": 0.1,
+                "BATCH_SIZE": 1,
+                "OPTIMIZER": "adam",
+                "SAVE_EVERY": 25,
+                "MIN_TRAIN_MASKS": 5,
+            },
+            "INFERENCE": {
+                "ENABLE": True,
+                "DIAMETER": None,
+                "FLOW_THRESHOLD": 0.4,
+                "CELLPROB_THRESHOLD": 0.0,
+                "NORMALIZE": {"TILE_NORM_BLOCKSIZE": 128},
+                "AUGMENT": False,
+                "RESAMPLE": True,
+            },
+            "PATHS": {
+                "MODEL_DIR": "models",
+                "RESULT_DIR": "results",
+                "MODEL_NAME": "cellpose_custom",
+            },
+        }
+        self.yaml_config_path = ""
+        self.cfg_path_var.set("(new unsaved config)")
+        self._populate_param_editor()
+        self._sync_model_selector_from_config()
+        logger.info("Created new config with defaults")
+
+    def _save_config_as(self):
+        """Save current config to a new file (always prompts for location)."""
+        if not self.yaml_config:
+            messagebox.showwarning("No Config", "Create or load a config first.")
+            return
+        self._read_params_into_config()
+        path = filedialog.asksaveasfilename(
+            title="Save Configuration As",
+            filetypes=[("YAML", "*.yaml")],
+            initialdir=str(PROJECT_ROOT / "configs"),
+            defaultextension=".yaml",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w") as f:
+                yaml.dump(self.yaml_config, f, default_flow_style=False, sort_keys=False)
+            self.yaml_config_path = path
+            self.cfg_path_var.set(path)
+            logger.info(f"Config saved to {path}")
+            messagebox.showinfo("Saved", f"Configuration saved to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save config:\n{e}")
+
     def _on_model_source_changed(self, event=None):
         """Toggle custom model path entry based on dropdown selection."""
         choice = self.model_source_var.get()
@@ -2975,6 +3070,44 @@ class SegmentationGUI(tk.Tk):
         self.param_vars.clear()
 
         row = 0
+
+        # ---- DATA directories (nested under DATA.TRAIN / DATA.TEST) ----
+        data_cfg = self.yaml_config.get("DATA", {})
+        ttk.Label(
+            self.param_inner,
+            text="--- DATA DIRECTORIES ---",
+            font=("TkDefaultFont", 10, "bold"),
+        ).grid(row=row, column=0, columnspan=3, sticky=tk.W, pady=(10, 2))
+        row += 1
+        for split_key, split_label in [("TRAIN", "Train"), ("TEST", "Test")]:
+            split_cfg = data_cfg.get(split_key, {})
+            for field_key, field_label in [
+                ("PATH", f"{split_label} Image Dir"),
+                ("MASK_PATH", f"{split_label} Mask Dir"),
+                ("IMAGE_FILTER", f"{split_label} Image Filter"),
+                ("MASK_FILTER", f"{split_label} Mask Filter"),
+            ]:
+                ttk.Label(self.param_inner, text=f"  {field_label}:").grid(
+                    row=row, column=0, sticky=tk.W, padx=(10, 5), pady=1
+                )
+                full_key = f"DATA.{split_key}.{field_key}"
+                var = tk.StringVar(value=str(split_cfg.get(field_key, "")))
+                w = 40 if "Dir" in field_label else 15
+                entry = ttk.Entry(self.param_inner, textvariable=var, width=w)
+                entry.grid(row=row, column=1, sticky=tk.W, pady=1)
+                if "Dir" in field_label:
+                    ttk.Button(
+                        self.param_inner, text="...",
+                        command=lambda v=var: self._browse_dir(v),
+                    ).grid(row=row, column=2, padx=2, pady=1)
+                self.param_vars[full_key] = var
+                row += 1
+
+        row = self._add_section("DATA", row, [
+            ("CHANNELS", "Channels [segment, nuclear]  (0=DIC, 1=mEGFP, 2=mScarlet, 3=miRFPnano3)", "str"),
+            ("Z_SLICE", "Z-Slice (null=first, or 0-indexed integer)", "str"),
+        ])
+
         row = self._add_section("TRAIN", row, [
             ("EPOCHS", "Epochs", "int"),
             ("LEARNING_RATE", "Learning Rate", "float"),
@@ -2982,11 +3115,6 @@ class SegmentationGUI(tk.Tk):
             ("BATCH_SIZE", "Batch Size", "int"),
             ("SAVE_EVERY", "Save Every N Epochs", "int"),
             ("MIN_TRAIN_MASKS", "Min Train Masks", "int"),
-        ])
-
-        row = self._add_section("DATA", row, [
-            ("CHANNELS", "Channels [segment, nuclear]  (0=DIC, 1=mEGFP, 2=mScarlet, 3=miRFPnano3)", "str"),
-            ("Z_SLICE", "Z-Slice (null=first, or 0-indexed integer)", "str"),
         ])
 
         row = self._add_section("INFERENCE", row, [
@@ -3077,7 +3205,6 @@ class SegmentationGUI(tk.Tk):
         }
 
         for full_key, var in self.param_vars.items():
-            section, key = full_key.split(".", 1)
             raw = var.get()
 
             # Parse value
@@ -3091,7 +3218,6 @@ class SegmentationGUI(tk.Tk):
             elif raw.lower() in ("null", "none", ""):
                 val = None
             elif raw.startswith("["):
-                # Parse list like [0, 0]
                 try:
                     val = yaml.safe_load(raw)
                 except yaml.YAMLError:
@@ -3099,13 +3225,18 @@ class SegmentationGUI(tk.Tk):
             else:
                 val = raw
 
-            if section not in self.yaml_config:
-                self.yaml_config[section] = {}
-            self.yaml_config[section][key] = val
+            # Handle nested keys like DATA.TRAIN.PATH
+            parts = full_key.split(".")
+            d = self.yaml_config
+            for p in parts[:-1]:
+                if p not in d:
+                    d[p] = {}
+                d = d[p]
+            d[parts[-1]] = val
 
     def _save_config(self):
         if not self.yaml_config:
-            messagebox.showwarning("No Config", "Load a config first.")
+            messagebox.showwarning("No Config", "Create or load a config first.")
             return
 
         self._read_params_into_config()
@@ -3135,58 +3266,453 @@ class SegmentationGUI(tk.Tk):
     def _build_train_tab(self):
         tab = self.tab_train
 
-        # Controls
-        ctrl_frame = ttk.Frame(tab)
-        ctrl_frame.pack(fill=tk.X, padx=10, pady=10)
+        # Scrollable body
+        canvas = tk.Canvas(tab, highlightthickness=0)
+        sb = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=canvas.yview)
+        body = ttk.Frame(canvas)
+        body.bind(
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=body, anchor=tk.NW)
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        ttk.Label(ctrl_frame, text="Task:").pack(side=tk.LEFT)
-        self.train_task = tk.StringVar(value="dic")
+        def _on_scroll(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_scroll, add="+")
+
+        # ---- Task Preset ----
+        task_frame = ttk.LabelFrame(body, text="Task Preset", padding=10)
+        task_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
+
+        ttk.Label(task_frame, text="Task:").grid(row=0, column=0, sticky=tk.W)
+        self.train_task = tk.StringVar(value="custom")
         task_combo = ttk.Combobox(
-            ctrl_frame,
+            task_frame,
             textvariable=self.train_task,
             values=["dic", "fluor", "both", "custom"],
             width=12,
             state="readonly",
         )
-        task_combo.pack(side=tk.LEFT, padx=5)
+        task_combo.grid(row=0, column=1, padx=5, sticky=tk.W)
+        task_combo.bind("<<ComboboxSelected>>", self._train_on_task_change)
+
+        ttk.Label(
+            task_frame,
+            text="'custom' uses the directories and config below; presets use built-in configs.",
+            foreground="gray",
+        ).grid(row=1, column=0, columnspan=4, sticky=tk.W, pady=(2, 0))
+
+        # ---- Data Directories ----
+        data_frame = ttk.LabelFrame(body, text="Training Data", padding=10)
+        data_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(data_frame, text="Train Images:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.train_img_dir = tk.StringVar()
+        ttk.Entry(data_frame, textvariable=self.train_img_dir, width=50).grid(
+            row=0, column=1, padx=5, pady=2, sticky=tk.EW
+        )
+        ttk.Button(
+            data_frame, text="Browse...",
+            command=lambda: self._browse_dir(self.train_img_dir),
+        ).grid(row=0, column=2, pady=2)
+
+        ttk.Label(data_frame, text="Train Masks:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.train_mask_dir = tk.StringVar()
+        ttk.Entry(data_frame, textvariable=self.train_mask_dir, width=50).grid(
+            row=1, column=1, padx=5, pady=2, sticky=tk.EW
+        )
+        ttk.Button(
+            data_frame, text="Browse...",
+            command=lambda: self._browse_dir(self.train_mask_dir),
+        ).grid(row=1, column=2, pady=2)
+
+        ttk.Label(data_frame, text="Test Images:").grid(row=2, column=0, sticky=tk.W, pady=2)
+        self.test_img_dir = tk.StringVar()
+        ttk.Entry(data_frame, textvariable=self.test_img_dir, width=50).grid(
+            row=2, column=1, padx=5, pady=2, sticky=tk.EW
+        )
+        ttk.Button(
+            data_frame, text="Browse...",
+            command=lambda: self._browse_dir(self.test_img_dir),
+        ).grid(row=2, column=2, pady=2)
+
+        ttk.Label(data_frame, text="Test Masks:").grid(row=3, column=0, sticky=tk.W, pady=2)
+        self.test_mask_dir = tk.StringVar()
+        ttk.Entry(data_frame, textvariable=self.test_mask_dir, width=50).grid(
+            row=3, column=1, padx=5, pady=2, sticky=tk.EW
+        )
+        ttk.Button(
+            data_frame, text="Browse...",
+            command=lambda: self._browse_dir(self.test_mask_dir),
+        ).grid(row=3, column=2, pady=2)
+
+        # File filters
+        filter_frame = ttk.Frame(data_frame)
+        filter_frame.grid(row=4, column=0, columnspan=3, sticky=tk.W, pady=(5, 0))
+        ttk.Label(filter_frame, text="Image Filter:").pack(side=tk.LEFT)
+        self.train_img_filter = tk.StringVar(value="_img")
+        ttk.Entry(filter_frame, textvariable=self.train_img_filter, width=10).pack(
+            side=tk.LEFT, padx=(5, 15)
+        )
+        ttk.Label(filter_frame, text="Mask Filter:").pack(side=tk.LEFT)
+        self.train_mask_filter = tk.StringVar(value="_masks")
+        ttk.Entry(filter_frame, textvariable=self.train_mask_filter, width=10).pack(
+            side=tk.LEFT, padx=5
+        )
+
+        data_frame.columnconfigure(1, weight=1)
+
+        # ---- Training Parameters (quick settings) ----
+        param_frame = ttk.LabelFrame(body, text="Training Parameters", padding=10)
+        param_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(param_frame, text="Epochs:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.train_epochs = tk.StringVar(value="100")
+        ttk.Entry(param_frame, textvariable=self.train_epochs, width=10).grid(
+            row=0, column=1, padx=5, pady=2, sticky=tk.W
+        )
+
+        ttk.Label(param_frame, text="Learning Rate:").grid(row=0, column=2, sticky=tk.W, padx=(20, 0), pady=2)
+        self.train_lr = tk.StringVar(value="0.00001")
+        ttk.Entry(param_frame, textvariable=self.train_lr, width=12).grid(
+            row=0, column=3, padx=5, pady=2, sticky=tk.W
+        )
+
+        ttk.Label(param_frame, text="Batch Size:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.train_batch = tk.StringVar(value="1")
+        ttk.Entry(param_frame, textvariable=self.train_batch, width=10).grid(
+            row=1, column=1, padx=5, pady=2, sticky=tk.W
+        )
+
+        ttk.Label(param_frame, text="Weight Decay:").grid(row=1, column=2, sticky=tk.W, padx=(20, 0), pady=2)
+        self.train_wd = tk.StringVar(value="0.1")
+        ttk.Entry(param_frame, textvariable=self.train_wd, width=12).grid(
+            row=1, column=3, padx=5, pady=2, sticky=tk.W
+        )
+
+        ttk.Label(param_frame, text="Channels [seg, nuc]:").grid(row=2, column=0, sticky=tk.W, pady=2)
+        self.train_channels = tk.StringVar(value="[0, 0]")
+        ttk.Entry(param_frame, textvariable=self.train_channels, width=12).grid(
+            row=2, column=1, padx=5, pady=2, sticky=tk.W
+        )
+
+        ttk.Label(param_frame, text="Diameter:").grid(row=2, column=2, sticky=tk.W, padx=(20, 0), pady=2)
+        self.train_diameter = tk.StringVar(value="null")
+        ttk.Entry(param_frame, textvariable=self.train_diameter, width=12).grid(
+            row=2, column=3, padx=5, pady=2, sticky=tk.W
+        )
+
+        ttk.Label(param_frame, text="Save Every N Epochs:").grid(row=3, column=0, sticky=tk.W, pady=2)
+        self.train_save_every = tk.StringVar(value="25")
+        ttk.Entry(param_frame, textvariable=self.train_save_every, width=10).grid(
+            row=3, column=1, padx=5, pady=2, sticky=tk.W
+        )
+
+        ttk.Label(param_frame, text="Min Train Masks:").grid(row=3, column=2, sticky=tk.W, padx=(20, 0), pady=2)
+        self.train_min_masks = tk.StringVar(value="5")
+        ttk.Entry(param_frame, textvariable=self.train_min_masks, width=10).grid(
+            row=3, column=3, padx=5, pady=2, sticky=tk.W
+        )
+
+        self.train_augment = tk.BooleanVar(value=True)
+        ttk.Checkbutton(param_frame, text="Enable Data Augmentation", variable=self.train_augment).grid(
+            row=4, column=0, columnspan=2, sticky=tk.W, pady=2
+        )
+
+        self.train_use_gpu = tk.BooleanVar(value=True)
+        ttk.Checkbutton(param_frame, text="Use GPU", variable=self.train_use_gpu).grid(
+            row=4, column=2, columnspan=2, sticky=tk.W, pady=2
+        )
+
+        # ---- Model ----
+        model_frame = ttk.LabelFrame(body, text="Model", padding=10)
+        model_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(model_frame, text="Pretrained Model:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.train_model_var = tk.StringVar(value="cpsam (default)")
+        ttk.Combobox(
+            model_frame,
+            textvariable=self.train_model_var,
+            values=["cpsam (default)", "Custom model..."],
+            width=20,
+            state="readonly",
+        ).grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
+
+        self.train_model_path = tk.StringVar()
+        self.train_model_entry = ttk.Entry(
+            model_frame, textvariable=self.train_model_path, width=40
+        )
+        self.train_model_entry.grid(row=0, column=2, padx=5, pady=2, sticky=tk.EW)
+        self.train_model_entry.config(state=tk.DISABLED)
+        self.train_model_btn = ttk.Button(
+            model_frame, text="Browse...", command=self._train_browse_model
+        )
+        self.train_model_btn.grid(row=0, column=3, pady=2)
+        self.train_model_btn.config(state=tk.DISABLED)
+        self.train_model_var.trace_add("write", lambda *_: self._train_on_model_change())
+
+        ttk.Label(model_frame, text="Output Model Name:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.train_model_name = tk.StringVar(value="cellpose_custom")
+        ttk.Entry(model_frame, textvariable=self.train_model_name, width=30).grid(
+            row=1, column=1, columnspan=2, padx=5, pady=2, sticky=tk.W
+        )
+
+        ttk.Label(model_frame, text="Model Save Dir:").grid(row=2, column=0, sticky=tk.W, pady=2)
+        self.train_model_dir = tk.StringVar(value="models")
+        ttk.Entry(model_frame, textvariable=self.train_model_dir, width=40).grid(
+            row=2, column=1, columnspan=2, padx=5, pady=2, sticky=tk.EW
+        )
+        ttk.Button(
+            model_frame, text="Browse...",
+            command=lambda: self._browse_dir(self.train_model_dir),
+        ).grid(row=2, column=3, pady=2)
+
+        model_frame.columnconfigure(2, weight=1)
+
+        # ---- Config link ----
+        cfg_link = ttk.Frame(body)
+        cfg_link.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(
+            cfg_link,
+            text="For advanced settings (augmentation details, inference params), use the Configuration tab.",
+            foreground="gray",
+        ).pack(anchor=tk.W)
+        ttk.Button(
+            cfg_link, text="Load Settings from Config File...",
+            command=self._train_load_from_config,
+        ).pack(anchor=tk.W, pady=(2, 0))
+
+        # ---- Buttons ----
+        btn_frame = ttk.Frame(body)
+        btn_frame.pack(fill=tk.X, padx=10, pady=5)
 
         self.btn_train = ttk.Button(
-            ctrl_frame, text="Start Training", command=self._start_training
+            btn_frame, text="Start Training", command=self._start_training
         )
-        self.btn_train.pack(side=tk.LEFT, padx=10)
+        self.btn_train.pack(side=tk.LEFT, padx=5)
 
         self.btn_stop = ttk.Button(
-            ctrl_frame, text="Stop", command=self._stop_training, state=tk.DISABLED
+            btn_frame, text="Stop", command=self._stop_training, state=tk.DISABLED
         )
         self.btn_stop.pack(side=tk.LEFT, padx=5)
 
         # Progress
-        self.train_progress = ttk.Progressbar(tab, mode="indeterminate")
+        self.train_progress = ttk.Progressbar(body, mode="indeterminate")
         self.train_progress.pack(fill=tk.X, padx=10, pady=5)
 
         self.train_status = tk.StringVar(value="Ready")
-        ttk.Label(tab, textvariable=self.train_status).pack(padx=10, anchor=tk.W)
+        ttk.Label(body, textvariable=self.train_status).pack(padx=10, anchor=tk.W)
 
         # Log output
-        log_frame = ttk.LabelFrame(tab, text="Training Log", padding=5)
+        log_frame = ttk.LabelFrame(body, text="Training Log", padding=5)
         log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
 
         self.train_log = scrolledtext.ScrolledText(
-            log_frame, wrap=tk.WORD, height=20, state=tk.DISABLED, font=("Courier", 9)
+            log_frame, wrap=tk.WORD, height=15, state=tk.DISABLED, font=("Courier", 9)
         )
         self.train_log.pack(fill=tk.BOTH, expand=True)
 
         self._training_thread = None
         self._stop_event = threading.Event()
 
+    def _train_on_task_change(self, event=None):
+        """When task preset changes, auto-fill directories from preset config."""
+        task = self.train_task.get()
+        if task == "custom":
+            return
+        presets = {
+            "dic": PROJECT_ROOT / "configs" / "dic_wholecell.yaml",
+            "fluor": PROJECT_ROOT / "configs" / "fluor_nucleus.yaml",
+        }
+        paths = []
+        if task == "both":
+            paths = [presets["dic"], presets["fluor"]]
+        elif task in presets:
+            paths = [presets[task]]
+
+        if paths and paths[0].exists():
+            with open(paths[0]) as f:
+                cfg = yaml.safe_load(f)
+            data_cfg = cfg.get("DATA", {})
+            base = PROJECT_ROOT
+            self.train_img_dir.set(str(base / data_cfg.get("TRAIN", {}).get("PATH", "")))
+            self.train_mask_dir.set(str(base / data_cfg.get("TRAIN", {}).get("MASK_PATH", "")))
+            self.test_img_dir.set(str(base / data_cfg.get("TEST", {}).get("PATH", "")))
+            self.test_mask_dir.set(str(base / data_cfg.get("TEST", {}).get("MASK_PATH", "")))
+            self.train_img_filter.set(data_cfg.get("TRAIN", {}).get("IMAGE_FILTER", "_img"))
+            self.train_mask_filter.set(data_cfg.get("TRAIN", {}).get("MASK_FILTER", "_masks"))
+            ch = data_cfg.get("CHANNELS", [0, 0])
+            self.train_channels.set(str(ch))
+            train_cfg = cfg.get("TRAIN", {})
+            self.train_epochs.set(str(train_cfg.get("EPOCHS", 100)))
+            self.train_lr.set(str(train_cfg.get("LEARNING_RATE", 1e-5)))
+            self.train_batch.set(str(train_cfg.get("BATCH_SIZE", 1)))
+            self.train_wd.set(str(train_cfg.get("WEIGHT_DECAY", 0.1)))
+            self.train_save_every.set(str(train_cfg.get("SAVE_EVERY", 25)))
+            self.train_min_masks.set(str(train_cfg.get("MIN_TRAIN_MASKS", 5)))
+            paths_cfg = cfg.get("PATHS", {})
+            self.train_model_name.set(paths_cfg.get("MODEL_NAME", "cellpose_model"))
+            self.train_model_dir.set(str(base / paths_cfg.get("MODEL_DIR", "models")))
+
+    def _train_on_model_change(self):
+        choice = self.train_model_var.get()
+        if "Custom" in choice:
+            self.train_model_entry.config(state=tk.NORMAL)
+            self.train_model_btn.config(state=tk.NORMAL)
+        else:
+            self.train_model_entry.config(state=tk.DISABLED)
+            self.train_model_btn.config(state=tk.DISABLED)
+            self.train_model_path.set("")
+
+    def _train_browse_model(self):
+        path = filedialog.askopenfilename(
+            title="Select Pretrained Model",
+            initialdir=str(PROJECT_ROOT / "models"),
+        )
+        if path:
+            self.train_model_path.set(path)
+
+    def _train_load_from_config(self):
+        """Load all training tab fields from a YAML config file."""
+        path = filedialog.askopenfilename(
+            title="Load Training Settings from Config",
+            filetypes=[("YAML", "*.yaml *.yml"), ("All", "*.*")],
+            initialdir=str(PROJECT_ROOT / "configs"),
+        )
+        if not path:
+            return
+        try:
+            with open(path) as f:
+                cfg = yaml.safe_load(f)
+            data_cfg = cfg.get("DATA", {})
+            base = Path(path).parent.parent  # configs -> project root
+            self.train_img_dir.set(str(base / data_cfg.get("TRAIN", {}).get("PATH", "")))
+            self.train_mask_dir.set(str(base / data_cfg.get("TRAIN", {}).get("MASK_PATH", "")))
+            self.test_img_dir.set(str(base / data_cfg.get("TEST", {}).get("PATH", "")))
+            self.test_mask_dir.set(str(base / data_cfg.get("TEST", {}).get("MASK_PATH", "")))
+            self.train_img_filter.set(data_cfg.get("TRAIN", {}).get("IMAGE_FILTER", "_img"))
+            self.train_mask_filter.set(data_cfg.get("TRAIN", {}).get("MASK_FILTER", "_masks"))
+            ch = data_cfg.get("CHANNELS", [0, 0])
+            self.train_channels.set(str(ch))
+            train_cfg = cfg.get("TRAIN", {})
+            self.train_epochs.set(str(train_cfg.get("EPOCHS", 100)))
+            self.train_lr.set(str(train_cfg.get("LEARNING_RATE", 1e-5)))
+            self.train_batch.set(str(train_cfg.get("BATCH_SIZE", 1)))
+            self.train_wd.set(str(train_cfg.get("WEIGHT_DECAY", 0.1)))
+            self.train_save_every.set(str(train_cfg.get("SAVE_EVERY", 25)))
+            self.train_min_masks.set(str(train_cfg.get("MIN_TRAIN_MASKS", 5)))
+            aug_cfg = cfg.get("AUGMENTATION", {})
+            self.train_augment.set(aug_cfg.get("ENABLE", True))
+            sys_cfg = cfg.get("SYSTEM", {})
+            self.train_use_gpu.set(sys_cfg.get("NUM_GPUS", 1) > 0)
+            paths_cfg = cfg.get("PATHS", {})
+            self.train_model_name.set(paths_cfg.get("MODEL_NAME", "cellpose_model"))
+            self.train_model_dir.set(str(base / paths_cfg.get("MODEL_DIR", "models")))
+            model_cfg = cfg.get("MODEL", {})
+            pretrained = model_cfg.get("PRETRAINED_MODEL")
+            if pretrained:
+                self.train_model_var.set("Custom model...")
+                self.train_model_path.set(str(pretrained))
+            else:
+                self.train_model_var.set("cpsam (default)")
+            self.train_task.set("custom")
+            logger.info(f"Loaded training settings from {path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load config:\n{e}")
+
+    def _build_train_config_from_gui(self) -> dict:
+        """Build a full training config dict from the Training tab GUI fields."""
+        channels = [0, 0]
+        try:
+            channels = yaml.safe_load(self.train_channels.get())
+        except Exception:
+            pass
+        diameter = None
+        d_str = self.train_diameter.get().strip().lower()
+        if d_str not in ("null", "none", "auto", ""):
+            try:
+                diameter = float(d_str)
+            except ValueError:
+                pass
+        pretrained = None
+        if "Custom" in self.train_model_var.get() and self.train_model_path.get():
+            pretrained = self.train_model_path.get()
+
+        return {
+            "SYSTEM": {
+                "NUM_GPUS": 1 if self.train_use_gpu.get() else 0,
+                "NUM_CPUS": 4,
+                "SEED": 42,
+            },
+            "DATA": {
+                "TRAIN": {
+                    "PATH": self.train_img_dir.get(),
+                    "MASK_PATH": self.train_mask_dir.get(),
+                    "IMAGE_FILTER": self.train_img_filter.get(),
+                    "MASK_FILTER": self.train_mask_filter.get(),
+                },
+                "TEST": {
+                    "PATH": self.test_img_dir.get(),
+                    "MASK_PATH": self.test_mask_dir.get(),
+                    "IMAGE_FILTER": self.train_img_filter.get(),
+                    "MASK_FILTER": self.train_mask_filter.get(),
+                },
+                "CHANNELS": channels,
+                "NORMALIZE": True,
+            },
+            "AUGMENTATION": {
+                "ENABLE": self.train_augment.get(),
+                "RANDOM_FLIP": True,
+                "RANDOM_ROTATION": {"ENABLE": True, "DEGREES": 180},
+                "ELASTIC_DEFORM": {"ENABLE": True, "ALPHA": [20, 40], "SIGMA": [5, 7]},
+                "GAUSSIAN_NOISE": {"ENABLE": True, "MEAN": 0.0, "STD": 0.05},
+                "BRIGHTNESS_CONTRAST": {
+                    "ENABLE": True,
+                    "BRIGHTNESS_RANGE": [-0.1, 0.1],
+                    "CONTRAST_RANGE": [0.9, 1.1],
+                },
+            },
+            "MODEL": {
+                "BACKEND": "cellpose",
+                "PRETRAINED_MODEL": pretrained,
+                "ARCHITECTURE": "cpsam",
+            },
+            "TRAIN": {
+                "ENABLE": True,
+                "EPOCHS": int(self.train_epochs.get()),
+                "LEARNING_RATE": float(self.train_lr.get()),
+                "WEIGHT_DECAY": float(self.train_wd.get()),
+                "BATCH_SIZE": int(self.train_batch.get()),
+                "OPTIMIZER": "adam",
+                "SAVE_EVERY": int(self.train_save_every.get()),
+                "MIN_TRAIN_MASKS": int(self.train_min_masks.get()),
+            },
+            "INFERENCE": {
+                "ENABLE": True,
+                "DIAMETER": diameter,
+                "FLOW_THRESHOLD": 0.4,
+                "CELLPROB_THRESHOLD": 0.0,
+                "NORMALIZE": {"TILE_NORM_BLOCKSIZE": 128},
+            },
+            "PATHS": {
+                "MODEL_DIR": self.train_model_dir.get(),
+                "RESULT_DIR": str(Path(self.train_model_dir.get()).parent / "results"),
+                "MODEL_NAME": self.train_model_name.get(),
+            },
+        }
+
     def _start_training(self):
         task = self.train_task.get()
 
-        if task == "custom" and not self.yaml_config:
-            messagebox.showwarning(
-                "No Config", "Load a config in the Configuration tab first."
-            )
-            return
+        if task == "custom":
+            # Validate that at least training image dir is set
+            if not self.train_img_dir.get():
+                messagebox.showwarning(
+                    "Missing Data", "Set the Train Images directory."
+                )
+                return
 
         self.btn_train.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
@@ -3217,9 +3743,12 @@ class SegmentationGUI(tk.Tk):
                 configs_to_run.append(str(PROJECT_ROOT / "configs" / "dic_wholecell.yaml"))
                 configs_to_run.append(str(PROJECT_ROOT / "configs" / "fluor_nucleus.yaml"))
             elif task == "custom":
-                # Use config from GUI editor
-                self._read_params_into_config()
-                configs_to_run.append(self.yaml_config_path)
+                # Build config from GUI fields and run directly
+                gui_cfg = self._build_train_config_from_gui()
+                logger.info("Training with settings from Training tab")
+                train_cellpose_model(gui_cfg)
+                self.log_queue.put("__TRAINING_DONE__")
+                return
 
             for cfg_path in configs_to_run:
                 if self._stop_event.is_set():
