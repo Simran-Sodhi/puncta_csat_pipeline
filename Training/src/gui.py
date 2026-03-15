@@ -132,6 +132,7 @@ class SegmentationGUI(tk.Tk):
         self.tab_config = ttk.Frame(self.notebook)
         self.tab_train = ttk.Frame(self.notebook)
         self.tab_eval = ttk.Frame(self.notebook)
+        self.tab_compare = ttk.Frame(self.notebook)
 
         self.notebook.add(self.tab_nd2, text="  ND2 Conversion  ")
         self.notebook.add(self.tab_deconv, text="  Deconvolution  ")
@@ -142,6 +143,7 @@ class SegmentationGUI(tk.Tk):
         self.notebook.add(self.tab_config, text="  Configuration  ")
         self.notebook.add(self.tab_train, text="  Training  ")
         self.notebook.add(self.tab_eval, text="  Evaluation  ")
+        self.notebook.add(self.tab_compare, text="  Mask Comparison  ")
 
         self._build_nd2_tab()
         self._build_deconv_tab()
@@ -152,6 +154,7 @@ class SegmentationGUI(tk.Tk):
         self._build_config_tab()
         self._build_train_tab()
         self._build_eval_tab()
+        self._build_compare_tab()
 
     # ==================================================================
     # TAB: ND2 CONVERSION
@@ -3951,6 +3954,311 @@ class SegmentationGUI(tk.Tk):
                 self.eval_results.config(state=tk.DISABLED)
 
     # ==================================================================
+    # TAB 5: MASK COMPARISON
+    # ==================================================================
+    def _build_compare_tab(self):
+        tab = self.tab_compare
+
+        ttk.Label(
+            tab,
+            text="Compare two segmentation masks (ground truth vs model output).\n"
+                 "Supports _seg.npy (Cellpose) and .tif mask formats.",
+            foreground="gray",
+        ).pack(anchor=tk.W, padx=10, pady=(10, 5))
+
+        # ---- Input files ----
+        io_frame = ttk.LabelFrame(tab, text="Input Files", padding=10)
+        io_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(io_frame, text="Original Image:").grid(row=0, column=0, sticky=tk.W, pady=3)
+        self.cmp_image_var = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.cmp_image_var, width=55).grid(
+            row=0, column=1, padx=5, pady=3, sticky=tk.EW
+        )
+        ttk.Button(
+            io_frame, text="Browse...",
+            command=lambda: self._cmp_browse_file(
+                self.cmp_image_var, "Select Original Image",
+                [("Image files", "*.tif *.tiff *.ome.tif *.png"), ("All", "*.*")],
+            ),
+        ).grid(row=0, column=2, pady=3)
+
+        ttk.Label(io_frame, text="Mask 1 (Ground Truth):").grid(row=1, column=0, sticky=tk.W, pady=3)
+        self.cmp_mask1_var = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.cmp_mask1_var, width=55).grid(
+            row=1, column=1, padx=5, pady=3, sticky=tk.EW
+        )
+        ttk.Button(
+            io_frame, text="Browse...",
+            command=lambda: self._cmp_browse_file(
+                self.cmp_mask1_var, "Select Mask 1 (Ground Truth)",
+                [("Mask files", "*.npy *.tif *.tiff"), ("All", "*.*")],
+            ),
+        ).grid(row=1, column=2, pady=3)
+
+        ttk.Label(io_frame, text="Mask 2 (Model Output):").grid(row=2, column=0, sticky=tk.W, pady=3)
+        self.cmp_mask2_var = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.cmp_mask2_var, width=55).grid(
+            row=2, column=1, padx=5, pady=3, sticky=tk.EW
+        )
+        ttk.Button(
+            io_frame, text="Browse...",
+            command=lambda: self._cmp_browse_file(
+                self.cmp_mask2_var, "Select Mask 2 (Model Output)",
+                [("Mask files", "*.npy *.tif *.tiff"), ("All", "*.*")],
+            ),
+        ).grid(row=2, column=2, pady=3)
+
+        io_frame.columnconfigure(1, weight=1)
+
+        # ---- Output ----
+        out_frame = ttk.LabelFrame(tab, text="Output", padding=10)
+        out_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(out_frame, text="Report Directory:").grid(row=0, column=0, sticky=tk.W, pady=3)
+        self.cmp_output_var = tk.StringVar(value="comparison_report")
+        ttk.Entry(out_frame, textvariable=self.cmp_output_var, width=55).grid(
+            row=0, column=1, padx=5, pady=3, sticky=tk.EW
+        )
+        ttk.Button(
+            out_frame, text="Browse...",
+            command=lambda: self._browse_dir(self.cmp_output_var),
+        ).grid(row=0, column=2, pady=3)
+
+        self.cmp_open_fig = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            out_frame, text="Open comparison figure when done",
+            variable=self.cmp_open_fig,
+        ).grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=2)
+
+        out_frame.columnconfigure(1, weight=1)
+
+        # ---- Buttons ----
+        btn_frame = ttk.Frame(tab)
+        btn_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        self.btn_cmp_run = ttk.Button(
+            btn_frame, text="Run Comparison", command=self._cmp_run
+        )
+        self.btn_cmp_run.pack(side=tk.LEFT, padx=5)
+
+        self.btn_cmp_quick = ttk.Button(
+            btn_frame, text="Quick Summary (no figure)", command=self._cmp_run_quick
+        )
+        self.btn_cmp_quick.pack(side=tk.LEFT, padx=5)
+
+        # ---- Progress ----
+        self.cmp_progress = ttk.Progressbar(tab, mode="indeterminate")
+        self.cmp_progress.pack(fill=tk.X, padx=10, pady=5)
+
+        self.cmp_status = tk.StringVar(value="Ready")
+        ttk.Label(tab, textvariable=self.cmp_status).pack(padx=10, anchor=tk.W)
+
+        # ---- Results ----
+        results_frame = ttk.LabelFrame(tab, text="Results", padding=5)
+        results_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
+
+        self.cmp_results = scrolledtext.ScrolledText(
+            results_frame, wrap=tk.WORD, height=15, state=tk.DISABLED,
+            font=("Courier", 9),
+        )
+        self.cmp_results.pack(fill=tk.BOTH, expand=True)
+
+    def _cmp_browse_file(self, var, title, filetypes):
+        p = filedialog.askopenfilename(title=title, filetypes=filetypes)
+        if p:
+            var.set(p)
+
+    def _cmp_validate(self) -> bool:
+        if not self.cmp_image_var.get() or not os.path.isfile(self.cmp_image_var.get()):
+            messagebox.showwarning("Missing", "Select a valid original image file.")
+            return False
+        if not self.cmp_mask1_var.get() or not os.path.isfile(self.cmp_mask1_var.get()):
+            messagebox.showwarning("Missing", "Select a valid Mask 1 file.")
+            return False
+        if not self.cmp_mask2_var.get() or not os.path.isfile(self.cmp_mask2_var.get()):
+            messagebox.showwarning("Missing", "Select a valid Mask 2 file.")
+            return False
+        return True
+
+    def _cmp_set_running(self, running: bool):
+        state = tk.DISABLED if running else tk.NORMAL
+        self.btn_cmp_run.config(state=state)
+        self.btn_cmp_quick.config(state=state)
+        if running:
+            self.cmp_progress.start(10)
+        else:
+            self.cmp_progress.stop()
+
+    @staticmethod
+    def _cmp_format_results(results: dict) -> str:
+        import numpy as np
+        b = results["binary"]
+        matches = results["matches"]
+        ap = results["ap"]
+        s1 = results["stats_mask1"]
+        s2 = results["stats_mask2"]
+        matched_ious = [iou for _, _, iou in matches]
+
+        lines = []
+        lines.append("=" * 55)
+        lines.append("          MASK COMPARISON RESULTS")
+        lines.append("=" * 55)
+        lines.append("")
+        lines.append("  GLOBAL METRICS")
+        lines.append(f"  {'Binary IoU:':<28} {b['binary_iou']:.4f}")
+        lines.append(f"  {'Binary Dice:':<28} {b['binary_dice']:.4f}")
+        lines.append("")
+        lines.append("  OBJECT COUNTS")
+        lines.append(f"  {'Objects in Mask 1:':<28} {s1['n_objects']}")
+        lines.append(f"  {'Objects in Mask 2:':<28} {s2['n_objects']}")
+        lines.append(f"  {'Matched objects:':<28} {len(matches)}")
+        lines.append(f"  {'Unmatched in Mask 1:':<28} {s1['n_objects'] - len(matches)}")
+        lines.append(f"  {'Unmatched in Mask 2:':<28} {s2['n_objects'] - len(matches)}")
+        lines.append("")
+        lines.append("  PER-OBJECT IoU")
+        if matched_ious:
+            lines.append(f"  {'Mean IoU:':<28} {np.mean(matched_ious):.4f}")
+            lines.append(f"  {'Median IoU:':<28} {np.median(matched_ious):.4f}")
+            lines.append(f"  {'Min IoU:':<28} {np.min(matched_ious):.4f}")
+            lines.append(f"  {'Max IoU:':<28} {np.max(matched_ious):.4f}")
+        else:
+            lines.append("  No matched objects found.")
+        lines.append("")
+        lines.append("  AVERAGE PRECISION")
+        for t, v in ap.items():
+            lines.append(f"  IoU >= {t}:")
+            lines.append(f"    {'Precision:':<24} {v['precision']:.4f}")
+            lines.append(f"    {'Recall:':<24} {v['recall']:.4f}")
+            lines.append(f"    {'F1 Score:':<24} {v['f1']:.4f}")
+            lines.append(f"    {'TP / FP / FN:':<24} {v['tp']} / {v['fp']} / {v['fn']}")
+        lines.append("")
+        lines.append("  INTENSITY (under mask)")
+        lines.append(f"  {'Mask 1 FG mean:':<28} {s1['fg_mean']:.1f}")
+        lines.append(f"  {'Mask 2 FG mean:':<28} {s2['fg_mean']:.1f}")
+        lines.append(f"  {'Mask 1 FG pixels:':<28} {s1['total_fg_px']}")
+        lines.append(f"  {'Mask 2 FG pixels:':<28} {s2['total_fg_px']}")
+        lines.append("")
+
+        if matched_ious:
+            sorted_m = sorted(matches, key=lambda x: x[2], reverse=True)
+            lines.append("  TOP 10 BEST MATCHED OBJECTS")
+            lines.append(f"  {'M1 Label':<12}{'M2 Label':<12}{'IoU':<10}")
+            lines.append("  " + "-" * 34)
+            for l1, l2, iou in sorted_m[:10]:
+                lines.append(f"  {l1:<12}{l2:<12}{iou:.4f}")
+
+            if len(sorted_m) > 10:
+                lines.append("")
+                lines.append("  BOTTOM 10 WORST MATCHED OBJECTS")
+                lines.append(f"  {'M1 Label':<12}{'M2 Label':<12}{'IoU':<10}")
+                lines.append("  " + "-" * 34)
+                for l1, l2, iou in sorted_m[-10:]:
+                    lines.append(f"  {l1:<12}{l2:<12}{iou:.4f}")
+
+        lines.append("")
+        lines.append("=" * 55)
+        return "\n".join(lines)
+
+    def _cmp_run(self):
+        if not self._cmp_validate():
+            return
+        self._cmp_set_running(True)
+        self.cmp_status.set("Running comparison...")
+        self.cmp_results.config(state=tk.NORMAL)
+        self.cmp_results.delete("1.0", tk.END)
+        self.cmp_results.config(state=tk.DISABLED)
+
+        def worker():
+            try:
+                from compare_masks import compare
+                results = compare(
+                    self.cmp_image_var.get(),
+                    self.cmp_mask1_var.get(),
+                    self.cmp_mask2_var.get(),
+                    self.cmp_output_var.get(),
+                )
+                text = self._cmp_format_results(results)
+                self.log_queue.put(f"__CMP_DONE__{text}")
+
+                if self.cmp_open_fig.get():
+                    fig_path = os.path.join(self.cmp_output_var.get(), "comparison.png")
+                    if os.path.isfile(fig_path):
+                        self.log_queue.put(f"__CMP_OPEN__{fig_path}")
+            except Exception as e:
+                logger.exception("Mask comparison failed")
+                self.log_queue.put(f"__CMP_ERROR__{e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _cmp_run_quick(self):
+        if not self._cmp_validate():
+            return
+        self._cmp_set_running(True)
+        self.cmp_status.set("Computing metrics...")
+        self.cmp_results.config(state=tk.NORMAL)
+        self.cmp_results.delete("1.0", tk.END)
+        self.cmp_results.config(state=tk.DISABLED)
+
+        def worker():
+            try:
+                from compare_masks import (
+                    load_image, load_mask, binary_metrics,
+                    match_objects, intensity_stats, average_precision,
+                )
+                image = load_image(self.cmp_image_var.get())
+                mask1 = load_mask(self.cmp_mask1_var.get())
+                mask2 = load_mask(self.cmp_mask2_var.get())
+
+                binary = binary_metrics(mask1, mask2)
+                matches, _, _ = match_objects(mask1, mask2)
+                ap = average_precision(mask1, mask2)
+                stats1 = intensity_stats(image, mask1)
+                stats2 = intensity_stats(image, mask2)
+
+                results = {
+                    "binary": binary,
+                    "matches": matches,
+                    "ap": ap,
+                    "stats_mask1": stats1,
+                    "stats_mask2": stats2,
+                }
+                text = self._cmp_format_results(results)
+                self.log_queue.put(f"__CMP_DONE__{text}")
+            except Exception as e:
+                logger.exception("Quick comparison failed")
+                self.log_queue.put(f"__CMP_ERROR__{e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_cmp_finished(self, text: str | None = None, error: str | None = None):
+        self._cmp_set_running(False)
+        if error:
+            self.cmp_status.set(f"Error: {error}")
+            messagebox.showerror("Comparison Error", str(error))
+        else:
+            self.cmp_status.set("Comparison complete")
+            if text:
+                self.cmp_results.config(state=tk.NORMAL)
+                self.cmp_results.insert(tk.END, text)
+                self.cmp_results.see("1.0")
+                self.cmp_results.config(state=tk.DISABLED)
+
+    @staticmethod
+    def _cmp_open_figure(path: str):
+        import subprocess
+        import platform
+        try:
+            if platform.system() == "Darwin":
+                subprocess.Popen(["open", path])
+            elif platform.system() == "Windows":
+                os.startfile(path)
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception:
+            pass
+
+    # ==================================================================
     # LOGGING
     # ==================================================================
     def _setup_logging(self):
@@ -4084,6 +4392,16 @@ class SegmentationGUI(tk.Tk):
                 self._on_eval_finished(error=msg[len("__EVAL_ERROR__"):])
                 continue
 
+            # -- Mask Comparison --
+            if msg.startswith("__CMP_DONE__"):
+                self._on_cmp_finished(text=msg[len("__CMP_DONE__"):])
+                continue
+            if msg.startswith("__CMP_ERROR__"):
+                self._on_cmp_finished(error=msg[len("__CMP_ERROR__"):])
+                continue
+            if msg.startswith("__CMP_OPEN__"):
+                self._cmp_open_figure(msg[len("__CMP_OPEN__"):])
+                continue
 
             # Append to training log
             self.train_log.config(state=tk.NORMAL)
