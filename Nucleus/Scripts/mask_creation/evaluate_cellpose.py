@@ -77,7 +77,7 @@ PRESETS = {
         "use_dic_norm": False,
     },
     "puncta": {
-        "diameter": 20,
+        "diameter": 0,
         "channel_index": 1,     # GFP
         "z_index": 0,
         "min_size": 0,

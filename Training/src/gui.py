@@ -1216,7 +1216,7 @@ class SegmentationGUI(tk.Tk):
             self.seg_dic_norm_var.set(False)
             self.seg_cyto_frame.pack_forget()
         elif mode == "puncta":
-            self.seg_diameter.set("20")
+            self.seg_diameter.set("0")
             self.seg_channel.set(1)
             self.seg_nuc_channel.set(0)
             self.seg_min_size.set(0)

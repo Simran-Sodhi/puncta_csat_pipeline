@@ -391,7 +391,7 @@ class Step2Frame(ttk.LabelFrame):
             self.dic_norm_var.set(False)
             self.cyto_frame.pack_forget()
         elif mode == "puncta":
-            self.diameter.var.set("20")
+            self.diameter.var.set("0")
             self.channel_idx.var.set("1")    # GFP
             self.z_idx.var.set("0")
             self.min_size.var.set("0")
