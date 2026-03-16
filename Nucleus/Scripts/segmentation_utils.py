@@ -619,6 +619,163 @@ def run_cellpose(img2d, model, diameter=None, batch_size=1, normalize=True,
     return masks, flows
 
 
+def merge_masks(mask_list, iou_threshold=0.5):
+    """
+    Merge label masks from multiple Cellpose passes into a single mask.
+
+    Strategy: start from the pass with the most detections, then add
+    objects from subsequent passes only if they do not significantly
+    overlap with objects already in the merged mask.
+
+    Parameters
+    ----------
+    mask_list : list of np.ndarray
+        List of (Y, X) integer label masks from different passes.
+    iou_threshold : float
+        Maximum IoU (intersection-over-union) with any existing object
+        before a candidate is considered a duplicate and discarded.
+        Lower = stricter deduplication (default 0.5).
+
+    Returns
+    -------
+    merged : np.ndarray (Y, X), int32
+        Merged label mask with consecutive labels.
+    """
+    from skimage.measure import regionprops
+
+    if not mask_list:
+        raise ValueError("mask_list is empty")
+    if len(mask_list) == 1:
+        return mask_list[0].astype(np.int32)
+
+    # Sort passes: most detections first (primary mask)
+    sorted_masks = sorted(mask_list, key=lambda m: int(m.max()), reverse=True)
+
+    merged = sorted_masks[0].astype(np.int32, copy=True)
+    next_label = int(merged.max()) + 1
+
+    for extra_mask in sorted_masks[1:]:
+        for prop in regionprops(extra_mask.astype(np.int32)):
+            candidate = extra_mask == prop.label  # boolean mask of candidate
+
+            # Check overlap with every existing object in merged
+            overlapping_labels = np.unique(merged[candidate])
+            overlapping_labels = overlapping_labels[overlapping_labels != 0]
+
+            if len(overlapping_labels) == 0:
+                # No overlap at all — add directly
+                merged[candidate] = next_label
+                next_label += 1
+                continue
+
+            # Compute IoU against each overlapping existing object
+            is_duplicate = False
+            for existing_lab in overlapping_labels:
+                existing = merged == existing_lab
+                intersection = np.logical_and(candidate, existing).sum()
+                union = np.logical_or(candidate, existing).sum()
+                iou = intersection / union if union > 0 else 0.0
+                if iou >= iou_threshold:
+                    is_duplicate = True
+                    break
+
+            if not is_duplicate:
+                # New object — only write to pixels not already claimed
+                free_pixels = candidate & (merged == 0)
+                if free_pixels.sum() > 0:
+                    merged[free_pixels] = next_label
+                    next_label += 1
+
+    # Relabel consecutively
+    merged, _, _ = relabel_sequential(merged)
+    return merged.astype(np.int32)
+
+
+def parse_diameters(diam_str):
+    """
+    Parse a diameter string into a list of float-or-None values.
+
+    Accepts:
+      - "auto", "0", "none", ""  ->  [None]
+      - "20"                     ->  [20.0]
+      - "20,100"                 ->  [20.0, 100.0]
+      - "20, 100, auto"         ->  [20.0, 100.0, None]
+
+    Returns
+    -------
+    diameters : list
+        List of float values or None (for auto-estimate).
+    """
+    if diam_str is None:
+        return [None]
+    diam_str = str(diam_str).strip().lower()
+    if not diam_str or diam_str in ("auto", "none"):
+        return [None]
+
+    parts = [p.strip() for p in diam_str.split(",")]
+    diameters = []
+    for p in parts:
+        if p in ("0", "", "auto", "none"):
+            diameters.append(None)
+        else:
+            diameters.append(float(p))
+    return diameters
+
+
+def run_cellpose_multipass(img2d, model, diameters, batch_size=1,
+                           normalize=True, flow_threshold=0.4,
+                           cellprob_threshold=0.0, augment=False,
+                           iou_threshold=0.5):
+    """
+    Run Cellpose at multiple diameters and merge the results.
+
+    This solves the mixed-size object problem: small puncta need a small
+    diameter while large puncta need a large diameter.  Each diameter
+    produces a separate mask, and the masks are merged with
+    IoU-based deduplication.
+
+    Parameters
+    ----------
+    img2d : np.ndarray (Y, X)
+        Normalized 2D image.
+    model : cellpose model
+        Pre-loaded Cellpose model.
+    diameters : list
+        List of diameters (float or None).  Each value triggers a
+        separate Cellpose pass.
+    iou_threshold : float
+        IoU threshold for deduplication during merge (default 0.5).
+
+    Returns
+    -------
+    masks : np.ndarray (Y, X), int32
+        Merged label mask.
+    flows : list
+        Flows from the first (primary) pass.
+    """
+    if len(diameters) == 1:
+        return run_cellpose(
+            img2d, model, diameter=diameters[0], batch_size=batch_size,
+            normalize=normalize, flow_threshold=flow_threshold,
+            cellprob_threshold=cellprob_threshold, augment=augment,
+        )
+
+    mask_list = []
+    first_flows = []
+    for i, diam in enumerate(diameters):
+        masks_i, flows_i = run_cellpose(
+            img2d, model, diameter=diam, batch_size=batch_size,
+            normalize=normalize, flow_threshold=flow_threshold,
+            cellprob_threshold=cellprob_threshold, augment=augment,
+        )
+        mask_list.append(masks_i)
+        if i == 0:
+            first_flows = flows_i
+
+    merged = merge_masks(mask_list, iou_threshold=iou_threshold)
+    return merged, first_flows
+
+
 # ------------------------------------------------------------------ #
 #  File I/O helpers
 # ------------------------------------------------------------------ #

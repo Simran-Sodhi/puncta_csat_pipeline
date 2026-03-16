@@ -1216,7 +1216,7 @@ class SegmentationGUI(tk.Tk):
             self.seg_dic_norm_var.set(False)
             self.seg_cyto_frame.pack_forget()
         elif mode == "puncta":
-            self.seg_diameter.set("0")
+            self.seg_diameter.set("20, 100")
             self.seg_channel.set(1)
             self.seg_nuc_channel.set(0)
             self.seg_min_size.set(0)
@@ -1395,8 +1395,7 @@ class SegmentationGUI(tk.Tk):
             return
 
         mode = self.seg_mode_var.get()
-        diam_str = self.seg_diameter.get().strip().lower()
-        diameter = None if diam_str in ("0", "", "auto", "none") else float(diam_str)
+        diam_str = self.seg_diameter.get().strip()
         channel = self.seg_channel.get()
         z_val = self.seg_z_idx.get().strip()
         z = int(z_val) if z_val else 0
@@ -1434,7 +1433,7 @@ class SegmentationGUI(tk.Tk):
 
         norm_label = f"DIC (CLAHE clip={clahe_clip:.3f})" if use_dic_norm else "LUT"
         self._seg_log_append(
-            f"Segmentation ({mode}): model={model_type}, diameter={diameter}, "
+            f"Segmentation ({mode}): model={model_type}, diameter={diam_str}, "
             f"channel={channel}, z={z}, flow={flow_thr}, cellprob={cellprob_thr}, "
             f"min_size={min_sz}, max_size={max_sz}, solidity={min_sol}, "
             f"smooth={smooth_r}, norm={norm_label}, augment={augment}"
@@ -1449,7 +1448,8 @@ class SegmentationGUI(tk.Tk):
                 from segmentation_utils import (
                     load_image_2d, auto_lut_clip, normalize_dic,
                     ensure_2d,
-                    load_cellpose_model, run_cellpose,
+                    load_cellpose_model, run_cellpose_multipass,
+                    parse_diameters,
                     postprocess_mask,
                     save_mask, save_seg_npy, save_triptych,
                     save_cytoplasm_triptych,
@@ -1485,8 +1485,9 @@ class SegmentationGUI(tk.Tk):
                         else:
                             img_norm = auto_lut_clip(img2d)
 
-                        masks, flows = run_cellpose(
-                            img_norm, model=model, diameter=diameter,
+                        diameters = parse_diameters(diam_str)
+                        masks, flows = run_cellpose_multipass(
+                            img_norm, model=model, diameters=diameters,
                             flow_threshold=flow_thr,
                             cellprob_threshold=cellprob_thr,
                             augment=augment,
@@ -1505,14 +1506,14 @@ class SegmentationGUI(tk.Tk):
                             if nuc_path is None:
                                 self._seg_log_append_q(f"    [WARN] No nucleus mask for {stem}")
                                 save_mask(masks, outdir / f"{stem}_cell_masks.tif")
-                                save_seg_npy(img_norm, masks, flows, img_path.name, img_path.parent, diameter)
+                                save_seg_npy(img_norm, masks, flows, img_path.name, img_path.parent, diameters[0])
                                 save_triptych(img_norm, masks, trip_dir / f"{stem}_cell_triptych.png")
                             else:
                                 nuc_m = ensure_2d(tiff_io.imread(str(nuc_path)))
                                 if nuc_m.shape != masks.shape:
                                     self._seg_log_append_q(f"    [WARN] Shape mismatch, skipping cyto")
                                     save_mask(masks, outdir / f"{stem}_cell_masks.tif")
-                                    save_seg_npy(img_norm, masks, flows, img_path.name, img_path.parent, diameter)
+                                    save_seg_npy(img_norm, masks, flows, img_path.name, img_path.parent, diameters[0])
                                 else:
                                     cyto_mask, kept, orphans = compute_cytoplasm_mask(
                                         masks, nuc_m,
@@ -1525,15 +1526,15 @@ class SegmentationGUI(tk.Tk):
                                     )
                                     save_mask(masks, outdir / f"{stem}_cell_masks.tif")
                                     save_mask(cyto_mask, outdir / f"{stem}_cyto_masks.tif")
-                                    save_seg_npy(img_norm, masks, flows, img_path.name, img_path.parent, diameter)
-                                    save_seg_npy(img_norm, cyto_mask, flows, f"{stem}_cyto", outdir, diameter)
+                                    save_seg_npy(img_norm, masks, flows, img_path.name, img_path.parent, diameters[0])
+                                    save_seg_npy(img_norm, cyto_mask, flows, f"{stem}_cyto", outdir, diameters[0])
                                     save_cytoplasm_triptych(
                                         img_norm, masks, nuc_m, cyto_mask,
                                         trip_dir / f"{stem}_cyto_triptych.png"
                                     )
                         else:
                             save_mask(masks, outdir / f"{stem}_cyto3_masks.tif")
-                            save_seg_npy(img_norm, masks, flows, img_path.name, img_path.parent, diameter)
+                            save_seg_npy(img_norm, masks, flows, img_path.name, img_path.parent, diameters[0])
                             save_triptych(img_norm, masks, trip_dir / f"{stem}_triptych.png")
 
                         status = "OK" if n_objects > 0 else "No signal"

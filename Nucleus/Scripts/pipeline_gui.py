@@ -279,7 +279,8 @@ class Step2Frame(ttk.LabelFrame):
             param_frame, "Diameter (px):", default=0, dtype=float,
             tooltip="Approximate object diameter in pixels.\n"
                     "Cell (DIC): 0 = auto-estimate,\n"
-                    "Nucleus ~200, Puncta ~20."
+                    "Nucleus ~200, Puncta ~20.\n"
+                    "Comma-separated for multi-pass: 20, 100"
         )
         self.diameter.pack(side="left", padx=4)
 
@@ -391,7 +392,7 @@ class Step2Frame(ttk.LabelFrame):
             self.dic_norm_var.set(False)
             self.cyto_frame.pack_forget()
         elif mode == "puncta":
-            self.diameter.var.set("0")
+            self.diameter.var.set("20, 100")
             self.channel_idx.var.set("1")    # GFP
             self.z_idx.var.set("0")
             self.min_size.var.set("0")
@@ -418,10 +419,7 @@ class Step2Frame(ttk.LabelFrame):
             return
 
         mode = self.mode_var.get()
-        diameter = self.diameter.get()
-        # Treat 0 as None (auto-estimate) for diameter
-        if diameter == 0:
-            diameter = None
+        diam_str = self.diameter.var.get().strip()
         channel = self.channel_idx.get()
         z = self.z_idx.get()
         min_sz = self.min_size.get()
@@ -452,7 +450,7 @@ class Step2Frame(ttk.LabelFrame):
         norm_label = "DIC (CLAHE)" if use_dic_norm else "LUT"
         self.log(f"\n{'='*60}\n"
                  f"Step 2: Cellpose Segmentation ({mode})\n"
-                 f"  diameter={diameter}, channel={channel}, z={z}\n"
+                 f"  diameter={diam_str}, channel={channel}, z={z}\n"
                  f"  min_size={min_sz}, gpu={gpu}, remove_edges={rm_edges}\n"
                  f"  normalization={norm_label}")
         if is_cyto:
@@ -468,7 +466,8 @@ class Step2Frame(ttk.LabelFrame):
                 from segmentation_utils import (
                     load_image_2d, auto_lut_clip, normalize_dic,
                     ensure_2d,
-                    load_cellpose_model, run_cellpose,
+                    load_cellpose_model, run_cellpose_multipass,
+                    parse_diameters,
                     postprocess_mask,
                     save_mask, save_triptych,
                     save_cytoplasm_triptych,
@@ -504,8 +503,9 @@ class Step2Frame(ttk.LabelFrame):
                         else:
                             img_norm = auto_lut_clip(img2d)
 
-                        masks, _flows = run_cellpose(img_norm, model=model,
-                                             diameter=diameter)
+                        diameters = parse_diameters(diam_str)
+                        masks, _flows = run_cellpose_multipass(
+                            img_norm, model=model, diameters=diameters)
                         masks = postprocess_mask(masks,
                                                  min_size=min_sz,
                                                  remove_edges=rm_edges)

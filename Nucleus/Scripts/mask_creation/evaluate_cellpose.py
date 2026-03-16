@@ -43,7 +43,8 @@ from segmentation_utils import (
     normalize_dic,
     ensure_2d,
     load_cellpose_model,
-    run_cellpose,
+    run_cellpose_multipass,
+    parse_diameters,
     postprocess_mask,
     save_mask,
     save_triptych,
@@ -77,7 +78,7 @@ PRESETS = {
         "use_dic_norm": False,
     },
     "puncta": {
-        "diameter": 0,
+        "diameter": "20, 100",  # multi-pass: small + large puncta
         "channel_index": 1,     # GFP
         "z_index": 0,
         "min_size": 0,
@@ -150,8 +151,9 @@ def build_parser():
         help="Use GPU if available.",
     )
     parser.add_argument(
-        "--diameter", type=float, default=None,
-        help="Approximate object diameter in pixels (0 = auto-estimate).",
+        "--diameter", type=str, default=None,
+        help="Approximate object diameter in pixels (0 = auto-estimate). "
+             "Comma-separated for multi-pass: '20,100'.",
     )
     parser.add_argument(
         "--batch-size", type=int, default=1,
@@ -271,9 +273,10 @@ def main():
                     high_percentile=args.lut_high,
                 )
 
-            masks, _flows = run_cellpose(
+            diameters = parse_diameters(args.diameter)
+            masks, _flows = run_cellpose_multipass(
                 img_norm, model=model,
-                diameter=args.diameter,
+                diameters=diameters,
                 batch_size=args.batch_size,
             )
             masks = postprocess_mask(

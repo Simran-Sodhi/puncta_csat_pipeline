@@ -170,7 +170,8 @@ def preprocess_image(image, segment_channel=0, nuclear_channel=0,
 
 
 def generate_masks(image_dir, output_dir, segment_channel=0, nuclear_channel=0,
-                   model_path=None, diameter=None, flow_threshold=0.4,
+                   model_path=None, diameter=None, diameters=None,
+                   flow_threshold=0.4,
                    cellprob_threshold=0.0, lower_percentile=1.0, upper_percentile=99.0,
                    tile_blocksize_dic=128, invert_dic=False, use_gpu=True,
                    z_slice=None, progress_callback=None):
@@ -250,16 +251,32 @@ def generate_masks(image_dir, output_dir, segment_channel=0, nuclear_channel=0,
                 tile_blocksize_dic=tile_blocksize_dic, invert_dic=invert_dic,
             )
 
-            eval_kwargs = dict(
-                diameter=diameter,
-                flow_threshold=flow_threshold,
-                cellprob_threshold=cellprob_threshold,
-            )
-            if pass_channels:
-                eval_kwargs["channels"] = cp_channels
+            # Resolve diameter list for multi-pass support
+            try:
+                from segmentation_utils import parse_diameters, merge_masks
+            except ImportError:
+                # Add Nucleus/Scripts to path if not already available
+                _nuc_dir = Path(__file__).resolve().parent.parent.parent / "Nucleus" / "Scripts"
+                if _nuc_dir.is_dir():
+                    import sys as _sys
+                    _sys.path.insert(0, str(_nuc_dir))
+                from segmentation_utils import parse_diameters, merge_masks
+            diam_list = diameters if diameters else parse_diameters(diameter)
 
-            result = model.eval(preprocessed, **eval_kwargs)
-            mask = result[0]
+            mask_list = []
+            for diam in diam_list:
+                eval_kwargs = dict(
+                    diameter=diam,
+                    flow_threshold=flow_threshold,
+                    cellprob_threshold=cellprob_threshold,
+                )
+                if pass_channels:
+                    eval_kwargs["channels"] = cp_channels
+
+                result = model.eval(preprocessed, **eval_kwargs)
+                mask_list.append(result[0])
+
+            mask = merge_masks(mask_list) if len(mask_list) > 1 else mask_list[0]
 
             num_objects = int(mask.max())
             logger.info(f"  Found {num_objects} objects")
