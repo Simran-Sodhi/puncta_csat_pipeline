@@ -153,7 +153,7 @@ def build_parser():
     parser.add_argument(
         "--diameter", type=str, default=None,
         help="Object diameter in pixels. '0' or 'auto' = auto-estimate. "
-             "'auto-multi' = auto-estimate then run at 0.5x/1x/2x scales "
+             "'auto-multi' = auto-estimate then run at 0.5x/1x/2x/4x scales "
              "(best for mixed-size objects). Comma-separated for explicit "
              "multi-pass: '20,100'.",
     )

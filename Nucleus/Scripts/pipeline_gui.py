@@ -279,7 +279,7 @@ class Step2Frame(ttk.LabelFrame):
             param_frame, "Diameter (px):", default=0, dtype=float,
             tooltip="Approximate object diameter in pixels.\n"
                     "0 or auto: single-pass auto-estimate.\n"
-                    "auto-multi: auto-estimate + run at 0.5x, 1x, 2x\n"
+                    "auto-multi: auto-estimate + run at 0.5x, 1x, 2x, 4x\n"
                     "  scales (best for mixed-size objects).\n"
                     "Comma-separated for explicit multi-pass: 20, 100"
         )

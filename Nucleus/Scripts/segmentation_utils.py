@@ -791,7 +791,7 @@ def run_cellpose_multipass(img2d, model, diameters, batch_size=1,
                            normalize=True, flow_threshold=0.4,
                            cellprob_threshold=0.0, augment=False,
                            overlap_threshold=0.3,
-                           auto_scale_factors=(0.5, 1.0, 2.0)):
+                           auto_scale_factors=(0.5, 1.0, 2.0, 4.0)):
     """
     Run Cellpose at multiple diameters and merge the results.
 
@@ -816,9 +816,9 @@ def run_cellpose_multipass(img2d, model, diameters, batch_size=1,
         object (default 0.3).  The larger-area mask wins.
     auto_scale_factors : tuple of float
         Scale factors applied to the auto-estimated diameter when
-        ``diameters="auto-multi"`` (default ``(0.5, 1.0, 2.0)``).
-        For example, if auto-estimate is 40px, passes run at
-        20px, 40px, and 80px.
+        ``diameters="auto-multi"`` (default ``(0.5, 1.0, 2.0, 4.0)``).
+        For example, if auto-estimate is 30px, passes run at
+        15px, 30px, 60px, and 120px.
 
     Returns
     -------
