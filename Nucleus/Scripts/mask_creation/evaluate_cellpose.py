@@ -78,7 +78,7 @@ PRESETS = {
         "use_dic_norm": False,
     },
     "puncta": {
-        "diameter": "20, 100",  # multi-pass: small + large puncta
+        "diameter": "auto-multi",  # auto-estimate + multi-scale passes
         "channel_index": 1,     # GFP
         "z_index": 0,
         "min_size": 0,
@@ -152,8 +152,10 @@ def build_parser():
     )
     parser.add_argument(
         "--diameter", type=str, default=None,
-        help="Approximate object diameter in pixels (0 = auto-estimate). "
-             "Comma-separated for multi-pass: '20,100'.",
+        help="Object diameter in pixels. '0' or 'auto' = auto-estimate. "
+             "'auto-multi' = auto-estimate then run at 0.5x/1x/2x scales "
+             "(best for mixed-size objects). Comma-separated for explicit "
+             "multi-pass: '20,100'.",
     )
     parser.add_argument(
         "--batch-size", type=int, default=1,

@@ -278,9 +278,10 @@ class Step2Frame(ttk.LabelFrame):
         self.diameter = NumberEntry(
             param_frame, "Diameter (px):", default=0, dtype=float,
             tooltip="Approximate object diameter in pixels.\n"
-                    "Cell (DIC): 0 = auto-estimate,\n"
-                    "Nucleus ~200, Puncta ~20.\n"
-                    "Comma-separated for multi-pass: 20, 100"
+                    "0 or auto: single-pass auto-estimate.\n"
+                    "auto-multi: auto-estimate + run at 0.5x, 1x, 2x\n"
+                    "  scales (best for mixed-size objects).\n"
+                    "Comma-separated for explicit multi-pass: 20, 100"
         )
         self.diameter.pack(side="left", padx=4)
 
@@ -392,7 +393,7 @@ class Step2Frame(ttk.LabelFrame):
             self.dic_norm_var.set(False)
             self.cyto_frame.pack_forget()
         elif mode == "puncta":
-            self.diameter.var.set("20, 100")
+            self.diameter.var.set("auto-multi")
             self.channel_idx.var.set("1")    # GFP
             self.z_idx.var.set("0")
             self.min_size.var.set("0")

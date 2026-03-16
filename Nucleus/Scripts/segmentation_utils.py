@@ -705,26 +705,77 @@ def merge_masks(mask_list, overlap_threshold=0.3):
     return merged.astype(np.int32)
 
 
+def _estimate_diameter(img2d, model):
+    """
+    Use Cellpose's built-in size estimator to get the average object
+    diameter for this image.  Returns the estimated diameter in pixels.
+    """
+    sz_model = None
+    try:
+        from cellpose import models as cp_models
+        # Cellpose 3
+        if hasattr(cp_models, "SizeModel"):
+            sz_model = cp_models.SizeModel(model, device=model.device)
+        # Cellpose 4
+        elif hasattr(model, "sz"):
+            sz_model = model.sz
+    except Exception:
+        pass
+
+    if sz_model is not None:
+        try:
+            import inspect
+            sig = inspect.signature(sz_model.eval)
+            kwargs = {}
+            if "channels" in sig.parameters:
+                kwargs["channels"] = [0, 0]
+            diam, _ = sz_model.eval(img2d, **kwargs)
+            if diam is not None and diam > 0:
+                return float(diam)
+        except Exception:
+            pass
+
+    # Fallback: run a quick auto pass and read back the estimated diam
+    import inspect
+    eval_params = inspect.signature(model.eval).parameters
+    kwargs = dict(diameter=None, normalize=True)
+    if "channels" in eval_params:
+        kwargs["channels"] = [0, 0]
+    result = model.eval(img2d, **kwargs)
+    # Cellpose 3 returns (masks, flows, styles, diams)
+    if len(result) >= 4 and result[3] is not None:
+        d = result[3]
+        return float(d) if not hasattr(d, '__len__') else float(d[0])
+    # Cellpose 4: diameter is stored on the model after eval
+    if hasattr(model, "diam_labels") and model.diam_labels:
+        return float(model.diam_labels)
+    # Last resort
+    return 30.0
+
+
 def parse_diameters(diam_str):
     """
     Parse a diameter string into a list of float-or-None values.
 
     Accepts:
-      - "auto", "0", "none", ""  ->  [None]
+      - "auto", "0", "none", ""  ->  [None]       (single auto pass)
+      - "auto-multi"             ->  "auto-multi"  (auto multi-scale)
       - "20"                     ->  [20.0]
       - "20,100"                 ->  [20.0, 100.0]
       - "20, 100, auto"         ->  [20.0, 100.0, None]
 
     Returns
     -------
-    diameters : list
-        List of float values or None (for auto-estimate).
+    diameters : list or str
+        List of float values or None, OR the string "auto-multi".
     """
     if diam_str is None:
         return [None]
     diam_str = str(diam_str).strip().lower()
     if not diam_str or diam_str in ("auto", "none"):
         return [None]
+    if diam_str == "auto-multi":
+        return "auto-multi"
 
     parts = [p.strip() for p in diam_str.split(",")]
     diameters = []
@@ -739,7 +790,8 @@ def parse_diameters(diam_str):
 def run_cellpose_multipass(img2d, model, diameters, batch_size=1,
                            normalize=True, flow_threshold=0.4,
                            cellprob_threshold=0.0, augment=False,
-                           overlap_threshold=0.3):
+                           overlap_threshold=0.3,
+                           auto_scale_factors=(0.5, 1.0, 2.0)):
     """
     Run Cellpose at multiple diameters and merge the results.
 
@@ -754,12 +806,19 @@ def run_cellpose_multipass(img2d, model, diameters, batch_size=1,
         Normalized 2D image.
     model : cellpose model
         Pre-loaded Cellpose model.
-    diameters : list
-        List of diameters (float or None).  Each value triggers a
-        separate Cellpose pass.
+    diameters : list or str
+        - List of explicit diameters (float or None).
+        - ``"auto-multi"``: auto-estimate the diameter, then run at
+          multiple scale factors around the estimate. Fully automatic,
+          no pixel sizes needed.
     overlap_threshold : float
         Minimum overlap ratio to consider two detections as the same
         object (default 0.3).  The larger-area mask wins.
+    auto_scale_factors : tuple of float
+        Scale factors applied to the auto-estimated diameter when
+        ``diameters="auto-multi"`` (default ``(0.5, 1.0, 2.0)``).
+        For example, if auto-estimate is 40px, passes run at
+        20px, 40px, and 80px.
 
     Returns
     -------
@@ -768,6 +827,14 @@ def run_cellpose_multipass(img2d, model, diameters, batch_size=1,
     flows : list
         Flows from the first (primary) pass.
     """
+    # Resolve auto-multi to concrete diameters
+    if diameters == "auto-multi":
+        est_diam = _estimate_diameter(img2d, model)
+        diameters = sorted(set(
+            max(5.0, round(est_diam * sf, 1))
+            for sf in auto_scale_factors
+        ))
+
     if len(diameters) == 1:
         return run_cellpose(
             img2d, model, diameter=diameters[0], batch_size=batch_size,
