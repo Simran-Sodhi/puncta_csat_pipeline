@@ -321,6 +321,27 @@ class Step2Frame(ttk.LabelFrame):
         ttk.Checkbutton(param_frame2, text="DIC normalization (CLAHE)",
                          variable=self.dic_norm_var).pack(side="left", padx=8)
 
+        # ---- Multi-scale passes & GPU count ----
+        param_frame3 = ttk.Frame(self)
+        param_frame3.pack(fill="x", pady=4)
+
+        ttk.Label(param_frame3, text="Multi-scale passes:").pack(side="left", padx=(4, 5))
+        self.scale_05x = tk.BooleanVar(value=True)
+        ttk.Checkbutton(param_frame3, text="0.5x", variable=self.scale_05x).pack(side="left", padx=2)
+        self.scale_1x = tk.BooleanVar(value=True)
+        ttk.Checkbutton(param_frame3, text="1x", variable=self.scale_1x).pack(side="left", padx=2)
+        self.scale_2x = tk.BooleanVar(value=True)
+        ttk.Checkbutton(param_frame3, text="2x", variable=self.scale_2x).pack(side="left", padx=2)
+        self.scale_4x = tk.BooleanVar(value=True)
+        ttk.Checkbutton(param_frame3, text="4x", variable=self.scale_4x).pack(side="left", padx=2)
+        ttk.Label(param_frame3, text="(used with auto-multi)",
+                  foreground="gray").pack(side="left", padx=(5, 15))
+
+        ttk.Label(param_frame3, text="GPUs:").pack(side="left", padx=(0, 5))
+        self.num_gpus = tk.IntVar(value=1)
+        ttk.Spinbox(param_frame3, from_=1, to=8, textvariable=self.num_gpus,
+                    width=3).pack(side="left")
+
         # ---- Cytoplasm-specific parameters (shown/hidden) ----
         self.cyto_frame = ttk.LabelFrame(
             self,
@@ -427,6 +448,21 @@ class Step2Frame(ttk.LabelFrame):
         gpu = self.gpu_var.get()
         rm_edges = self.edges_var.get()
         use_dic_norm = self.dic_norm_var.get()
+        num_gpus = self.num_gpus.get()
+
+        # Build scale factors tuple from checkboxes
+        scale_factors = []
+        if self.scale_05x.get():
+            scale_factors.append(0.5)
+        if self.scale_1x.get():
+            scale_factors.append(1.0)
+        if self.scale_2x.get():
+            scale_factors.append(2.0)
+        if self.scale_4x.get():
+            scale_factors.append(4.0)
+        if not scale_factors:
+            scale_factors = [1.0]
+        scale_factors = tuple(scale_factors)
 
         is_cyto = mode == "cytoplasm"
         nuc_mask_dir = None
@@ -476,29 +512,49 @@ class Step2Frame(ttk.LabelFrame):
                     compute_cytoplasm_mask,
                 )
                 import numpy as np
-                import tifffile as tiff
-                import re
+                import tifffile as tiff_io
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                try:
+                    import torch
+                except ImportError:
+                    torch = None
 
                 image_paths = collect_image_paths(input_path)
                 if not image_paths:
                     self.log("[ERROR] No TIFF images found.")
                     return
 
-                self.log(f"Found {len(image_paths)} image(s). Loading model...")
-                model = load_cellpose_model(gpu=gpu, model_type="cyto3")
+                # Determine how many GPUs to use
+                effective_gpus = 1
+                if gpu and num_gpus > 1 and torch is not None:
+                    available = torch.cuda.device_count() if torch.cuda.is_available() else 0
+                    effective_gpus = min(num_gpus, available) if available > 1 else 1
+
+                self.log(f"Found {len(image_paths)} image(s). "
+                         f"Loading model on {effective_gpus} GPU(s)...")
+
+                # Load one model per GPU
+                models = []
+                for gpu_idx in range(effective_gpus):
+                    if effective_gpus > 1:
+                        torch.cuda.set_device(gpu_idx)
+                    m = load_cellpose_model(gpu=gpu, model_type="cyto3")
+                    models.append(m)
+
                 outdir = Path(out_dir)
                 outdir.mkdir(parents=True, exist_ok=True)
                 trip_dir = outdir / "triptychs"
                 trip_dir.mkdir(parents=True, exist_ok=True)
+                total = len(image_paths)
 
-                for i, img_path in enumerate(image_paths, 1):
-                    self.log(f"  [{i}/{len(image_paths)}] {img_path.name}")
+                def process_image(img_path, gpu_model, gpu_idx):
+                    """Process a single image on the assigned GPU."""
+                    if effective_gpus > 1:
+                        torch.cuda.set_device(gpu_idx)
                     try:
                         img2d = load_image_2d(img_path,
                                               channel_index=channel,
                                               z_index=z)
-
-                        # DIC: CLAHE normalization; fluorescence: LUT
                         if use_dic_norm:
                             img_norm = normalize_dic(img2d)
                         else:
@@ -506,7 +562,8 @@ class Step2Frame(ttk.LabelFrame):
 
                         diameters = parse_diameters(diam_str)
                         masks, _flows = run_cellpose_multipass(
-                            img_norm, model=model, diameters=diameters)
+                            img_norm, model=gpu_model, diameters=diameters,
+                            auto_scale_factors=scale_factors)
                         masks = postprocess_mask(masks,
                                                  min_size=min_sz,
                                                  remove_edges=rm_edges)
@@ -514,7 +571,6 @@ class Step2Frame(ttk.LabelFrame):
                         stem = img_path.stem
 
                         if is_cyto:
-                            # Find matching nucleus mask
                             nuc_path = self._find_nuc_mask(
                                 nuc_mask_dir, stem)
                             if nuc_path is None:
@@ -526,9 +582,9 @@ class Step2Frame(ttk.LabelFrame):
                                 save_triptych(
                                     img_norm, masks,
                                     trip_dir / f"{stem}_cell_triptych.png")
-                                continue
+                                return img_path, "OK (no nuc mask)"
 
-                            nuc_m = ensure_2d(tiff.imread(nuc_path))
+                            nuc_m = ensure_2d(tiff_io.imread(nuc_path))
                             if nuc_m.shape != masks.shape:
                                 self.log(
                                     f"    [WARN] Shape mismatch: "
@@ -536,7 +592,7 @@ class Step2Frame(ttk.LabelFrame):
                                     f"nucleus {nuc_m.shape}, skipping.")
                                 save_mask(masks,
                                           outdir / f"{stem}_cell_masks.tif")
-                                continue
+                                return img_path, "OK (shape mismatch)"
 
                             cyto_mask, kept, orphans = \
                                 compute_cytoplasm_mask(
@@ -548,7 +604,6 @@ class Step2Frame(ttk.LabelFrame):
                             self.log(
                                 f"    Kept {len(kept)} cells, "
                                 f"removed {len(orphans)} orphans")
-
                             save_mask(masks,
                                       outdir / f"{stem}_cell_masks.tif")
                             save_mask(cyto_mask,
@@ -562,8 +617,34 @@ class Step2Frame(ttk.LabelFrame):
                             save_triptych(
                                 img_norm, masks,
                                 trip_dir / f"{stem}_triptych.png")
+                        return img_path, "OK"
                     except Exception as e:
                         self.log(f"    [ERROR] {e}")
+                        return img_path, "FAILED"
+
+                if effective_gpus <= 1:
+                    # Single GPU — sequential
+                    for i, img_path in enumerate(image_paths, 1):
+                        self.log(f"  [{i}/{total}] {img_path.name}")
+                        process_image(img_path, models[0], 0)
+                else:
+                    # Multi-GPU — parallel
+                    self.log(f"Running parallel on {effective_gpus} GPUs...")
+                    completed = [0]
+                    futures = {}
+                    with ThreadPoolExecutor(max_workers=effective_gpus) as executor:
+                        for i, img_path in enumerate(image_paths):
+                            gpu_idx = i % effective_gpus
+                            fut = executor.submit(
+                                process_image, img_path, models[gpu_idx], gpu_idx)
+                            futures[fut] = img_path
+
+                        for fut in as_completed(futures):
+                            completed[0] += 1
+                            img_path, status = fut.result()
+                            self.log(
+                                f"  [{completed[0]}/{total}] "
+                                f"{img_path.name} -> {status}")
 
                 self.log("[DONE] Segmentation complete.")
             except Exception as exc:

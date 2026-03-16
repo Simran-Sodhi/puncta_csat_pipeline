@@ -1107,6 +1107,27 @@ class SegmentationGUI(tk.Tk):
         ttk.Label(row2, text="(0 = off, 0.8 = filter irregular shapes)",
                   foreground="gray").pack(side=tk.LEFT)
 
+        # Row 3: multi-scale pass checkboxes & GPU count
+        row3 = ttk.Frame(cp_frame)
+        row3.pack(fill=tk.X, pady=2)
+
+        ttk.Label(row3, text="Multi-scale passes:").pack(side=tk.LEFT, padx=(0, 5))
+        self.seg_scale_05x = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row3, text="0.5x", variable=self.seg_scale_05x).pack(side=tk.LEFT, padx=2)
+        self.seg_scale_1x = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row3, text="1x", variable=self.seg_scale_1x).pack(side=tk.LEFT, padx=2)
+        self.seg_scale_2x = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row3, text="2x", variable=self.seg_scale_2x).pack(side=tk.LEFT, padx=2)
+        self.seg_scale_4x = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row3, text="4x", variable=self.seg_scale_4x).pack(side=tk.LEFT, padx=2)
+        ttk.Label(row3, text="(used with auto-multi diameter)",
+                  foreground="gray").pack(side=tk.LEFT, padx=(5, 15))
+
+        ttk.Label(row3, text="GPUs:").pack(side=tk.LEFT, padx=(0, 5))
+        self.seg_num_gpus = tk.IntVar(value=1)
+        ttk.Spinbox(row3, from_=1, to=8, textvariable=self.seg_num_gpus,
+                    width=3).pack(side=tk.LEFT)
+
         # ---- Cytoplasm-specific options (shown/hidden) ----
         self.seg_cyto_frame = ttk.LabelFrame(body, text="Cytoplasm Options (cell - nucleus = cytoplasm)", padding=10)
 
@@ -1411,6 +1432,21 @@ class SegmentationGUI(tk.Tk):
         flow_thr = self.seg_flow_thr.get()
         cellprob_thr = self.seg_cellprob_thr.get()
         model_type = self._seg_get_model_type()
+        num_gpus = self.seg_num_gpus.get()
+
+        # Build scale factors tuple from checkboxes
+        scale_factors = []
+        if self.seg_scale_05x.get():
+            scale_factors.append(0.5)
+        if self.seg_scale_1x.get():
+            scale_factors.append(1.0)
+        if self.seg_scale_2x.get():
+            scale_factors.append(2.0)
+        if self.seg_scale_4x.get():
+            scale_factors.append(4.0)
+        if not scale_factors:
+            scale_factors = [1.0]  # fallback
+        scale_factors = tuple(scale_factors)
 
         is_cyto = mode == "cytoplasm"
         nuc_mask_dir = None
@@ -1458,26 +1494,48 @@ class SegmentationGUI(tk.Tk):
                 )
                 import numpy as np
                 import tifffile as tiff_io
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                try:
+                    import torch
+                except ImportError:
+                    torch = None
 
                 image_paths = collect_image_paths(input_path)
                 if not image_paths:
                     self.log_queue.put("__SEG_ERROR__No TIFF images found.")
                     return
 
-                self._seg_log_append_q(f"Found {len(image_paths)} image(s). Loading model ({model_type})...")
-                model = load_cellpose_model(gpu=gpu, model_type=model_type)
+                # Determine how many GPUs to use
+                effective_gpus = 1
+                if gpu and num_gpus > 1 and torch is not None:
+                    available = torch.cuda.device_count() if torch.cuda.is_available() else 0
+                    effective_gpus = min(num_gpus, available) if available > 1 else 1
+
+                self._seg_log_append_q(
+                    f"Found {len(image_paths)} image(s). "
+                    f"Loading model ({model_type}) on {effective_gpus} GPU(s)..."
+                )
+
+                # Load one model per GPU
+                models = []
+                for gpu_idx in range(effective_gpus):
+                    if effective_gpus > 1:
+                        torch.cuda.set_device(gpu_idx)
+                    m = load_cellpose_model(gpu=gpu, model_type=model_type)
+                    models.append(m)
+
                 outdir = Path(out_dir)
                 outdir.mkdir(parents=True, exist_ok=True)
                 trip_dir = outdir / "triptychs"
                 trip_dir.mkdir(parents=True, exist_ok=True)
                 total = len(image_paths)
+                completed_count = [0]  # mutable counter for progress
 
-                for i, img_path in enumerate(image_paths, 1):
-                    self._seg_log_append_q(f"  [{i}/{total}] {img_path.name}")
-                    pct = int(100 * i / total)
-                    self.log_queue.put(f"__SEG_PROGRESS__{pct}")
+                def process_image(img_path, gpu_model, gpu_idx):
+                    """Process a single image on the assigned GPU."""
+                    if effective_gpus > 1:
+                        torch.cuda.set_device(gpu_idx)
                     n_objects = -1
-
                     try:
                         img2d = load_image_2d(img_path, channel_index=channel, z_index=z)
                         if use_dic_norm:
@@ -1487,10 +1545,11 @@ class SegmentationGUI(tk.Tk):
 
                         diameters = parse_diameters(diam_str)
                         masks, flows = run_cellpose_multipass(
-                            img_norm, model=model, diameters=diameters,
+                            img_norm, model=gpu_model, diameters=diameters,
                             flow_threshold=flow_thr,
                             cellprob_threshold=cellprob_thr,
                             augment=augment,
+                            auto_scale_factors=scale_factors,
                         )
                         edge_thr = 0.25 if use_dic_norm else 0.0
                         masks = postprocess_mask(
@@ -1500,20 +1559,21 @@ class SegmentationGUI(tk.Tk):
                         )
                         n_objects = int(masks.max())
                         stem = img_path.stem
+                        diam0 = diameters[0] if isinstance(diameters, list) else None
 
                         if is_cyto:
                             nuc_path = self._find_nuc_mask(nuc_mask_dir, stem)
                             if nuc_path is None:
                                 self._seg_log_append_q(f"    [WARN] No nucleus mask for {stem}")
                                 save_mask(masks, outdir / f"{stem}_cell_masks.tif")
-                                save_seg_npy(img_norm, masks, flows, img_path.name, img_path.parent, diameters[0])
+                                save_seg_npy(img_norm, masks, flows, img_path.name, img_path.parent, diam0)
                                 save_triptych(img_norm, masks, trip_dir / f"{stem}_cell_triptych.png")
                             else:
                                 nuc_m = ensure_2d(tiff_io.imread(str(nuc_path)))
                                 if nuc_m.shape != masks.shape:
                                     self._seg_log_append_q(f"    [WARN] Shape mismatch, skipping cyto")
                                     save_mask(masks, outdir / f"{stem}_cell_masks.tif")
-                                    save_seg_npy(img_norm, masks, flows, img_path.name, img_path.parent, diameters[0])
+                                    save_seg_npy(img_norm, masks, flows, img_path.name, img_path.parent, diam0)
                                 else:
                                     cyto_mask, kept, orphans = compute_cytoplasm_mask(
                                         masks, nuc_m,
@@ -1526,23 +1586,49 @@ class SegmentationGUI(tk.Tk):
                                     )
                                     save_mask(masks, outdir / f"{stem}_cell_masks.tif")
                                     save_mask(cyto_mask, outdir / f"{stem}_cyto_masks.tif")
-                                    save_seg_npy(img_norm, masks, flows, img_path.name, img_path.parent, diameters[0])
-                                    save_seg_npy(img_norm, cyto_mask, flows, f"{stem}_cyto", outdir, diameters[0])
+                                    save_seg_npy(img_norm, masks, flows, img_path.name, img_path.parent, diam0)
+                                    save_seg_npy(img_norm, cyto_mask, flows, f"{stem}_cyto", outdir, diam0)
                                     save_cytoplasm_triptych(
                                         img_norm, masks, nuc_m, cyto_mask,
                                         trip_dir / f"{stem}_cyto_triptych.png"
                                     )
                         else:
                             save_mask(masks, outdir / f"{stem}_cyto3_masks.tif")
-                            save_seg_npy(img_norm, masks, flows, img_path.name, img_path.parent, diameters[0])
+                            save_seg_npy(img_norm, masks, flows, img_path.name, img_path.parent, diam0)
                             save_triptych(img_norm, masks, trip_dir / f"{stem}_triptych.png")
 
-                        status = "OK" if n_objects > 0 else "No signal"
+                        return img_path, n_objects, "OK" if n_objects > 0 else "No signal"
                     except Exception as e:
                         self._seg_log_append_q(f"    [ERROR] {e}")
-                        status = "FAILED"
+                        return img_path, -1, "FAILED"
 
-                    self.log_queue.put(f"__SEG_RESULT__{img_path.name}||{n_objects}||{status}")
+                if effective_gpus <= 1:
+                    # Single GPU — sequential processing (preserves log order)
+                    for i, img_path in enumerate(image_paths, 1):
+                        self._seg_log_append_q(f"  [{i}/{total}] {img_path.name}")
+                        self.log_queue.put(f"__SEG_PROGRESS__{int(100 * i / total)}")
+                        img_path, n_objects, status = process_image(img_path, models[0], 0)
+                        self.log_queue.put(f"__SEG_RESULT__{img_path.name}||{n_objects}||{status}")
+                else:
+                    # Multi-GPU — parallel processing
+                    self._seg_log_append_q(f"Running parallel on {effective_gpus} GPUs...")
+                    futures = {}
+                    with ThreadPoolExecutor(max_workers=effective_gpus) as executor:
+                        for i, img_path in enumerate(image_paths):
+                            gpu_idx = i % effective_gpus
+                            fut = executor.submit(process_image, img_path, models[gpu_idx], gpu_idx)
+                            futures[fut] = (i, img_path)
+
+                        for fut in as_completed(futures):
+                            idx, orig_path = futures[fut]
+                            completed_count[0] += 1
+                            pct = int(100 * completed_count[0] / total)
+                            self.log_queue.put(f"__SEG_PROGRESS__{pct}")
+                            img_path, n_objects, status = fut.result()
+                            self._seg_log_append_q(
+                                f"  [{completed_count[0]}/{total}] {img_path.name} -> {status}"
+                            )
+                            self.log_queue.put(f"__SEG_RESULT__{img_path.name}||{n_objects}||{status}")
 
                 self.log_queue.put("__SEG_DONE__")
             except Exception as exc:
