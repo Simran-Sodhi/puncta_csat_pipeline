@@ -619,22 +619,27 @@ def run_cellpose(img2d, model, diameter=None, batch_size=1, normalize=True,
     return masks, flows
 
 
-def merge_masks(mask_list, iou_threshold=0.5):
+def merge_masks(mask_list, overlap_threshold=0.3):
     """
     Merge label masks from multiple Cellpose passes into a single mask.
 
-    Strategy: start from the pass with the most detections, then add
-    objects from subsequent passes only if they do not significantly
-    overlap with objects already in the merged mask.
+    Each pass runs on a clean image (no prior masks).  When two passes
+    detect the same object at the same location, the mask with the
+    **larger area** is kept and the smaller one is discarded entirely
+    (no rings or halos).  Objects that don't overlap anything are added
+    as new detections.
+
+    "Same object" is defined by the overlap ratio:
+        overlap_ratio = intersection / min(area_candidate, area_existing)
+    This catches cases where a small object is fully inside a larger one.
 
     Parameters
     ----------
     mask_list : list of np.ndarray
         List of (Y, X) integer label masks from different passes.
-    iou_threshold : float
-        Maximum IoU (intersection-over-union) with any existing object
-        before a candidate is considered a duplicate and discarded.
-        Lower = stricter deduplication (default 0.5).
+    overlap_threshold : float
+        Minimum overlap ratio to consider two objects as the "same"
+        object detected at different scales (default 0.3).
 
     Returns
     -------
@@ -648,43 +653,52 @@ def merge_masks(mask_list, iou_threshold=0.5):
     if len(mask_list) == 1:
         return mask_list[0].astype(np.int32)
 
-    # Sort passes: most detections first (primary mask)
-    sorted_masks = sorted(mask_list, key=lambda m: int(m.max()), reverse=True)
+    # Collect every object from every pass as (boolean_mask, area)
+    all_objects = []
+    for pass_mask in mask_list:
+        pm = pass_mask.astype(np.int32)
+        for prop in regionprops(pm):
+            obj_mask = pm == prop.label
+            all_objects.append((obj_mask, int(prop.area)))
 
-    merged = sorted_masks[0].astype(np.int32, copy=True)
-    next_label = int(merged.max()) + 1
+    # Sort largest first — larger objects get priority
+    all_objects.sort(key=lambda x: x[1], reverse=True)
 
-    for extra_mask in sorted_masks[1:]:
-        for prop in regionprops(extra_mask.astype(np.int32)):
-            candidate = extra_mask == prop.label  # boolean mask of candidate
+    merged = np.zeros(mask_list[0].shape, dtype=np.int32)
+    next_label = 1
 
-            # Check overlap with every existing object in merged
-            overlapping_labels = np.unique(merged[candidate])
-            overlapping_labels = overlapping_labels[overlapping_labels != 0]
+    for candidate, cand_area in all_objects:
+        # Find which existing labels this candidate overlaps
+        overlapping_labels = np.unique(merged[candidate])
+        overlapping_labels = overlapping_labels[overlapping_labels != 0]
 
-            if len(overlapping_labels) == 0:
-                # No overlap at all — add directly
-                merged[candidate] = next_label
-                next_label += 1
-                continue
+        if len(overlapping_labels) == 0:
+            # No overlap — add as a new object
+            merged[candidate] = next_label
+            next_label += 1
+            continue
 
-            # Compute IoU against each overlapping existing object
-            is_duplicate = False
-            for existing_lab in overlapping_labels:
-                existing = merged == existing_lab
-                intersection = np.logical_and(candidate, existing).sum()
-                union = np.logical_or(candidate, existing).sum()
-                iou = intersection / union if union > 0 else 0.0
-                if iou >= iou_threshold:
-                    is_duplicate = True
+        # Check if candidate is the "same object" as any existing one
+        same_object = False
+        for existing_lab in overlapping_labels:
+            existing = merged == existing_lab
+            intersection = np.logical_and(candidate, existing).sum()
+            smaller_area = min(cand_area, int(existing.sum()))
+            if smaller_area > 0:
+                ratio = intersection / smaller_area
+                if ratio >= overlap_threshold:
+                    # Same object — existing is already larger (we
+                    # process largest first), so just skip candidate
+                    same_object = True
                     break
 
-            if not is_duplicate:
-                # New object — only write to pixels not already claimed
-                free_pixels = candidate & (merged == 0)
-                if free_pixels.sum() > 0:
-                    merged[free_pixels] = next_label
-                    next_label += 1
+        if not same_object:
+            # Genuinely new object that only partially touches others
+            # (e.g. adjacent cells) — add only to unclaimed pixels
+            free_pixels = candidate & (merged == 0)
+            if free_pixels.sum() > 0:
+                merged[free_pixels] = next_label
+                next_label += 1
 
     # Relabel consecutively
     merged, _, _ = relabel_sequential(merged)
@@ -725,14 +739,14 @@ def parse_diameters(diam_str):
 def run_cellpose_multipass(img2d, model, diameters, batch_size=1,
                            normalize=True, flow_threshold=0.4,
                            cellprob_threshold=0.0, augment=False,
-                           iou_threshold=0.5):
+                           overlap_threshold=0.3):
     """
     Run Cellpose at multiple diameters and merge the results.
 
-    This solves the mixed-size object problem: small puncta need a small
-    diameter while large puncta need a large diameter.  Each diameter
-    produces a separate mask, and the masks are merged with
-    IoU-based deduplication.
+    Each diameter triggers an independent Cellpose pass on the same
+    clean image (no prior masks are fed back).  When the same object
+    is detected at multiple scales, the mask with the **larger area**
+    is kept and the smaller one is discarded entirely.
 
     Parameters
     ----------
@@ -743,8 +757,9 @@ def run_cellpose_multipass(img2d, model, diameters, batch_size=1,
     diameters : list
         List of diameters (float or None).  Each value triggers a
         separate Cellpose pass.
-    iou_threshold : float
-        IoU threshold for deduplication during merge (default 0.5).
+    overlap_threshold : float
+        Minimum overlap ratio to consider two detections as the same
+        object (default 0.3).  The larger-area mask wins.
 
     Returns
     -------
@@ -772,7 +787,7 @@ def run_cellpose_multipass(img2d, model, diameters, batch_size=1,
         if i == 0:
             first_flows = flows_i
 
-    merged = merge_masks(mask_list, iou_threshold=iou_threshold)
+    merged = merge_masks(mask_list, overlap_threshold=overlap_threshold)
     return merged, first_flows
 
 
