@@ -3954,72 +3954,78 @@ class SegmentationGUI(tk.Tk):
                 self.eval_results.config(state=tk.DISABLED)
 
     # ==================================================================
-    # TAB 5: MASK COMPARISON
+    # TAB 5: MASK COMPARISON  (single pair + bulk directories)
     # ==================================================================
     def _build_compare_tab(self):
         tab = self.tab_compare
 
+        # Sub-notebook: Single / Bulk
+        self.cmp_notebook = ttk.Notebook(tab)
+        self.cmp_notebook.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+        self._cmp_single_frame = ttk.Frame(self.cmp_notebook)
+        self._cmp_bulk_frame = ttk.Frame(self.cmp_notebook)
+        self.cmp_notebook.add(self._cmp_single_frame, text="  Single Pair  ")
+        self.cmp_notebook.add(self._cmp_bulk_frame, text="  Bulk (Directories)  ")
+
+        self._build_cmp_single()
+        self._build_cmp_bulk()
+
+    # -- Single pair sub-tab ----
+    def _build_cmp_single(self):
+        tab = self._cmp_single_frame
+
         ttk.Label(
             tab,
-            text="Compare two segmentation masks (ground truth vs model output).\n"
+            text="Compare one image against two masks (ground truth vs model).\n"
                  "Supports _seg.npy (Cellpose) and .tif mask formats.",
             foreground="gray",
         ).pack(anchor=tk.W, padx=10, pady=(10, 5))
 
-        # ---- Input files ----
         io_frame = ttk.LabelFrame(tab, text="Input Files", padding=10)
         io_frame.pack(fill=tk.X, padx=10, pady=5)
 
         ttk.Label(io_frame, text="Original Image:").grid(row=0, column=0, sticky=tk.W, pady=3)
         self.cmp_image_var = tk.StringVar()
         ttk.Entry(io_frame, textvariable=self.cmp_image_var, width=55).grid(
-            row=0, column=1, padx=5, pady=3, sticky=tk.EW
-        )
+            row=0, column=1, padx=5, pady=3, sticky=tk.EW)
         ttk.Button(
             io_frame, text="Browse...",
             command=lambda: self._cmp_browse_file(
                 self.cmp_image_var, "Select Original Image",
-                [("Image files", "*.tif *.tiff *.ome.tif *.png"), ("All", "*.*")],
-            ),
+                [("Image files", "*.tif *.tiff *.ome.tif *.png"), ("All", "*.*")]),
         ).grid(row=0, column=2, pady=3)
 
         ttk.Label(io_frame, text="Mask 1 (Ground Truth):").grid(row=1, column=0, sticky=tk.W, pady=3)
         self.cmp_mask1_var = tk.StringVar()
         ttk.Entry(io_frame, textvariable=self.cmp_mask1_var, width=55).grid(
-            row=1, column=1, padx=5, pady=3, sticky=tk.EW
-        )
+            row=1, column=1, padx=5, pady=3, sticky=tk.EW)
         ttk.Button(
             io_frame, text="Browse...",
             command=lambda: self._cmp_browse_file(
                 self.cmp_mask1_var, "Select Mask 1 (Ground Truth)",
-                [("Mask files", "*.npy *.tif *.tiff"), ("All", "*.*")],
-            ),
+                [("Mask files", "*.npy *.tif *.tiff"), ("All", "*.*")]),
         ).grid(row=1, column=2, pady=3)
 
         ttk.Label(io_frame, text="Mask 2 (Model Output):").grid(row=2, column=0, sticky=tk.W, pady=3)
         self.cmp_mask2_var = tk.StringVar()
         ttk.Entry(io_frame, textvariable=self.cmp_mask2_var, width=55).grid(
-            row=2, column=1, padx=5, pady=3, sticky=tk.EW
-        )
+            row=2, column=1, padx=5, pady=3, sticky=tk.EW)
         ttk.Button(
             io_frame, text="Browse...",
             command=lambda: self._cmp_browse_file(
                 self.cmp_mask2_var, "Select Mask 2 (Model Output)",
-                [("Mask files", "*.npy *.tif *.tiff"), ("All", "*.*")],
-            ),
+                [("Mask files", "*.npy *.tif *.tiff"), ("All", "*.*")]),
         ).grid(row=2, column=2, pady=3)
-
         io_frame.columnconfigure(1, weight=1)
 
-        # ---- Output ----
         out_frame = ttk.LabelFrame(tab, text="Output", padding=10)
         out_frame.pack(fill=tk.X, padx=10, pady=5)
 
         ttk.Label(out_frame, text="Report Directory:").grid(row=0, column=0, sticky=tk.W, pady=3)
         self.cmp_output_var = tk.StringVar(value="comparison_report")
         ttk.Entry(out_frame, textvariable=self.cmp_output_var, width=55).grid(
-            row=0, column=1, padx=5, pady=3, sticky=tk.EW
-        )
+            row=0, column=1, padx=5, pady=3, sticky=tk.EW)
         ttk.Button(
             out_frame, text="Browse...",
             command=lambda: self._browse_dir(self.cmp_output_var),
@@ -4030,55 +4036,139 @@ class SegmentationGUI(tk.Tk):
             out_frame, text="Open comparison figure when done",
             variable=self.cmp_open_fig,
         ).grid(row=1, column=0, columnspan=3, sticky=tk.W, pady=2)
-
         out_frame.columnconfigure(1, weight=1)
 
-        # ---- Buttons ----
         btn_frame = ttk.Frame(tab)
         btn_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        self.btn_cmp_run = ttk.Button(
-            btn_frame, text="Run Comparison", command=self._cmp_run
-        )
+        self.btn_cmp_run = ttk.Button(btn_frame, text="Run Comparison", command=self._cmp_run)
         self.btn_cmp_run.pack(side=tk.LEFT, padx=5)
 
         self.btn_cmp_quick = ttk.Button(
-            btn_frame, text="Quick Summary (no figure)", command=self._cmp_run_quick
-        )
+            btn_frame, text="Quick Summary (no figure)", command=self._cmp_run_quick)
         self.btn_cmp_quick.pack(side=tk.LEFT, padx=5)
 
-        # ---- Progress ----
         self.cmp_progress = ttk.Progressbar(tab, mode="indeterminate")
         self.cmp_progress.pack(fill=tk.X, padx=10, pady=5)
 
         self.cmp_status = tk.StringVar(value="Ready")
         ttk.Label(tab, textvariable=self.cmp_status).pack(padx=10, anchor=tk.W)
 
-        # ---- Results ----
         results_frame = ttk.LabelFrame(tab, text="Results", padding=5)
         results_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
 
         self.cmp_results = scrolledtext.ScrolledText(
-            results_frame, wrap=tk.WORD, height=15, state=tk.DISABLED,
-            font=("Courier", 9),
-        )
+            results_frame, wrap=tk.WORD, height=12, state=tk.DISABLED,
+            font=("Courier", 9))
         self.cmp_results.pack(fill=tk.BOTH, expand=True)
 
+    # -- Bulk sub-tab ----
+    def _build_cmp_bulk(self):
+        tab = self._cmp_bulk_frame
+
+        ttk.Label(
+            tab,
+            text="Compare all matching image/mask pairs across directories.\n"
+                 "Files are auto-matched by filename stem "
+                 "(e.g. dic_001_img.tif  <->  dic_001_masks.tif  <->  dic_001_seg.npy).",
+            foreground="gray",
+        ).pack(anchor=tk.W, padx=10, pady=(10, 5))
+
+        dir_frame = ttk.LabelFrame(tab, text="Input Directories", padding=10)
+        dir_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(dir_frame, text="Images Directory:").grid(row=0, column=0, sticky=tk.W, pady=3)
+        self.cmp_bulk_img_dir = tk.StringVar()
+        ttk.Entry(dir_frame, textvariable=self.cmp_bulk_img_dir, width=55).grid(
+            row=0, column=1, padx=5, pady=3, sticky=tk.EW)
+        ttk.Button(
+            dir_frame, text="Browse...",
+            command=lambda: self._browse_dir(self.cmp_bulk_img_dir),
+        ).grid(row=0, column=2, pady=3)
+
+        ttk.Label(dir_frame, text="Mask 1 Dir (Ground Truth):").grid(row=1, column=0, sticky=tk.W, pady=3)
+        self.cmp_bulk_mask1_dir = tk.StringVar()
+        ttk.Entry(dir_frame, textvariable=self.cmp_bulk_mask1_dir, width=55).grid(
+            row=1, column=1, padx=5, pady=3, sticky=tk.EW)
+        ttk.Button(
+            dir_frame, text="Browse...",
+            command=lambda: self._browse_dir(self.cmp_bulk_mask1_dir),
+        ).grid(row=1, column=2, pady=3)
+
+        ttk.Label(dir_frame, text="Mask 2 Dir (Model Output):").grid(row=2, column=0, sticky=tk.W, pady=3)
+        self.cmp_bulk_mask2_dir = tk.StringVar()
+        ttk.Entry(dir_frame, textvariable=self.cmp_bulk_mask2_dir, width=55).grid(
+            row=2, column=1, padx=5, pady=3, sticky=tk.EW)
+        ttk.Button(
+            dir_frame, text="Browse...",
+            command=lambda: self._browse_dir(self.cmp_bulk_mask2_dir),
+        ).grid(row=2, column=2, pady=3)
+        dir_frame.columnconfigure(1, weight=1)
+
+        out_frame = ttk.LabelFrame(tab, text="Output", padding=10)
+        out_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        ttk.Label(out_frame, text="Report Directory:").grid(row=0, column=0, sticky=tk.W, pady=3)
+        self.cmp_bulk_output_var = tk.StringVar(value="batch_comparison")
+        ttk.Entry(out_frame, textvariable=self.cmp_bulk_output_var, width=55).grid(
+            row=0, column=1, padx=5, pady=3, sticky=tk.EW)
+        ttk.Button(
+            out_frame, text="Browse...",
+            command=lambda: self._browse_dir(self.cmp_bulk_output_var),
+        ).grid(row=0, column=2, pady=3)
+        out_frame.columnconfigure(1, weight=1)
+
+        btn_frame = ttk.Frame(tab)
+        btn_frame.pack(fill=tk.X, padx=10, pady=5)
+
+        self.btn_cmp_bulk_preview = ttk.Button(
+            btn_frame, text="Preview Matches", command=self._cmp_bulk_preview)
+        self.btn_cmp_bulk_preview.pack(side=tk.LEFT, padx=5)
+
+        self.btn_cmp_bulk_run = ttk.Button(
+            btn_frame, text="Run Batch Comparison", command=self._cmp_bulk_run)
+        self.btn_cmp_bulk_run.pack(side=tk.LEFT, padx=5)
+
+        self.cmp_bulk_progress = ttk.Progressbar(tab, mode="determinate", maximum=100)
+        self.cmp_bulk_progress.pack(fill=tk.X, padx=10, pady=5)
+
+        self.cmp_bulk_status = tk.StringVar(value="Ready")
+        ttk.Label(tab, textvariable=self.cmp_bulk_status).pack(padx=10, anchor=tk.W)
+
+        results_frame = ttk.LabelFrame(tab, text="Results", padding=5)
+        results_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
+
+        self.cmp_bulk_results = scrolledtext.ScrolledText(
+            results_frame, wrap=tk.WORD, height=12, state=tk.DISABLED,
+            font=("Courier", 9))
+        self.cmp_bulk_results.pack(fill=tk.BOTH, expand=True)
+
+    # -- Shared helpers ----
     def _cmp_browse_file(self, var, title, filetypes):
         p = filedialog.askopenfilename(title=title, filetypes=filetypes)
         if p:
             var.set(p)
 
-    def _cmp_validate(self) -> bool:
-        if not self.cmp_image_var.get() or not os.path.isfile(self.cmp_image_var.get()):
-            messagebox.showwarning("Missing", "Select a valid original image file.")
-            return False
-        if not self.cmp_mask1_var.get() or not os.path.isfile(self.cmp_mask1_var.get()):
-            messagebox.showwarning("Missing", "Select a valid Mask 1 file.")
-            return False
-        if not self.cmp_mask2_var.get() or not os.path.isfile(self.cmp_mask2_var.get()):
-            messagebox.showwarning("Missing", "Select a valid Mask 2 file.")
-            return False
+    def _cmp_validate_single(self) -> bool:
+        for var, name in [
+            (self.cmp_image_var, "original image"),
+            (self.cmp_mask1_var, "Mask 1"),
+            (self.cmp_mask2_var, "Mask 2"),
+        ]:
+            if not var.get() or not os.path.isfile(var.get()):
+                messagebox.showwarning("Missing", f"Select a valid {name} file.")
+                return False
+        return True
+
+    def _cmp_validate_bulk(self) -> bool:
+        for var, name in [
+            (self.cmp_bulk_img_dir, "Images Directory"),
+            (self.cmp_bulk_mask1_dir, "Mask 1 Directory"),
+            (self.cmp_bulk_mask2_dir, "Mask 2 Directory"),
+        ]:
+            if not var.get() or not os.path.isdir(var.get()):
+                messagebox.showwarning("Missing", f"Select a valid {name}.")
+                return False
         return True
 
     def _cmp_set_running(self, running: bool):
@@ -4090,8 +4180,15 @@ class SegmentationGUI(tk.Tk):
         else:
             self.cmp_progress.stop()
 
+    def _cmp_bulk_set_running(self, running: bool):
+        state = tk.DISABLED if running else tk.NORMAL
+        self.btn_cmp_bulk_run.config(state=state)
+        self.btn_cmp_bulk_preview.config(state=state)
+        if not running:
+            self.cmp_bulk_progress.config(value=0)
+
     @staticmethod
-    def _cmp_format_results(results: dict) -> str:
+    def _cmp_format_single(results: dict) -> str:
         import numpy as np
         b = results["binary"]
         matches = results["matches"]
@@ -4147,7 +4244,6 @@ class SegmentationGUI(tk.Tk):
             lines.append("  " + "-" * 34)
             for l1, l2, iou in sorted_m[:10]:
                 lines.append(f"  {l1:<12}{l2:<12}{iou:.4f}")
-
             if len(sorted_m) > 10:
                 lines.append("")
                 lines.append("  BOTTOM 10 WORST MATCHED OBJECTS")
@@ -4160,8 +4256,65 @@ class SegmentationGUI(tk.Tk):
         lines.append("=" * 55)
         return "\n".join(lines)
 
+    @staticmethod
+    def _cmp_format_batch(batch: dict) -> str:
+        import numpy as np
+        agg = batch["aggregate"]
+        pairs = batch["per_pair"]
+        warnings = batch["warnings"]
+
+        lines = []
+        lines.append("=" * 65)
+        lines.append("            BATCH COMPARISON RESULTS")
+        lines.append("=" * 65)
+        lines.append("")
+        lines.append(f"  {'Pairs compared:':<30} {agg.get('n_pairs', 0)}")
+        lines.append(f"  {'Mean Binary IoU:':<30} {agg.get('mean_binary_iou', 0):.4f}")
+        lines.append(f"  {'Mean Binary Dice:':<30} {agg.get('mean_binary_dice', 0):.4f}")
+        lines.append(f"  {'Std Binary IoU:':<30} {agg.get('std_binary_iou', 0):.4f}")
+        lines.append(f"  {'Total matched objects:':<30} {agg.get('total_matched_objects', 0)}")
+        lines.append(f"  {'Mean per-object IoU:':<30} {agg.get('mean_object_iou', 0):.4f}")
+        lines.append(f"  {'Median per-object IoU:':<30} {agg.get('median_object_iou', 0):.4f}")
+        lines.append("")
+        lines.append("  AGGREGATE AVERAGE PRECISION")
+        for t in [0.5, 0.75, 0.9]:
+            p = agg.get(f"precision@{t}", 0)
+            r = agg.get(f"recall@{t}", 0)
+            f1 = agg.get(f"f1@{t}", 0)
+            lines.append(f"  IoU >= {t}:  P={p:.4f}  R={r:.4f}  F1={f1:.4f}")
+        lines.append("")
+
+        lines.append("  PER-PAIR SUMMARY")
+        lines.append(f"  {'Key':<20}{'BinIoU':<10}{'BinDice':<10}"
+                     f"{'ObjM1':<8}{'ObjM2':<8}{'Match':<8}{'MeanIoU':<10}")
+        lines.append("  " + "-" * 74)
+        for p in pairs:
+            r = p["results"]
+            matched_ious = [iou for _, _, iou in r["matches"]]
+            mean_iou = f"{np.mean(matched_ious):.4f}" if matched_ious else "N/A"
+            lines.append(
+                f"  {p['key']:<20}"
+                f"{r['binary']['binary_iou']:<10.4f}"
+                f"{r['binary']['binary_dice']:<10.4f}"
+                f"{r['stats_mask1']['n_objects']:<8}"
+                f"{r['stats_mask2']['n_objects']:<8}"
+                f"{len(r['matches']):<8}"
+                f"{mean_iou:<10}"
+            )
+        lines.append("")
+
+        if warnings:
+            lines.append("  WARNINGS")
+            for w in warnings:
+                lines.append(f"    {w}")
+            lines.append("")
+
+        lines.append("=" * 65)
+        return "\n".join(lines)
+
+    # -- Single pair actions ----
     def _cmp_run(self):
-        if not self._cmp_validate():
+        if not self._cmp_validate_single():
             return
         self._cmp_set_running(True)
         self.cmp_status.set("Running comparison...")
@@ -4178,9 +4331,8 @@ class SegmentationGUI(tk.Tk):
                     self.cmp_mask2_var.get(),
                     self.cmp_output_var.get(),
                 )
-                text = self._cmp_format_results(results)
+                text = self._cmp_format_single(results)
                 self.log_queue.put(f"__CMP_DONE__{text}")
-
                 if self.cmp_open_fig.get():
                     fig_path = os.path.join(self.cmp_output_var.get(), "comparison.png")
                     if os.path.isfile(fig_path):
@@ -4192,7 +4344,7 @@ class SegmentationGUI(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _cmp_run_quick(self):
-        if not self._cmp_validate():
+        if not self._cmp_validate_single():
             return
         self._cmp_set_running(True)
         self.cmp_status.set("Computing metrics...")
@@ -4209,21 +4361,16 @@ class SegmentationGUI(tk.Tk):
                 image = load_image(self.cmp_image_var.get())
                 mask1 = load_mask(self.cmp_mask1_var.get())
                 mask2 = load_mask(self.cmp_mask2_var.get())
-
                 binary = binary_metrics(mask1, mask2)
                 matches, _, _ = match_objects(mask1, mask2)
                 ap = average_precision(mask1, mask2)
                 stats1 = intensity_stats(image, mask1)
                 stats2 = intensity_stats(image, mask2)
-
                 results = {
-                    "binary": binary,
-                    "matches": matches,
-                    "ap": ap,
-                    "stats_mask1": stats1,
-                    "stats_mask2": stats2,
+                    "binary": binary, "matches": matches, "ap": ap,
+                    "stats_mask1": stats1, "stats_mask2": stats2,
                 }
-                text = self._cmp_format_results(results)
+                text = self._cmp_format_single(results)
                 self.log_queue.put(f"__CMP_DONE__{text}")
             except Exception as e:
                 logger.exception("Quick comparison failed")
@@ -4243,6 +4390,82 @@ class SegmentationGUI(tk.Tk):
                 self.cmp_results.insert(tk.END, text)
                 self.cmp_results.see("1.0")
                 self.cmp_results.config(state=tk.DISABLED)
+
+    # -- Bulk actions ----
+    def _cmp_bulk_preview(self):
+        if not self._cmp_validate_bulk():
+            return
+        try:
+            from compare_masks import auto_match
+            matched, warnings = auto_match(
+                self.cmp_bulk_img_dir.get(),
+                self.cmp_bulk_mask1_dir.get(),
+                self.cmp_bulk_mask2_dir.get(),
+            )
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            return
+
+        lines = [f"Found {len(matched)} matched triplets:\n"]
+        for img, m1, m2 in matched:
+            lines.append(f"  {os.path.basename(img)}")
+            lines.append(f"    M1: {os.path.basename(m1)}")
+            lines.append(f"    M2: {os.path.basename(m2)}")
+            lines.append("")
+        if warnings:
+            lines.append(f"\nWarnings ({len(warnings)}):")
+            for w in warnings:
+                lines.append(f"  {w}")
+
+        self.cmp_bulk_results.config(state=tk.NORMAL)
+        self.cmp_bulk_results.delete("1.0", tk.END)
+        self.cmp_bulk_results.insert(tk.END, "\n".join(lines))
+        self.cmp_bulk_results.config(state=tk.DISABLED)
+        self.cmp_bulk_status.set(f"{len(matched)} pairs matched, {len(warnings)} warnings")
+
+    def _cmp_bulk_run(self):
+        if not self._cmp_validate_bulk():
+            return
+        self._cmp_bulk_set_running(True)
+        self.cmp_bulk_status.set("Running batch comparison...")
+        self.cmp_bulk_results.config(state=tk.NORMAL)
+        self.cmp_bulk_results.delete("1.0", tk.END)
+        self.cmp_bulk_results.config(state=tk.DISABLED)
+
+        def progress_cb(current, total, key, _result):
+            pct = int(100 * current / total) if total > 0 else 0
+            self.log_queue.put(f"__BCMP_PROGRESS__{pct}||{current}||{total}||{key}")
+
+        def worker():
+            try:
+                from compare_masks import compare_batch
+                batch = compare_batch(
+                    self.cmp_bulk_img_dir.get(),
+                    self.cmp_bulk_mask1_dir.get(),
+                    self.cmp_bulk_mask2_dir.get(),
+                    self.cmp_bulk_output_var.get(),
+                    progress_callback=progress_cb,
+                )
+                text = self._cmp_format_batch(batch)
+                self.log_queue.put(f"__BCMP_DONE__{text}")
+            except Exception as e:
+                logger.exception("Batch comparison failed")
+                self.log_queue.put(f"__BCMP_ERROR__{e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_bcmp_finished(self, text: str | None = None, error: str | None = None):
+        self._cmp_bulk_set_running(False)
+        if error:
+            self.cmp_bulk_status.set(f"Error: {error}")
+            messagebox.showerror("Batch Error", str(error))
+        else:
+            self.cmp_bulk_status.set("Batch comparison complete")
+            if text:
+                self.cmp_bulk_results.config(state=tk.NORMAL)
+                self.cmp_bulk_results.insert(tk.END, text)
+                self.cmp_bulk_results.see("1.0")
+                self.cmp_bulk_results.config(state=tk.DISABLED)
 
     @staticmethod
     def _cmp_open_figure(path: str):
@@ -4392,7 +4615,7 @@ class SegmentationGUI(tk.Tk):
                 self._on_eval_finished(error=msg[len("__EVAL_ERROR__"):])
                 continue
 
-            # -- Mask Comparison --
+            # -- Mask Comparison (single) --
             if msg.startswith("__CMP_DONE__"):
                 self._on_cmp_finished(text=msg[len("__CMP_DONE__"):])
                 continue
@@ -4401,6 +4624,21 @@ class SegmentationGUI(tk.Tk):
                 continue
             if msg.startswith("__CMP_OPEN__"):
                 self._cmp_open_figure(msg[len("__CMP_OPEN__"):])
+                continue
+
+            # -- Mask Comparison (bulk) --
+            if msg.startswith("__BCMP_PROGRESS__"):
+                parts = msg[len("__BCMP_PROGRESS__"):].split("||")
+                pct = int(parts[0])
+                cur, tot, key = parts[1], parts[2], parts[3]
+                self.cmp_bulk_progress.config(value=pct)
+                self.cmp_bulk_status.set(f"Comparing {cur}/{tot}: {key}")
+                continue
+            if msg.startswith("__BCMP_DONE__"):
+                self._on_bcmp_finished(text=msg[len("__BCMP_DONE__"):])
+                continue
+            if msg.startswith("__BCMP_ERROR__"):
+                self._on_bcmp_finished(error=msg[len("__BCMP_ERROR__"):])
                 continue
 
             # Append to training log

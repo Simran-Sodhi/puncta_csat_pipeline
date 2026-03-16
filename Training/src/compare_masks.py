@@ -415,14 +415,272 @@ def compare(image_path, mask1_path, mask2_path, output_dir="comparison_report"):
     }
 
 
+# ------------------------------------------------------------------ #
+#  Auto-matching & Batch comparison
+# ------------------------------------------------------------------ #
+import re
+
+_IMAGE_EXTS = {".tif", ".tiff", ".ome.tif", ".png"}
+_MASK_EXTS = {".tif", ".tiff", ".png", ".npy"}
+
+
+def _extract_key(filename: str) -> str:
+    """Extract a matching key from a filename.
+
+    Strategy (in order):
+      1. Strip known suffixes (_img, _masks, _seg, _cell_masks, etc.)
+         and use the remaining stem as the key.
+      2. Fall back to the full stem (minus extension).
+
+    This allows matching across naming conventions:
+      dic_001_img.tif  <->  dic_001_masks.tif  <->  dic_001_seg.npy
+    """
+    stem = filename
+    # Strip extension(s) — handle .ome.tif
+    if stem.lower().endswith(".ome.tif"):
+        stem = stem[:-8]
+    else:
+        stem = os.path.splitext(stem)[0]
+
+    # Strip known suffixes (order matters — longest first)
+    for suffix in [
+        "_cell_masks", "_cyto3_masks", "_cyto_masks",
+        "_nucleus_masks", "_puncta_masks",
+        "_masks", "_seg", "_img",
+    ]:
+        if stem.lower().endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    return stem
+
+
+def _scan_dir(directory: str, extensions: set) -> dict[str, str]:
+    """Scan a directory and return {matching_key: filepath}."""
+    result = {}
+    for fname in sorted(os.listdir(directory)):
+        fpath = os.path.join(directory, fname)
+        if not os.path.isfile(fpath):
+            continue
+        flow = fname.lower()
+        # Check extension match
+        matched_ext = False
+        for ext in extensions:
+            if flow.endswith(ext):
+                matched_ext = True
+                break
+        if not matched_ext:
+            continue
+        key = _extract_key(fname)
+        result[key] = fpath
+    return result
+
+
+def auto_match(
+    image_dir: str,
+    mask1_dir: str,
+    mask2_dir: str,
+) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """Auto-match images with masks from two directories.
+
+    Returns
+    -------
+    matched : list of (image_path, mask1_path, mask2_path)
+    warnings : list of warning messages for unmatched files
+    """
+    images = _scan_dir(image_dir, _IMAGE_EXTS)
+    masks1 = _scan_dir(mask1_dir, _MASK_EXTS)
+    masks2 = _scan_dir(mask2_dir, _MASK_EXTS)
+
+    matched = []
+    warnings = []
+
+    all_keys = sorted(set(images) | set(masks1) | set(masks2))
+    for key in all_keys:
+        img = images.get(key)
+        m1 = masks1.get(key)
+        m2 = masks2.get(key)
+        if img and m1 and m2:
+            matched.append((img, m1, m2))
+        else:
+            parts = []
+            if not img:
+                parts.append("no image")
+            if not m1:
+                parts.append("no mask1")
+            if not m2:
+                parts.append("no mask2")
+            warnings.append(f"Key '{key}': {', '.join(parts)}")
+
+    return matched, warnings
+
+
+def compare_batch(
+    image_dir: str,
+    mask1_dir: str,
+    mask2_dir: str,
+    output_dir: str = "batch_comparison",
+    progress_callback=None,
+) -> dict:
+    """Run comparison on all matched image/mask triplets in directories.
+
+    Parameters
+    ----------
+    image_dir : str
+        Directory containing original images.
+    mask1_dir : str
+        Directory containing ground-truth masks.
+    mask2_dir : str
+        Directory containing model-output masks.
+    output_dir : str
+        Directory for all reports.
+    progress_callback : callable, optional
+        Called with (current_index, total, key, results_dict) after each pair.
+
+    Returns
+    -------
+    dict with keys:
+        "per_pair" : list of {key, image, mask1, mask2, results}
+        "aggregate" : aggregated metrics across all pairs
+        "warnings" : list of warning strings
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    matched, warnings = auto_match(image_dir, mask1_dir, mask2_dir)
+    if not matched:
+        raise ValueError(
+            f"No matched triplets found.\n"
+            f"  Images in '{image_dir}': {len(_scan_dir(image_dir, _IMAGE_EXTS))}\n"
+            f"  Masks1 in '{mask1_dir}': {len(_scan_dir(mask1_dir, _MASK_EXTS))}\n"
+            f"  Masks2 in '{mask2_dir}': {len(_scan_dir(mask2_dir, _MASK_EXTS))}\n"
+            f"Check that filenames share a common stem "
+            f"(e.g. dic_001_img.tif / dic_001_masks.tif / dic_001_seg.npy)."
+        )
+
+    per_pair = []
+    all_binary_iou = []
+    all_binary_dice = []
+    all_obj_ious = []
+    all_ap = {}
+
+    total = len(matched)
+    for idx, (img_path, m1_path, m2_path) in enumerate(matched):
+        key = _extract_key(os.path.basename(img_path))
+        logger.info(f"[{idx + 1}/{total}] Comparing: {key}")
+
+        try:
+            pair_dir = os.path.join(output_dir, key)
+            results = compare(img_path, m1_path, m2_path, pair_dir)
+
+            per_pair.append({
+                "key": key,
+                "image": img_path,
+                "mask1": m1_path,
+                "mask2": m2_path,
+                "results": results,
+            })
+
+            all_binary_iou.append(results["binary"]["binary_iou"])
+            all_binary_dice.append(results["binary"]["binary_dice"])
+            matched_ious = [iou for _, _, iou in results["matches"]]
+            all_obj_ious.extend(matched_ious)
+
+            # Accumulate AP
+            for t, v in results["ap"].items():
+                if t not in all_ap:
+                    all_ap[t] = {"tp": 0, "fp": 0, "fn": 0}
+                all_ap[t]["tp"] += v["tp"]
+                all_ap[t]["fp"] += v["fp"]
+                all_ap[t]["fn"] += v["fn"]
+
+        except Exception as e:
+            logger.error(f"Failed on '{key}': {e}")
+            warnings.append(f"Error on '{key}': {e}")
+
+        if progress_callback:
+            progress_callback(idx + 1, total, key,
+                              per_pair[-1] if per_pair else None)
+
+    # Aggregate
+    aggregate = {}
+    if all_binary_iou:
+        aggregate["mean_binary_iou"] = float(np.mean(all_binary_iou))
+        aggregate["mean_binary_dice"] = float(np.mean(all_binary_dice))
+        aggregate["std_binary_iou"] = float(np.std(all_binary_iou))
+        aggregate["n_pairs"] = len(per_pair)
+    if all_obj_ious:
+        aggregate["mean_object_iou"] = float(np.mean(all_obj_ious))
+        aggregate["median_object_iou"] = float(np.median(all_obj_ious))
+        aggregate["total_matched_objects"] = len(all_obj_ious)
+    for t, v in all_ap.items():
+        tp, fp, fn = v["tp"], v["fp"], v["fn"]
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * prec * recall / (prec + recall) if (prec + recall) > 0 else 0.0
+        aggregate[f"precision@{t}"] = prec
+        aggregate[f"recall@{t}"] = recall
+        aggregate[f"f1@{t}"] = f1
+
+    # Save batch summary CSV
+    summary_csv = os.path.join(output_dir, "batch_summary.csv")
+    with open(summary_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["key", "binary_iou", "binary_dice", "n_objects_m1",
+                     "n_objects_m2", "n_matched", "mean_obj_iou"])
+        for p in per_pair:
+            r = p["results"]
+            matched_ious = [iou for _, _, iou in r["matches"]]
+            w.writerow([
+                p["key"],
+                f"{r['binary']['binary_iou']:.4f}",
+                f"{r['binary']['binary_dice']:.4f}",
+                r["stats_mask1"]["n_objects"],
+                r["stats_mask2"]["n_objects"],
+                len(r["matches"]),
+                f"{np.mean(matched_ious):.4f}" if matched_ious else "N/A",
+            ])
+
+    logger.info(f"Batch summary saved to {summary_csv}")
+
+    return {
+        "per_pair": per_pair,
+        "aggregate": aggregate,
+        "warnings": warnings,
+    }
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Compare two segmentation masks against an original image"
     )
-    parser.add_argument("--image", required=True, help="Path to original image (.ome.tif / .tif)")
-    parser.add_argument("--mask1", required=True, help="Path to mask 1 (_seg.npy or .tif) — e.g. ground truth")
-    parser.add_argument("--mask2", required=True, help="Path to mask 2 (_seg.npy or .tif) — e.g. model output")
-    parser.add_argument("--output", default="comparison_report", help="Output directory for results")
+    sub = parser.add_subparsers(dest="command")
+
+    # Single-pair mode
+    single = sub.add_parser("single", help="Compare a single image/mask pair")
+    single.add_argument("--image", required=True, help="Path to original image")
+    single.add_argument("--mask1", required=True, help="Path to mask 1 (ground truth)")
+    single.add_argument("--mask2", required=True, help="Path to mask 2 (model output)")
+    single.add_argument("--output", default="comparison_report", help="Output directory")
+
+    # Batch mode
+    batch = sub.add_parser("batch", help="Compare all matched pairs in directories")
+    batch.add_argument("--images", required=True, help="Directory of images")
+    batch.add_argument("--masks1", required=True, help="Directory of ground-truth masks")
+    batch.add_argument("--masks2", required=True, help="Directory of model-output masks")
+    batch.add_argument("--output", default="batch_comparison", help="Output directory")
+
+    # Default: legacy single mode
+    parser.add_argument("--image", help="Path to original image")
+    parser.add_argument("--mask1", help="Path to mask 1")
+    parser.add_argument("--mask2", help="Path to mask 2")
+    parser.add_argument("--output", default="comparison_report", help="Output directory")
+
     args = parser.parse_args()
 
-    compare(args.image, args.mask1, args.mask2, args.output)
+    if args.command == "batch":
+        compare_batch(args.images, args.masks1, args.masks2, args.output)
+    elif args.command == "single":
+        compare(args.image, args.mask1, args.mask2, args.output)
+    elif args.image and args.mask1 and args.mask2:
+        compare(args.image, args.mask1, args.mask2, args.output)
+    else:
+        parser.print_help()
