@@ -533,7 +533,8 @@ def fit_logistic_binary(df, x_col="cytoplasm_mean_intensity",
 
 def _sigmoid(x, L, k, x0, b):
     """Generalised logistic: y = b + L / (1 + exp(-k*(x - x0)))"""
-    return b + L / (1.0 + np.exp(-k * (x - x0)))
+    z = np.clip(-k * (x - x0), -500, 500)
+    return b + L / (1.0 + np.exp(z))
 
 
 def fit_sigmoid_intensity(df, x_col="cytoplasm_mean_intensity",
