@@ -2257,7 +2257,6 @@ class SegmentationGUI(tk.Tk):
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        # Mousewheel scrolling
         canvas.bind_all("<MouseWheel>",
                         lambda e: canvas.yview_scroll(-1 * (e.delta // 120), "units"))
         body = self._ana_scroll_frame
@@ -2265,9 +2264,10 @@ class SegmentationGUI(tk.Tk):
         # ---- Description ----
         info = ttk.Label(
             body,
-            text="Estimate the critical concentration (C*) for protein phase separation\n"
-                 "from live-cell fluorescence images. C* is the cytoplasmic protein\n"
-                 "concentration where 50% of cells show phase-separated droplets.",
+            text="Estimate the critical concentration (Csat) for protein phase separation\n"
+                 "from mEGFP fluorescence images using pre-computed masks.\n\n"
+                 "Method 1 (Binary): P(puncta present) vs cytoplasmic intensity -> Csat at P=0.5\n"
+                 "Method 2 (Intensity): Puncta sum intensity vs avg cytoplasm/nucleus intensity -> sigmoid midpoint",
             foreground="gray",
         )
         info.pack(anchor=tk.W, padx=10, pady=(10, 5))
@@ -2303,7 +2303,7 @@ class SegmentationGUI(tk.Tk):
                    command=lambda: self._ana_browse_file(self.ana_nuc_mask_path)).grid(
             row=2, column=2, pady=2)
 
-        ttk.Label(io_frame, text="Puncta Mask (mEGFP, optional):").grid(
+        ttk.Label(io_frame, text="Puncta Mask (mEGFP):").grid(
             row=3, column=0, sticky=tk.W, pady=2)
         self.ana_puncta_mask_path = tk.StringVar()
         ttk.Entry(io_frame, textvariable=self.ana_puncta_mask_path, width=55).grid(
@@ -2312,60 +2312,54 @@ class SegmentationGUI(tk.Tk):
                    command=lambda: self._ana_browse_file(self.ana_puncta_mask_path)).grid(
             row=3, column=2, pady=2)
 
-        # ---- Channel / detection parameters ----
+        # ---- Parameters ----
         param_frame = ttk.LabelFrame(body, text="Parameters", padding=10)
         param_frame.pack(fill=tk.X, padx=10, pady=5)
 
         p_row0 = ttk.Frame(param_frame)
         p_row0.pack(fill=tk.X, pady=2)
 
-        ttk.Label(p_row0, text="Fluorescence channel (mEGFP):").pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(p_row0, text="mEGFP channel index:").pack(side=tk.LEFT, padx=(0, 5))
         self.ana_fluor_ch = tk.IntVar(value=1)
         ttk.Entry(p_row0, textvariable=self.ana_fluor_ch, width=4).pack(side=tk.LEFT, padx=(0, 15))
 
-        ttk.Label(p_row0, text="Droplet threshold (x*std):").pack(side=tk.LEFT, padx=(0, 5))
-        self.ana_thresh_factor = tk.DoubleVar(value=2.0)
-        ttk.Entry(p_row0, textvariable=self.ana_thresh_factor, width=5).pack(side=tk.LEFT, padx=(0, 15))
+        ttk.Label(p_row0, text="Outlier Z-threshold:").pack(side=tk.LEFT, padx=(0, 5))
+        self.ana_z_thresh = tk.DoubleVar(value=3.0)
+        ttk.Entry(p_row0, textvariable=self.ana_z_thresh, width=5).pack(side=tk.LEFT, padx=(0, 15))
 
-        ttk.Label(p_row0, text="Min droplet area (px):").pack(side=tk.LEFT, padx=(0, 5))
-        self.ana_min_drop_area = tk.IntVar(value=5)
-        ttk.Entry(p_row0, textvariable=self.ana_min_drop_area, width=5).pack(side=tk.LEFT, padx=(0, 15))
+        ttk.Label(p_row0, text="Bootstrap iterations:").pack(side=tk.LEFT, padx=(0, 5))
+        self.ana_n_bootstrap = tk.IntVar(value=1000)
+        ttk.Entry(p_row0, textvariable=self.ana_n_bootstrap, width=6).pack(side=tk.LEFT)
 
-        ttk.Label(p_row0, text="Gaussian sigma:").pack(side=tk.LEFT, padx=(0, 5))
-        self.ana_sigma = tk.DoubleVar(value=1.5)
-        ttk.Entry(p_row0, textvariable=self.ana_sigma, width=5).pack(side=tk.LEFT)
-
+        # Method 2 X-axis selection
         p_row1 = ttk.Frame(param_frame)
         p_row1.pack(fill=tk.X, pady=2)
 
-        ttk.Label(p_row1, text="Min circularity:").pack(side=tk.LEFT, padx=(0, 5))
-        self.ana_min_circ = tk.DoubleVar(value=0.3)
-        ttk.Entry(p_row1, textvariable=self.ana_min_circ, width=5).pack(side=tk.LEFT, padx=(0, 15))
-
-        ttk.Label(p_row1, text="Outlier Z-threshold:").pack(side=tk.LEFT, padx=(0, 5))
-        self.ana_z_thresh = tk.DoubleVar(value=3.0)
-        ttk.Entry(p_row1, textvariable=self.ana_z_thresh, width=5).pack(side=tk.LEFT, padx=(0, 15))
-
-        ttk.Label(p_row1, text="Bootstrap iterations:").pack(side=tk.LEFT, padx=(0, 5))
-        self.ana_n_bootstrap = tk.IntVar(value=1000)
-        ttk.Entry(p_row1, textvariable=self.ana_n_bootstrap, width=6).pack(side=tk.LEFT)
+        ttk.Label(p_row1, text="Method 2 X-axis:").pack(side=tk.LEFT, padx=(0, 5))
+        self.ana_method2_xaxis = tk.StringVar(value="cytoplasm")
+        ttk.Radiobutton(p_row1, text="Cytoplasm (Cell - Nucleus)",
+                        variable=self.ana_method2_xaxis,
+                        value="cytoplasm").pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Radiobutton(p_row1, text="Nucleus",
+                        variable=self.ana_method2_xaxis,
+                        value="nucleus").pack(side=tk.LEFT)
 
         # ---- Action buttons ----
         btn_frame = ttk.LabelFrame(body, text="Actions", padding=10)
         btn_frame.pack(fill=tk.X, padx=10, pady=5)
 
         self.btn_ana_measure = ttk.Button(
-            btn_frame, text="Run Measurement Extraction",
+            btn_frame, text="1. Extract Measurements",
             command=self._ana_run_measurement)
         self.btn_ana_measure.pack(side=tk.LEFT, padx=5)
 
-        self.btn_ana_cstar = ttk.Button(
-            btn_frame, text="Estimate Critical Concentration",
-            command=self._ana_run_cstar, state=tk.DISABLED)
-        self.btn_ana_cstar.pack(side=tk.LEFT, padx=5)
+        self.btn_ana_csat = ttk.Button(
+            btn_frame, text="2. Estimate Csat (Both Methods)",
+            command=self._ana_run_csat, state=tk.DISABLED)
+        self.btn_ana_csat.pack(side=tk.LEFT, padx=5)
 
         self.btn_ana_export = ttk.Button(
-            btn_frame, text="Export CSV",
+            btn_frame, text="3. Export CSV",
             command=self._ana_export_csv, state=tk.DISABLED)
         self.btn_ana_export.pack(side=tk.LEFT, padx=5)
 
@@ -2379,23 +2373,23 @@ class SegmentationGUI(tk.Tk):
         summary_frame = ttk.LabelFrame(body, text="Results Summary", padding=10)
         summary_frame.pack(fill=tk.X, padx=10, pady=5)
         self.ana_summary_text = tk.StringVar(
-            value="Run measurement extraction and C* estimation to see results here."
+            value="Run measurement extraction and Csat estimation to see results here."
         )
         ttk.Label(summary_frame, textvariable=self.ana_summary_text,
                   justify=tk.LEFT, wraplength=700).pack(anchor=tk.W)
 
-        # ---- Plot panels (2x2 grid) ----
+        # ---- Plot panels (3x2 grid) ----
         plot_frame = ttk.LabelFrame(body, text="Visualization", padding=5)
         plot_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        # Create 4 sub-frames for plots
         self._ana_plot_frames = {}
-        for idx, (r, c, title) in enumerate([
+        for r, c, title in [
             (0, 0, "Overlay"),
             (0, 1, "Intensity Histogram"),
-            (1, 0, "Intensity vs Droplet Count"),
-            (1, 1, "Phase Transition Curve"),
-        ]):
+            (1, 0, "Intensity vs Puncta Count"),
+            (1, 1, "Method 1: Binary Phase Transition"),
+            (2, 0, "Method 2: Intensity Sigmoid"),
+        ]:
             f = ttk.LabelFrame(plot_frame, text=title, padding=2)
             f.grid(row=r, column=c, padx=4, pady=4, sticky="nsew")
             self._ana_plot_frames[title] = f
@@ -2403,6 +2397,7 @@ class SegmentationGUI(tk.Tk):
         plot_frame.columnconfigure(1, weight=1)
         plot_frame.rowconfigure(0, weight=1)
         plot_frame.rowconfigure(1, weight=1)
+        plot_frame.rowconfigure(2, weight=1)
 
         # ---- Log ----
         log_frame = ttk.LabelFrame(body, text="Log", padding=5)
@@ -2413,12 +2408,13 @@ class SegmentationGUI(tk.Tk):
         self.ana_log.pack(fill=tk.BOTH, expand=True)
 
         # Internal state
-        self._ana_df = None           # per-cell DataFrame
-        self._ana_df_clean = None     # cleaned DataFrame
-        self._ana_fit_result = None   # logistic fit result dict
-        self._ana_droplet_mask = None # combined droplet mask
-        self._ana_fluor_img = None    # loaded fluorescence image
-        self._ana_cell_mask = None    # loaded cell mask
+        self._ana_df = None
+        self._ana_df_clean = None
+        self._ana_result_m1 = None  # Method 1 result
+        self._ana_result_m2 = None  # Method 2 result
+        self._ana_puncta_binary = None
+        self._ana_fluor_img = None
+        self._ana_cell_mask = None
 
     # ---- File browse helper ----
     def _ana_browse_file(self, string_var):
@@ -2464,26 +2460,25 @@ class SegmentationGUI(tk.Tk):
     def _ana_run_measurement(self):
         img_path = self.ana_image_path.get()
         cell_path = self.ana_cell_mask_path.get()
-        if not img_path or not cell_path:
+        puncta_path = self.ana_puncta_mask_path.get()
+        if not img_path or not cell_path or not puncta_path:
             messagebox.showwarning(
                 "Missing input",
-                "Please provide:\n- Fluorescence image\n- Cell mask")
+                "Please provide all required files:\n"
+                "- Fluorescence image (OME-TIFF)\n"
+                "- Cell mask\n"
+                "- Puncta mask")
             return
 
         fluor_ch = self.ana_fluor_ch.get()
-        sigma = self.ana_sigma.get()
-        thresh_f = self.ana_thresh_factor.get()
-        min_area = self.ana_min_drop_area.get()
-        min_circ = self.ana_min_circ.get()
         nuc_path = self.ana_nuc_mask_path.get() or None
-        puncta_path = self.ana_puncta_mask_path.get() or None
 
         self.btn_ana_measure.config(state=tk.DISABLED)
-        self.btn_ana_cstar.config(state=tk.DISABLED)
+        self.btn_ana_csat.config(state=tk.DISABLED)
         self.btn_ana_export.config(state=tk.DISABLED)
         self.ana_progress.config(value=0)
         self.ana_status.set("Extracting measurements...")
-        self._ana_log_append(f"Loading image channel {fluor_ch} from {Path(img_path).name}...")
+        self._ana_log_append(f"Loading mEGFP channel {fluor_ch} from {Path(img_path).name}...")
 
         def task():
             try:
@@ -2494,50 +2489,41 @@ class SegmentationGUI(tk.Tk):
 
                 fluor_img = load_image_channel(img_path, channel_index=fluor_ch)
                 cell_mask = load_mask_2d(cell_path)
+                puncta_mask = load_mask_2d(puncta_path)
                 self._ana_fluor_img = fluor_img
                 self._ana_cell_mask = cell_mask
 
                 self._ana_log_append_q(
-                    f"Image: {fluor_img.shape}, Cell mask: {cell_mask.shape}, "
-                    f"{int(cell_mask.max())} cells")
+                    f"Image: {fluor_img.shape}, Cell mask: {int(cell_mask.max())} cells, "
+                    f"Puncta mask: {int(puncta_mask.max())} objects")
 
                 nuc_mask = None
                 if nuc_path:
                     nuc_mask = load_mask_2d(nuc_path)
                     self._ana_log_append_q(f"Nucleus mask loaded: {int(nuc_mask.max())} nuclei")
 
-                puncta_mask = None
-                if puncta_path:
-                    puncta_mask = load_mask_2d(puncta_path)
-                    self._ana_log_append_q(f"Puncta mask loaded: {int(puncta_mask.max())} puncta objects")
-
                 def _on_progress(current, total):
                     pct = int(100 * current / total) if total > 0 else 0
                     self.log_queue.put(f"__ANA_PROGRESS__{pct}")
 
-                df, droplet_mask = extract_cell_measurements(
+                df, puncta_binary = extract_cell_measurements(
                     fluorescence_img=fluor_img,
                     cell_mask=cell_mask,
-                    nucleus_mask=nuc_mask,
                     puncta_mask=puncta_mask,
-                    sigma=sigma,
-                    threshold_factor=thresh_f,
-                    min_droplet_area=min_area,
-                    min_circularity=min_circ,
+                    nucleus_mask=nuc_mask,
                     progress_callback=_on_progress,
                 )
 
                 self._ana_df = df
-                self._ana_droplet_mask = droplet_mask
+                self._ana_puncta_binary = puncta_binary
 
-                n_with = int(df["droplet_present"].sum())
+                n_with = int(df["puncta_present"].sum())
                 n_total = len(df)
                 self._ana_log_append_q(
                     f"Extraction complete: {n_total} cells, "
-                    f"{n_with} with droplets ({100*n_with/max(n_total,1):.1f}%)")
+                    f"{n_with} with puncta ({100*n_with/max(n_total,1):.1f}%)")
 
-                # Generate overlay plot
-                fig_overlay = plot_overlay(fluor_img, cell_mask, droplet_mask)
+                fig_overlay = plot_overlay(fluor_img, cell_mask, puncta_binary)
                 self.log_queue.put(("__ANA_PLOT__", "Overlay", fig_overlay))
 
                 self.log_queue.put("__ANA_MEASURE_DONE__")
@@ -2546,72 +2532,118 @@ class SegmentationGUI(tk.Tk):
 
         threading.Thread(target=task, daemon=True).start()
 
-    # ---- Estimate C* ----
-    def _ana_run_cstar(self):
+    # ---- Estimate Csat (both methods) ----
+    def _ana_run_csat(self):
         if self._ana_df is None or len(self._ana_df) == 0:
             messagebox.showwarning("No data", "Run measurement extraction first.")
             return
 
         z_thresh = self.ana_z_thresh.get()
         n_boot = self.ana_n_bootstrap.get()
+        m2_xaxis = self.ana_method2_xaxis.get()  # "cytoplasm" or "nucleus"
 
-        self.btn_ana_cstar.config(state=tk.DISABLED)
-        self.ana_status.set("Fitting logistic model & bootstrapping...")
-        self._ana_log_append("Cleaning data and fitting logistic regression...")
+        # Determine Method 2 column
+        if m2_xaxis == "nucleus":
+            m2_col = "nucleus_mean_intensity"
+            m2_label = "Nucleus"
+        else:
+            m2_col = "cytoplasm_mean_intensity"
+            m2_label = "Cytoplasm"
+
+        # Check nucleus data available if needed
+        if m2_xaxis == "nucleus" and self._ana_df["nucleus_mean_intensity"].isna().all():
+            messagebox.showwarning(
+                "No nucleus data",
+                "Nucleus mask was not provided during extraction.\n"
+                "Please re-extract with a nucleus mask, or select 'Cytoplasm' for Method 2.")
+            return
+
+        self.btn_ana_csat.config(state=tk.DISABLED)
+        self.ana_status.set("Fitting Csat models (Methods 1 & 2)...")
+        self._ana_log_append("Cleaning data and fitting both Csat methods...")
 
         def task():
             try:
                 from phase_separation import (
-                    clean_data, fit_logistic,
-                    plot_intensity_histogram,
-                    plot_scatter_droplet_count,
-                    plot_phase_transition,
+                    clean_data, fit_logistic_binary, fit_sigmoid_intensity,
+                    plot_intensity_histogram, plot_scatter_puncta_count,
+                    plot_method1_phase_transition, plot_method2_sigmoid,
                 )
 
-                df_clean = clean_data(self._ana_df, z_threshold=z_thresh)
+                # Clean data (using cytoplasm col for Method 1)
+                df_clean = clean_data(self._ana_df,
+                                      intensity_col="cytoplasm_mean_intensity",
+                                      z_threshold=z_thresh)
                 self._ana_df_clean = df_clean
                 n_removed = len(self._ana_df) - len(df_clean)
                 self._ana_log_append_q(
-                    f"Cleaned: {len(df_clean)} cells kept, {n_removed} removed "
-                    f"(NaN or outlier)")
+                    f"Cleaned: {len(df_clean)} cells kept, {n_removed} removed")
 
-                result = fit_logistic(df_clean, n_bootstrap=n_boot)
-                self._ana_fit_result = result
+                # --- Method 1: Binary logistic ---
+                self._ana_log_append_q("Method 1: Fitting logistic P(puncta) ~ cyto intensity...")
+                result_m1 = fit_logistic_binary(
+                    df_clean, x_col="cytoplasm_mean_intensity",
+                    n_bootstrap=n_boot)
+                self._ana_result_m1 = result_m1
 
-                if "error" in result:
-                    self._ana_log_append_q(f"[WARN] {result['error']}")
+                if "error" in result_m1:
+                    self._ana_log_append_q(f"  [WARN] Method 1: {result_m1['error']}")
+                else:
+                    self._ana_log_append_q(
+                        f"  Method 1 Csat = {result_m1['csat']:.2f}  "
+                        f"(95% CI: [{result_m1['ci_low']:.2f}, {result_m1['ci_high']:.2f}])")
 
-                c_star = result["c_star"]
-                ci_lo = result["ci_low"]
-                ci_hi = result["ci_high"]
+                # --- Method 2: Sigmoid intensity ---
                 self._ana_log_append_q(
-                    f"C* = {c_star:.2f}  (95% CI: [{ci_lo:.2f}, {ci_hi:.2f}])")
-                self._ana_log_append_q(
-                    f"Cells with droplets: {result['n_with_drops']}, "
-                    f"without: {result['n_no_drops']}")
+                    f"Method 2: Fitting sigmoid puncta_sum ~ {m2_label} intensity...")
+                result_m2 = fit_sigmoid_intensity(
+                    df_clean, x_col=m2_col, n_bootstrap=n_boot)
+                self._ana_result_m2 = result_m2
 
-                # Build summary text
-                summary = (
-                    f"Estimated Critical Concentration (C*): {c_star:.2f}\n"
-                    f"95% Confidence Interval: [{ci_lo:.2f}, {ci_hi:.2f}]\n"
-                    f"Total cells analyzed: {result['n_cells']}\n"
-                    f"  With droplets: {result['n_with_drops']}  |  "
-                    f"Without: {result['n_no_drops']}\n"
-                    f"Logistic slope: {result['slope']:.4f}\n\n"
-                    f"C* is the cytoplasmic protein concentration at which 50% of cells\n"
-                    f"show phase-separated droplets, providing an estimate of the\n"
-                    f"phase separation threshold."
-                )
-                self.log_queue.put(f"__ANA_SUMMARY__{summary}")
+                if "error" in result_m2:
+                    self._ana_log_append_q(f"  [WARN] Method 2: {result_m2['error']}")
+                else:
+                    self._ana_log_append_q(
+                        f"  Method 2 Csat = {result_m2['csat']:.2f}  "
+                        f"(95% CI: [{result_m2['ci_low']:.2f}, {result_m2['ci_high']:.2f}])")
 
-                # Generate plots
+                # --- Build summary ---
+                lines = []
+                lines.append("=" * 50)
+                lines.append("METHOD 1: Binary Logistic Regression")
+                lines.append(f"  P(puncta_present) vs Cytoplasmic Mean Intensity (mEGFP)")
+                if "error" not in result_m1:
+                    lines.append(f"  Csat = {result_m1['csat']:.2f}  "
+                                 f"(95% CI: [{result_m1['ci_low']:.2f}, {result_m1['ci_high']:.2f}])")
+                    lines.append(f"  Cells with puncta: {result_m1['n_with_puncta']}  |  "
+                                 f"Without: {result_m1['n_no_puncta']}")
+                else:
+                    lines.append(f"  {result_m1['error']}")
+
+                lines.append("")
+                lines.append("METHOD 2: Sigmoid Intensity Fit")
+                lines.append(f"  Puncta Sum Intensity vs {m2_label} Mean Intensity (mEGFP)")
+                if "error" not in result_m2:
+                    lines.append(f"  Csat = {result_m2['csat']:.2f}  "
+                                 f"(95% CI: [{result_m2['ci_low']:.2f}, {result_m2['ci_high']:.2f}])")
+                else:
+                    lines.append(f"  {result_m2['error']}")
+                lines.append("=" * 50)
+                lines.append(f"Total cells analyzed: {len(df_clean)}")
+
+                summary_text = "\n".join(lines)
+                self.log_queue.put(f"__ANA_SUMMARY__{summary_text}")
+
+                # --- Plots ---
                 fig_hist = plot_intensity_histogram(df_clean)
-                fig_scatter = plot_scatter_droplet_count(df_clean)
-                fig_phase = plot_phase_transition(df_clean, result)
+                fig_scatter = plot_scatter_puncta_count(df_clean)
+                fig_m1 = plot_method1_phase_transition(df_clean, result_m1)
+                fig_m2 = plot_method2_sigmoid(df_clean, result_m2)
 
                 self.log_queue.put(("__ANA_PLOT__", "Intensity Histogram", fig_hist))
-                self.log_queue.put(("__ANA_PLOT__", "Intensity vs Droplet Count", fig_scatter))
-                self.log_queue.put(("__ANA_PLOT__", "Phase Transition Curve", fig_phase))
+                self.log_queue.put(("__ANA_PLOT__", "Intensity vs Puncta Count", fig_scatter))
+                self.log_queue.put(("__ANA_PLOT__", "Method 1: Binary Phase Transition", fig_m1))
+                self.log_queue.put(("__ANA_PLOT__", "Method 2: Intensity Sigmoid", fig_m2))
 
                 self.log_queue.put("__ANA_CSTAR_DONE__")
             except Exception as exc:
@@ -2630,8 +2662,10 @@ class SegmentationGUI(tk.Tk):
         if not path:
             return
 
-        cols = ["cell_id", "cytoplasm_mean_intensity", "total_cell_intensity",
-                "droplet_present", "droplet_count", "droplet_total_area"]
+        cols = ["cell_id", "cell_area", "cytoplasm_mean_intensity",
+                "nucleus_mean_intensity", "total_cell_intensity",
+                "puncta_present", "puncta_count", "puncta_total_area",
+                "puncta_sum_intensity"]
         export_cols = [c for c in cols if c in df.columns]
         df[export_cols].to_csv(path, index=False)
         self._ana_log_append(f"CSV exported: {path}  ({len(df)} rows)")
@@ -2641,7 +2675,7 @@ class SegmentationGUI(tk.Tk):
     def _on_ana_finished(self, csv_path=None, error=None):
         """Handle analysis error messages."""
         self.btn_ana_measure.config(state=tk.NORMAL)
-        self.btn_ana_cstar.config(state=tk.NORMAL)
+        self.btn_ana_csat.config(state=tk.NORMAL)
         self.btn_ana_export.config(state=tk.NORMAL)
         self.ana_progress.config(value=100)
         if error:
@@ -2653,17 +2687,17 @@ class SegmentationGUI(tk.Tk):
     def _on_ana_measure_done(self):
         """Called when measurement extraction finishes."""
         self.btn_ana_measure.config(state=tk.NORMAL)
-        self.btn_ana_cstar.config(state=tk.NORMAL)
+        self.btn_ana_csat.config(state=tk.NORMAL)
         self.btn_ana_export.config(state=tk.NORMAL)
         self.ana_progress.config(value=100)
-        self.ana_status.set("Measurement extraction complete. Ready for C* estimation.")
+        self.ana_status.set("Measurement extraction complete. Ready for Csat estimation.")
 
     def _on_ana_cstar_done(self):
-        """Called when C* estimation finishes."""
-        self.btn_ana_cstar.config(state=tk.NORMAL)
+        """Called when Csat estimation finishes."""
+        self.btn_ana_csat.config(state=tk.NORMAL)
         self.btn_ana_export.config(state=tk.NORMAL)
         self.ana_progress.config(value=100)
-        self.ana_status.set("C* estimation complete.")
+        self.ana_status.set("Csat estimation complete (both methods).")
 
     # ==================================================================
     # Helper: generic directory browse

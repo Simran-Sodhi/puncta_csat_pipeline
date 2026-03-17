@@ -1,28 +1,34 @@
 """
 phase_separation.py
 
-Backend module for estimating the critical concentration (C*) for
+Backend module for estimating the critical concentration (Csat) for
 protein phase separation from live-cell fluorescence images.
 
+Two methods for Csat estimation:
+
+  Method 1 (Binary):
+    Logistic regression: P(puncta_present) vs cytoplasmic mean intensity
+    Csat = intensity where P = 0.5
+
+  Method 2 (Intensity):
+    Sigmoid curve fit: puncta sum intensity vs average intensity
+    of cytoplasm (cell - nucleus) OR nucleus (user-defined).
+    Csat = intensity at 50% of the fitted maximum.
+
 Pipeline:
-  1. Extract per-cell measurements from fluorescence image + masks
-  2. Detect droplets (condensates) within each cell
-  3. Compute cytoplasmic intensity excluding droplets
-  4. Fit logistic regression: P(droplet) vs cytoplasmic intensity
-  5. Estimate C* (50% probability threshold) with bootstrap CI
+  1. Load mEGFP fluorescence image + cell/nucleus/puncta masks
+  2. Extract per-cell measurements using puncta mask directly
+  3. Fit both Csat models with bootstrap confidence intervals
 
 Designed for GUI integration — all heavy computation in functions
 that accept a progress_callback(current, total) for reporting.
 """
 
 import logging
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.ndimage import gaussian_filter, label as ndi_label
-from skimage.measure import regionprops
-from skimage.morphology import remove_small_objects, binary_opening, disk
+from scipy.ndimage import label as ndi_label
 
 logger = logging.getLogger(__name__)
 
@@ -73,119 +79,44 @@ def load_mask_2d(path):
 
 
 # ------------------------------------------------------------------ #
-#  2. Droplet detection
-# ------------------------------------------------------------------ #
-
-def detect_droplets_in_cell(fluorescence, cell_binary,
-                            sigma=1.5,
-                            threshold_factor=2.0,
-                            min_droplet_area=5,
-                            min_circularity=0.3):
-    """
-    Detect bright puncta (phase-separated droplets) within a single cell.
-
-    Parameters
-    ----------
-    fluorescence : 2D array
-        Fluorescence channel (full image).
-    cell_binary : 2D bool array
-        Binary mask of the cell region.
-    sigma : float
-        Gaussian smoothing sigma before thresholding.
-    threshold_factor : float
-        Droplets must exceed (background_mean + factor * background_std).
-    min_droplet_area : int
-        Minimum area in pixels for a valid droplet.
-    min_circularity : float
-        Minimum circularity (4*pi*area / perimeter^2) to keep.
-        Set 0 to disable.
-
-    Returns
-    -------
-    droplet_mask : 2D bool array (same shape as fluorescence)
-        Binary mask of detected droplets within this cell.
-    """
-    cell_pixels = fluorescence[cell_binary]
-    if cell_pixels.size == 0:
-        return np.zeros_like(cell_binary)
-
-    # Smooth and threshold
-    smoothed = gaussian_filter(fluorescence, sigma=sigma)
-    bg_mean = np.mean(cell_pixels)
-    bg_std = np.std(cell_pixels)
-    thresh = bg_mean + threshold_factor * bg_std
-
-    bright = (smoothed > thresh) & cell_binary
-
-    # Morphological opening to remove noise
-    if bright.any():
-        bright = binary_opening(bright, footprint=disk(1))
-
-    # Label connected components and filter
-    labeled, n_obj = ndi_label(bright)
-    droplet_mask = np.zeros_like(cell_binary)
-
-    if n_obj == 0:
-        return droplet_mask
-
-    # Remove small objects
-    labeled = remove_small_objects(labeled, min_size=min_droplet_area)
-
-    # Filter by circularity
-    for prop in regionprops(labeled):
-        if prop.perimeter > 0 and min_circularity > 0:
-            circ = 4 * np.pi * prop.area / (prop.perimeter ** 2)
-            if circ < min_circularity:
-                continue
-        droplet_mask[labeled == prop.label] = True
-
-    return droplet_mask
-
-
-# ------------------------------------------------------------------ #
-#  3. Per-cell measurement extraction
+#  2. Per-cell measurement extraction (puncta mask required)
 # ------------------------------------------------------------------ #
 
 def extract_cell_measurements(fluorescence_img, cell_mask,
+                              puncta_mask,
                               nucleus_mask=None,
-                              puncta_mask=None,
-                              sigma=1.5,
-                              threshold_factor=2.0,
-                              min_droplet_area=5,
-                              min_circularity=0.3,
                               progress_callback=None):
     """
-    Extract per-cell measurements from a fluorescence image.
+    Extract per-cell measurements from mEGFP fluorescence + masks.
 
     Parameters
     ----------
     fluorescence_img : 2D array
-        The fluorescence channel (e.g. mEGFP, channel 1).
+        The mEGFP fluorescence channel.
     cell_mask : 2D int array
         Labeled cell mask (0=background, 1..N=cells).
+    puncta_mask : 2D int array
+        Labeled puncta (droplet) mask. Used directly — no auto-detection.
     nucleus_mask : 2D int array or None
         Labeled nucleus mask. If provided, cytoplasm = cell - nucleus.
-    puncta_mask : 2D int array or None
-        Pre-computed puncta mask. If provided, used instead of
-        auto-detection for droplet identification.
-    sigma, threshold_factor, min_droplet_area, min_circularity
-        Parameters for auto droplet detection (used when puncta_mask
-        is None).
     progress_callback : callable(current, total) or None
 
     Returns
     -------
-    df : pd.DataFrame
-        Per-cell measurements.
-    combined_droplet_mask : 2D bool array
-        Union of all detected droplet masks (for visualization).
+    df : pd.DataFrame with columns:
+        cell_id, cell_area, total_cell_intensity,
+        cytoplasm_mean_intensity, nucleus_mean_intensity,
+        puncta_present, puncta_count, puncta_total_area,
+        puncta_sum_intensity
+    puncta_binary : 2D bool array
+        Combined puncta mask (for visualization).
     """
     cell_ids = np.unique(cell_mask)
     cell_ids = cell_ids[cell_ids != 0]
     total = len(cell_ids)
 
+    puncta_binary = (puncta_mask > 0)
     records = []
-    combined_droplet_mask = np.zeros(cell_mask.shape, dtype=bool)
 
     for idx, cid in enumerate(cell_ids):
         if progress_callback and idx % 10 == 0:
@@ -194,191 +125,254 @@ def extract_cell_measurements(fluorescence_img, cell_mask,
         cell_binary = cell_mask == cid
         cell_area = int(cell_binary.sum())
 
-        # Total cell intensity
+        # Total cell intensity (mEGFP)
         total_intensity = float(fluorescence_img[cell_binary].sum())
 
-        # Determine cytoplasm region
+        # Puncta within this cell
+        cell_puncta = puncta_binary & cell_binary
+        labeled_puncta, n_puncta = ndi_label(cell_puncta)
+        puncta_area = int(cell_puncta.sum())
+
+        # Sum intensity of puncta pixels in mEGFP channel
+        if cell_puncta.any():
+            puncta_sum_int = float(fluorescence_img[cell_puncta].sum())
+        else:
+            puncta_sum_int = 0.0
+
+        # Nucleus region
         if nucleus_mask is not None:
             nuc_binary = (nucleus_mask > 0) & cell_binary
             cyto_binary = cell_binary & ~nuc_binary
         else:
+            nuc_binary = None
             cyto_binary = cell_binary
 
-        # Detect or use pre-computed droplets
-        if puncta_mask is not None:
-            # Use pre-computed puncta mask within this cell
-            cell_droplets = (puncta_mask > 0) & cell_binary
+        # Cytoplasm intensity EXCLUDING puncta (unbiased for Csat)
+        cyto_no_puncta = cyto_binary & ~cell_puncta
+        cyto_pixels = fluorescence_img[cyto_no_puncta]
+        cyto_mean = float(np.mean(cyto_pixels)) if cyto_pixels.size > 0 else np.nan
+
+        # Nucleus mean intensity
+        if nuc_binary is not None:
+            nuc_no_puncta = nuc_binary & ~cell_puncta
+            nuc_pixels = fluorescence_img[nuc_no_puncta]
+            nuc_mean = float(np.mean(nuc_pixels)) if nuc_pixels.size > 0 else np.nan
         else:
-            cell_droplets = detect_droplets_in_cell(
-                fluorescence_img, cyto_binary,
-                sigma=sigma,
-                threshold_factor=threshold_factor,
-                min_droplet_area=min_droplet_area,
-                min_circularity=min_circularity,
-            )
-
-        combined_droplet_mask |= cell_droplets
-
-        # Droplet metrics
-        labeled_drops, n_drops = ndi_label(cell_droplets)
-        droplet_count = n_drops
-        droplet_total_area = int(cell_droplets.sum())
-
-        # Cytoplasm intensity EXCLUDING droplets (critical for unbiased C*)
-        cyto_no_drops = cyto_binary & ~cell_droplets
-        cyto_pixels = fluorescence_img[cyto_no_drops]
-        if cyto_pixels.size > 0:
-            cyto_mean_intensity = float(np.mean(cyto_pixels))
-        else:
-            cyto_mean_intensity = np.nan
+            nuc_mean = np.nan
 
         records.append({
             "cell_id": int(cid),
             "cell_area": cell_area,
             "total_cell_intensity": total_intensity,
-            "cytoplasm_mean_intensity": cyto_mean_intensity,
-            "droplet_present": 1 if droplet_count > 0 else 0,
-            "droplet_count": droplet_count,
-            "droplet_total_area": droplet_total_area,
+            "cytoplasm_mean_intensity": cyto_mean,
+            "nucleus_mean_intensity": nuc_mean,
+            "puncta_present": 1 if n_puncta > 0 else 0,
+            "puncta_count": n_puncta,
+            "puncta_total_area": puncta_area,
+            "puncta_sum_intensity": puncta_sum_int,
         })
 
     if progress_callback:
         progress_callback(total, total)
 
     df = pd.DataFrame(records)
-    return df, combined_droplet_mask
+    return df, puncta_binary
 
 
 # ------------------------------------------------------------------ #
-#  4. Data cleaning
+#  3. Data cleaning
 # ------------------------------------------------------------------ #
 
-def clean_data(df, z_threshold=3.0):
+def clean_data(df, intensity_col="cytoplasm_mean_intensity", z_threshold=3.0):
     """
     Clean per-cell data before analysis.
 
-    1. Drop rows with NaN cytoplasm_mean_intensity.
+    1. Drop rows with NaN in intensity_col.
     2. Remove outliers beyond z_threshold standard deviations.
 
     Returns a copy; does not modify the input.
     """
-    out = df.dropna(subset=["cytoplasm_mean_intensity"]).copy()
+    out = df.dropna(subset=[intensity_col]).copy()
     if len(out) < 3:
         return out
 
-    mean_c = out["cytoplasm_mean_intensity"].mean()
-    std_c = out["cytoplasm_mean_intensity"].std()
+    mean_c = out[intensity_col].mean()
+    std_c = out[intensity_col].std()
     if std_c > 0:
-        z_scores = np.abs((out["cytoplasm_mean_intensity"] - mean_c) / std_c)
+        z_scores = np.abs((out[intensity_col] - mean_c) / std_c)
         out = out[z_scores <= z_threshold].copy()
 
     return out.reset_index(drop=True)
 
 
 # ------------------------------------------------------------------ #
-#  5. Critical concentration estimation (logistic regression)
+#  4. Method 1: Binary logistic regression  P(puncta) ~ intensity
 # ------------------------------------------------------------------ #
 
-def fit_logistic(df, n_bootstrap=1000, ci=0.95, random_state=42):
+def fit_logistic_binary(df, x_col="cytoplasm_mean_intensity",
+                        n_bootstrap=1000, ci=0.95, random_state=42):
     """
-    Fit a logistic regression: P(droplet_present) ~ cytoplasm_mean_intensity.
+    Method 1: Logistic regression P(puncta_present) ~ x_col.
+    Csat = x where P = 0.5 (the decision boundary).
 
-    Returns
-    -------
-    result : dict with keys:
-        c_star        : float — estimated critical concentration
-        slope         : float — logistic slope parameter
-        ci_low        : float — lower bound of C* CI
-        ci_high       : float — upper bound of C* CI
-        model         : fitted LogisticRegression object
-        n_cells       : int
-        n_with_drops  : int
-        n_no_drops    : int
+    Returns dict with: csat, slope, ci_low, ci_high, model, counts, method.
     """
     from sklearn.linear_model import LogisticRegression
 
-    X = df["cytoplasm_mean_intensity"].values.reshape(-1, 1)
-    y = df["droplet_present"].values
+    X = df[x_col].values.reshape(-1, 1)
+    y = df["puncta_present"].values
 
-    # Check we have both classes
+    base = {
+        "method": "binary",
+        "x_col": x_col,
+        "n_cells": len(df),
+        "n_with_puncta": int(y.sum()),
+        "n_no_puncta": int((y == 0).sum()),
+    }
+
     if len(np.unique(y)) < 2:
-        return {
-            "c_star": np.nan,
-            "slope": np.nan,
-            "ci_low": np.nan,
-            "ci_high": np.nan,
-            "model": None,
-            "n_cells": len(df),
-            "n_with_drops": int(y.sum()),
-            "n_no_drops": int((y == 0).sum()),
-            "error": "Need cells both with and without droplets.",
-        }
+        return {**base, "csat": np.nan, "slope": np.nan,
+                "ci_low": np.nan, "ci_high": np.nan, "model": None,
+                "error": "Need cells both with and without puncta."}
 
-    # Fit on full dataset
     model = LogisticRegression(solver="lbfgs", max_iter=1000)
     model.fit(X, y)
 
     slope = float(model.coef_[0, 0])
     intercept = float(model.intercept_[0])
-    c_star = -intercept / slope if slope != 0 else np.nan
+    csat = -intercept / slope if slope != 0 else np.nan
 
-    # Bootstrap C*
+    # Bootstrap
     rng = np.random.RandomState(random_state)
-    c_star_boots = []
+    csat_boots = []
     n = len(df)
     for _ in range(n_bootstrap):
         idx = rng.randint(0, n, size=n)
-        X_b = X[idx]
-        y_b = y[idx]
+        X_b, y_b = X[idx], y[idx]
         if len(np.unique(y_b)) < 2:
             continue
         m = LogisticRegression(solver="lbfgs", max_iter=1000)
         m.fit(X_b, y_b)
         s = float(m.coef_[0, 0])
         if s != 0:
-            c_star_boots.append(-float(m.intercept_[0]) / s)
+            csat_boots.append(-float(m.intercept_[0]) / s)
 
     alpha = (1 - ci) / 2
-    if c_star_boots:
-        ci_low = float(np.percentile(c_star_boots, 100 * alpha))
-        ci_high = float(np.percentile(c_star_boots, 100 * (1 - alpha)))
+    if csat_boots:
+        ci_low = float(np.percentile(csat_boots, 100 * alpha))
+        ci_high = float(np.percentile(csat_boots, 100 * (1 - alpha)))
     else:
         ci_low = ci_high = np.nan
 
-    return {
-        "c_star": c_star,
-        "slope": slope,
-        "ci_low": ci_low,
-        "ci_high": ci_high,
-        "model": model,
+    return {**base, "csat": csat, "slope": slope,
+            "ci_low": ci_low, "ci_high": ci_high, "model": model}
+
+
+# ------------------------------------------------------------------ #
+#  5. Method 2: Sigmoid fit  puncta_sum_intensity ~ avg_intensity
+# ------------------------------------------------------------------ #
+
+def _sigmoid(x, L, k, x0, b):
+    """Generalised logistic: y = b + L / (1 + exp(-k*(x - x0)))"""
+    return b + L / (1.0 + np.exp(-k * (x - x0)))
+
+
+def fit_sigmoid_intensity(df, x_col="cytoplasm_mean_intensity",
+                          n_bootstrap=1000, ci=0.95, random_state=42):
+    """
+    Method 2: Fit sigmoid curve to puncta_sum_intensity vs x_col.
+    Csat = x0, the midpoint where the response reaches 50% of its max.
+
+    Returns dict with: csat, L, k, x0, b, ci_low, ci_high, method.
+    """
+    from scipy.optimize import curve_fit
+
+    x = df[x_col].values.astype(np.float64)
+    y = df["puncta_sum_intensity"].values.astype(np.float64)
+
+    base = {
+        "method": "intensity",
+        "x_col": x_col,
         "n_cells": len(df),
-        "n_with_drops": int(y.sum()),
-        "n_no_drops": int((y == 0).sum()),
     }
+
+    if len(x) < 5:
+        return {**base, "csat": np.nan, "L": np.nan, "k": np.nan,
+                "x0": np.nan, "b": np.nan, "ci_low": np.nan,
+                "ci_high": np.nan, "popt": None,
+                "error": "Need at least 5 cells for sigmoid fit."}
+
+    # Initial guesses
+    y_range = np.max(y) - np.min(y)
+    x_mid = np.median(x)
+    p0 = [y_range, 0.01, x_mid, np.min(y)]
+    bounds = ([0, -np.inf, np.min(x) - np.ptp(x), -np.inf],
+              [np.inf, np.inf, np.max(x) + np.ptp(x), np.inf])
+
+    try:
+        popt, _ = curve_fit(_sigmoid, x, y, p0=p0, bounds=bounds,
+                            maxfev=10000)
+    except (RuntimeError, ValueError) as e:
+        return {**base, "csat": np.nan, "L": np.nan, "k": np.nan,
+                "x0": np.nan, "b": np.nan, "ci_low": np.nan,
+                "ci_high": np.nan, "popt": None,
+                "error": f"Sigmoid fit failed: {e}"}
+
+    L, k, x0, b = popt
+    csat = x0  # midpoint of sigmoid = 50% of L
+
+    # Bootstrap
+    rng = np.random.RandomState(random_state)
+    csat_boots = []
+    n = len(df)
+    for _ in range(n_bootstrap):
+        idx = rng.randint(0, n, size=n)
+        x_b, y_b = x[idx], y[idx]
+        try:
+            popt_b, _ = curve_fit(_sigmoid, x_b, y_b, p0=popt,
+                                  bounds=bounds, maxfev=5000)
+            csat_boots.append(popt_b[2])  # x0
+        except (RuntimeError, ValueError):
+            continue
+
+    alpha = (1 - ci) / 2
+    if csat_boots:
+        ci_low = float(np.percentile(csat_boots, 100 * alpha))
+        ci_high = float(np.percentile(csat_boots, 100 * (1 - alpha)))
+    else:
+        ci_low = ci_high = np.nan
+
+    return {**base, "csat": csat, "L": float(L), "k": float(k),
+            "x0": float(x0), "b": float(b),
+            "ci_low": ci_low, "ci_high": ci_high, "popt": popt}
 
 
 # ------------------------------------------------------------------ #
 #  6. Plotting helpers (return matplotlib Figure objects)
 # ------------------------------------------------------------------ #
 
-def plot_intensity_histogram(df):
-    """Histogram of cytoplasmic intensity distribution."""
+def _make_figure(w=5, h=3.5):
     import matplotlib
     matplotlib.use("Agg")
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_agg import FigureCanvasAgg
-
-    fig = Figure(figsize=(5, 3.5))
+    fig = Figure(figsize=(w, h))
     FigureCanvasAgg(fig)
+    return fig
+
+
+def plot_intensity_histogram(df):
+    """Histogram of cytoplasmic intensity, coloured by puncta presence."""
+    fig = _make_figure()
     ax = fig.add_subplot(111)
 
     vals = df["cytoplasm_mean_intensity"].dropna().values
-    has_drops = df["droplet_present"].values == 1
-    no_drops = ~has_drops & ~np.isnan(df["cytoplasm_mean_intensity"].values)
+    has = df["puncta_present"].values == 1
+    no = ~has & ~np.isnan(df["cytoplasm_mean_intensity"].values)
 
-    ax.hist(vals[no_drops], bins=40, alpha=0.6, label="No droplets", color="#4C72B0")
-    ax.hist(vals[has_drops], bins=40, alpha=0.6, label="With droplets", color="#DD8452")
-    ax.set_xlabel("Cytoplasmic Mean Intensity")
+    ax.hist(vals[no], bins=40, alpha=0.6, label="No puncta", color="#4C72B0")
+    ax.hist(vals[has], bins=40, alpha=0.6, label="With puncta", color="#DD8452")
+    ax.set_xlabel("Cytoplasmic Mean Intensity (mEGFP)")
     ax.set_ylabel("Cell Count")
     ax.set_title("Cytoplasmic Intensity Distribution")
     ax.legend()
@@ -386,46 +380,30 @@ def plot_intensity_histogram(df):
     return fig
 
 
-def plot_scatter_droplet_count(df):
-    """Scatter: cytoplasm_mean_intensity vs droplet_count."""
-    import matplotlib
-    matplotlib.use("Agg")
-    from matplotlib.figure import Figure
-    from matplotlib.backends.backend_agg import FigureCanvasAgg
-
-    fig = Figure(figsize=(5, 3.5))
-    FigureCanvasAgg(fig)
+def plot_scatter_puncta_count(df):
+    """Scatter: cytoplasm_mean_intensity vs puncta_count."""
+    fig = _make_figure()
     ax = fig.add_subplot(111)
-
-    x = df["cytoplasm_mean_intensity"].values
-    y = df["droplet_count"].values
-    ax.scatter(x, y, alpha=0.4, s=12, edgecolors="none")
-    ax.set_xlabel("Cytoplasmic Mean Intensity")
-    ax.set_ylabel("Droplet Count")
-    ax.set_title("Intensity vs Droplet Count")
+    ax.scatter(df["cytoplasm_mean_intensity"].values,
+               df["puncta_count"].values, alpha=0.4, s=12, edgecolors="none")
+    ax.set_xlabel("Cytoplasmic Mean Intensity (mEGFP)")
+    ax.set_ylabel("Puncta Count")
+    ax.set_title("Intensity vs Puncta Count")
     fig.tight_layout()
     return fig
 
 
-def plot_phase_transition(df, fit_result):
+def plot_method1_phase_transition(df, result):
     """
-    Phase transition plot:
-      - Raw data points (jittered)
-      - Binned fraction with droplets
-      - Fitted logistic curve
-      - Vertical line at C*
+    Method 1 plot: P(puncta_present) vs cytoplasm intensity.
+    Jittered raw data + binned fractions + logistic curve + Csat line.
     """
-    import matplotlib
-    matplotlib.use("Agg")
-    from matplotlib.figure import Figure
-    from matplotlib.backends.backend_agg import FigureCanvasAgg
-
-    fig = Figure(figsize=(6, 4))
-    FigureCanvasAgg(fig)
+    fig = _make_figure(6, 4)
     ax = fig.add_subplot(111)
 
-    x = df["cytoplasm_mean_intensity"].values
-    y = df["droplet_present"].values
+    x_col = result.get("x_col", "cytoplasm_mean_intensity")
+    x = df[x_col].values
+    y = df["puncta_present"].values
 
     # Jittered raw data
     jitter = np.random.default_rng(0).uniform(-0.03, 0.03, size=len(y))
@@ -435,77 +413,104 @@ def plot_phase_transition(df, fit_result):
     # Binned fractions
     n_bins = min(20, max(5, len(df) // 20))
     bins = np.linspace(np.nanmin(x), np.nanmax(x), n_bins + 1)
-    bin_centers = []
-    bin_fractions = []
     for i in range(n_bins):
         mask = (x >= bins[i]) & (x < bins[i + 1])
         if mask.sum() >= 3:
-            bin_centers.append((bins[i] + bins[i + 1]) / 2)
-            bin_fractions.append(y[mask].mean())
-    ax.scatter(bin_centers, bin_fractions, color="#DD8452", s=40,
-               zorder=3, edgecolors="black", linewidths=0.5,
-               label="Binned fraction")
+            cx = (bins[i] + bins[i + 1]) / 2
+            ax.scatter(cx, y[mask].mean(), color="#DD8452", s=40, zorder=3,
+                       edgecolors="black", linewidths=0.5)
 
-    # Fitted logistic curve
-    model = fit_result.get("model")
-    c_star = fit_result.get("c_star", np.nan)
-    if model is not None and not np.isnan(c_star):
+    # Logistic curve
+    model = result.get("model")
+    csat = result.get("csat", np.nan)
+    if model is not None and not np.isnan(csat):
         x_curve = np.linspace(np.nanmin(x), np.nanmax(x), 300)
         y_curve = model.predict_proba(x_curve.reshape(-1, 1))[:, 1]
         ax.plot(x_curve, y_curve, color="#C44E52", linewidth=2,
                 label="Logistic fit", zorder=2)
-
-        # C* vertical line
-        ax.axvline(c_star, color="#C44E52", linestyle="--", linewidth=1.5,
-                   label=f"C* = {c_star:.1f}", zorder=2)
-        ci_lo = fit_result.get("ci_low", np.nan)
-        ci_hi = fit_result.get("ci_high", np.nan)
+        ax.axvline(csat, color="#C44E52", linestyle="--", linewidth=1.5,
+                   label=f"Csat = {csat:.1f}", zorder=2)
+        ci_lo = result.get("ci_low", np.nan)
+        ci_hi = result.get("ci_high", np.nan)
         if not np.isnan(ci_lo) and not np.isnan(ci_hi):
             ax.axvspan(ci_lo, ci_hi, alpha=0.12, color="#C44E52")
 
-    ax.set_xlabel("Cytoplasmic Mean Intensity (proxy for [Protein])")
+    ax.set_xlabel("Cytoplasmic Mean Intensity (mEGFP)")
     ax.set_ylabel("P(Phase Separation)")
-    ax.set_title("Phase Transition Curve")
+    ax.set_title("Method 1: Binary Phase Transition")
     ax.set_ylim(-0.08, 1.08)
     ax.legend(fontsize=8, loc="upper left")
     fig.tight_layout()
     return fig
 
 
-def plot_overlay(fluorescence_img, cell_mask, droplet_mask):
+def plot_method2_sigmoid(df, result):
     """
-    Overlay visualization: fluorescence + cell outlines + droplets.
-    Returns a matplotlib Figure.
+    Method 2 plot: puncta_sum_intensity vs avg intensity (cyto or nuc).
+    Raw scatter + fitted sigmoid + Csat line.
     """
-    import matplotlib
-    matplotlib.use("Agg")
-    from matplotlib.figure import Figure
-    from matplotlib.backends.backend_agg import FigureCanvasAgg
-    from skimage.segmentation import find_boundaries
-
-    fig = Figure(figsize=(6, 5))
-    FigureCanvasAgg(fig)
+    fig = _make_figure(6, 4)
     ax = fig.add_subplot(111)
 
-    # Normalize fluorescence for display
+    x_col = result.get("x_col", "cytoplasm_mean_intensity")
+    x = df[x_col].values
+    y = df["puncta_sum_intensity"].values
+
+    ax.scatter(x, y, alpha=0.3, s=12, color="#4C72B0", edgecolors="none",
+               label="Cells", zorder=1)
+
+    popt = result.get("popt")
+    csat = result.get("csat", np.nan)
+    if popt is not None and not np.isnan(csat):
+        x_curve = np.linspace(np.nanmin(x), np.nanmax(x), 300)
+        y_curve = _sigmoid(x_curve, *popt)
+        ax.plot(x_curve, y_curve, color="#C44E52", linewidth=2,
+                label="Sigmoid fit", zorder=2)
+        ax.axvline(csat, color="#C44E52", linestyle="--", linewidth=1.5,
+                   label=f"Csat = {csat:.1f}", zorder=2)
+        ci_lo = result.get("ci_low", np.nan)
+        ci_hi = result.get("ci_high", np.nan)
+        if not np.isnan(ci_lo) and not np.isnan(ci_hi):
+            ax.axvspan(ci_lo, ci_hi, alpha=0.12, color="#C44E52")
+
+    x_label = ("Nucleus Mean Intensity (mEGFP)" if "nucleus" in x_col
+               else "Cytoplasmic Mean Intensity (mEGFP)")
+    ax.set_xlabel(x_label)
+    ax.set_ylabel("Sum Puncta Intensity (mEGFP)")
+    ax.set_title("Method 2: Intensity Sigmoid Fit")
+    ax.legend(fontsize=8, loc="upper left")
+    fig.tight_layout()
+    return fig
+
+
+def plot_overlay(fluorescence_img, cell_mask, puncta_mask):
+    """
+    Overlay visualization: fluorescence + cell outlines + puncta.
+    Returns a matplotlib Figure.
+    """
+    from skimage.segmentation import find_boundaries
+
+    fig = _make_figure(6, 5)
+    ax = fig.add_subplot(111)
+
     vmin, vmax = np.percentile(fluorescence_img, (1, 99.5))
     disp = np.clip((fluorescence_img - vmin) / (vmax - vmin + 1e-8), 0, 1)
     ax.imshow(disp, cmap="gray")
 
-    # Cell boundaries in cyan
     if cell_mask.max() > 0:
         boundaries = find_boundaries(cell_mask, mode="outer")
         overlay = np.zeros((*cell_mask.shape, 4), dtype=np.float32)
         overlay[boundaries] = [0, 1, 1, 0.6]  # cyan
         ax.imshow(overlay)
 
-    # Droplets in magenta
-    if droplet_mask.any():
-        drop_overlay = np.zeros((*droplet_mask.shape, 4), dtype=np.float32)
-        drop_overlay[droplet_mask] = [1, 0, 1, 0.5]  # magenta
-        ax.imshow(drop_overlay)
+    if isinstance(puncta_mask, np.ndarray):
+        pm = puncta_mask > 0 if puncta_mask.dtype != bool else puncta_mask
+        if pm.any():
+            drop_overlay = np.zeros((*pm.shape, 4), dtype=np.float32)
+            drop_overlay[pm] = [1, 0, 1, 0.5]  # magenta
+            ax.imshow(drop_overlay)
 
-    ax.set_title("Cells + Detected Droplets")
+    ax.set_title("Cells + Puncta (mEGFP)")
     ax.axis("off")
     fig.tight_layout()
     return fig
