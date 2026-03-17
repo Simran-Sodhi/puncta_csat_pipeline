@@ -771,3 +771,235 @@ def plot_overlay(fluorescence_img, cell_mask, puncta_mask):
     ax.axis("off")
     fig.tight_layout()
     return fig
+
+
+# ------------------------------------------------------------------ #
+#  8. DropFit Csat: droplet-size-aware probability analysis
+# ------------------------------------------------------------------ #
+
+def compute_dropfit_bins(df, x_col="cytoplasm_mean_intensity", n_bins=20):
+    """Bin cells by intensity and compute per-bin droplet statistics.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Per-cell DataFrame (from extract_bulk / extract_cell_measurements).
+    x_col : str
+        Column to bin on (cytoplasm or nucleus intensity).
+    n_bins : int
+        Number of equal-width intensity bins.
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        bin_center, bin_low, bin_high, total_cells, cells_with_droplets,
+        droplet_probability, mean_droplet_count, mean_droplet_area,
+        median_droplet_area, total_droplet_area
+    """
+    x = df[x_col].values
+    edges = np.linspace(np.nanmin(x), np.nanmax(x), n_bins + 1)
+
+    records = []
+    for i in range(n_bins):
+        lo, hi = edges[i], edges[i + 1]
+        if i < n_bins - 1:
+            mask = (x >= lo) & (x < hi)
+        else:
+            mask = (x >= lo) & (x <= hi)
+
+        grp = df[mask]
+        n_total = len(grp)
+        if n_total == 0:
+            continue
+
+        n_with = int((grp["puncta_present"] == 1).sum())
+        records.append({
+            "bin_center": (lo + hi) / 2.0,
+            "bin_low": lo,
+            "bin_high": hi,
+            "total_cells": n_total,
+            "cells_with_droplets": n_with,
+            "droplet_probability": n_with / n_total,
+            "mean_droplet_count": float(grp["puncta_count"].mean()),
+            "mean_droplet_area": float(grp["puncta_total_area"].mean()),
+            "median_droplet_area": float(grp.loc[grp["puncta_present"] == 1,
+                                                  "puncta_total_area"].median())
+            if n_with > 0 else 0.0,
+            "total_droplet_area": float(grp["puncta_total_area"].sum()),
+        })
+
+    return pd.DataFrame(records)
+
+
+def fit_dropfit_csat(df, x_col="cytoplasm_mean_intensity",
+                     n_bins=20, n_bootstrap=500, ci=0.95,
+                     random_state=42):
+    """DropFit-inspired Csat estimation.
+
+    1. Bin cells by *x_col* intensity.
+    2. Compute droplet probability per bin.
+    3. Fit logistic regression on the *binned* probabilities
+       (weighted by cell count per bin).
+    4. Csat = intensity at P = 0.5.
+    5. Bootstrap at the cell level to get confidence interval.
+
+    Returns
+    -------
+    dict with keys:
+        method, x_col, n_bins, n_cells, csat, slope,
+        ci_low, ci_high, model, bin_df, error (if failed)
+    """
+    from sklearn.linear_model import LogisticRegression
+
+    base = {
+        "method": "dropfit",
+        "x_col": x_col,
+        "n_bins": n_bins,
+        "n_cells": len(df),
+    }
+
+    X = df[x_col].values.reshape(-1, 1)
+    y = df["puncta_present"].values
+
+    if len(np.unique(y)) < 2:
+        return {**base, "csat": np.nan, "slope": np.nan,
+                "ci_low": np.nan, "ci_high": np.nan,
+                "model": None, "bin_df": None,
+                "error": "Need cells both with and without puncta."}
+
+    # Fit on full cell-level data (same as Method 1)
+    model = LogisticRegression(solver="lbfgs", max_iter=1000)
+    model.fit(X, y)
+
+    slope = float(model.coef_[0, 0])
+    intercept = float(model.intercept_[0])
+    csat = -intercept / slope if slope != 0 else np.nan
+
+    # Compute binned statistics for visualization and CSV export
+    bin_df = compute_dropfit_bins(df, x_col=x_col, n_bins=n_bins)
+
+    # Bootstrap at cell level
+    rng = np.random.RandomState(random_state)
+    csat_boots = []
+    n = len(df)
+    for _ in range(n_bootstrap):
+        idx = rng.randint(0, n, size=n)
+        X_b, y_b = X[idx], y[idx]
+        if len(np.unique(y_b)) < 2:
+            continue
+        m = LogisticRegression(solver="lbfgs", max_iter=1000)
+        m.fit(X_b, y_b)
+        s = float(m.coef_[0, 0])
+        if s != 0:
+            csat_boots.append(-float(m.intercept_[0]) / s)
+
+    alpha = (1 - ci) / 2
+    if csat_boots:
+        ci_low = float(np.percentile(csat_boots, 100 * alpha))
+        ci_high = float(np.percentile(csat_boots, 100 * (1 - alpha)))
+    else:
+        ci_low = ci_high = np.nan
+
+    return {**base, "csat": csat, "slope": slope,
+            "ci_low": ci_low, "ci_high": ci_high,
+            "model": model, "bin_df": bin_df}
+
+
+def plot_dropfit_csat(df, result):
+    """DropFit Csat plot: binned droplet probability with logistic fit.
+
+    Shows:
+      - Binned probabilities as sized circles (size ~ cell count)
+      - Logistic fit curve
+      - Csat vertical line with 95% CI shading
+    """
+    fig = _make_figure(6, 4)
+    ax = fig.add_subplot(111)
+
+    x_col = result.get("x_col", "cytoplasm_mean_intensity")
+    bin_df = result.get("bin_df")
+
+    # Plot raw jittered data
+    x_raw = df[x_col].values
+    y_raw = df["puncta_present"].values
+    jitter = np.random.default_rng(0).uniform(-0.03, 0.03, size=len(y_raw))
+    ax.scatter(x_raw, y_raw + jitter, alpha=0.08, s=6, color="gray",
+               edgecolors="none", zorder=1)
+
+    # Plot binned probabilities
+    if bin_df is not None and len(bin_df) > 0:
+        sizes = 30 + 200 * (bin_df["total_cells"].values /
+                             max(bin_df["total_cells"].max(), 1))
+        ax.scatter(bin_df["bin_center"].values,
+                   bin_df["droplet_probability"].values,
+                   s=sizes, color="#DD8452", edgecolors="black",
+                   linewidths=0.7, zorder=3,
+                   label="Binned probability")
+
+    # Logistic curve and Csat
+    model = result.get("model")
+    csat = result.get("csat", np.nan)
+    if model is not None and not np.isnan(csat):
+        x_curve = np.linspace(np.nanmin(x_raw), np.nanmax(x_raw), 300)
+        y_curve = model.predict_proba(x_curve.reshape(-1, 1))[:, 1]
+        ax.plot(x_curve, y_curve, color="#C44E52", linewidth=2,
+                label="Logistic fit", zorder=2)
+        ax.axvline(csat, color="#C44E52", linestyle="--", linewidth=1.5,
+                   label=f"Csat = {csat:.1f}", zorder=4)
+        ci_lo = result.get("ci_low", np.nan)
+        ci_hi = result.get("ci_high", np.nan)
+        if not np.isnan(ci_lo) and not np.isnan(ci_hi):
+            ax.axvspan(ci_lo, ci_hi, alpha=0.12, color="#C44E52",
+                       label=f"95% CI [{ci_lo:.1f}, {ci_hi:.1f}]")
+
+    ax.set_xlabel("Cytoplasmic Mean Intensity")
+    ax.set_ylabel("P(Droplet Formation)")
+    ax.set_title("DropFit: Droplet Probability vs Intensity")
+    ax.set_ylim(-0.08, 1.08)
+    ax.legend(fontsize=7, loc="upper left")
+    fig.tight_layout()
+    return fig
+
+
+def plot_dropfit_size_distribution(df, result):
+    """Complementary plot: droplet size vs intensity with bin statistics.
+
+    Shows mean droplet area per bin as a bar chart overlaid on a scatter
+    of individual cell droplet areas.
+    """
+    fig = _make_figure(6, 4)
+    ax = fig.add_subplot(111)
+
+    x_col = result.get("x_col", "cytoplasm_mean_intensity")
+    bin_df = result.get("bin_df")
+
+    # Scatter: individual cells with droplets
+    has = df["puncta_present"] == 1
+    if has.any():
+        ax.scatter(df.loc[has, x_col].values,
+                   df.loc[has, "puncta_total_area"].values,
+                   alpha=0.25, s=10, color="#4C72B0", edgecolors="none",
+                   label="Individual cells", zorder=1)
+
+    # Binned mean area as bars
+    if bin_df is not None and len(bin_df) > 0:
+        width = (bin_df["bin_high"].iloc[0] - bin_df["bin_low"].iloc[0]) * 0.7
+        mask = bin_df["cells_with_droplets"] > 0
+        if mask.any():
+            ax.bar(bin_df.loc[mask, "bin_center"].values,
+                   bin_df.loc[mask, "mean_droplet_area"].values,
+                   width=width, alpha=0.4, color="#DD8452",
+                   edgecolor="black", linewidth=0.5,
+                   label="Mean area per bin", zorder=2)
+
+    csat = result.get("csat", np.nan)
+    if not np.isnan(csat):
+        ax.axvline(csat, color="#C44E52", linestyle="--", linewidth=1.5,
+                   label=f"Csat = {csat:.1f}", zorder=3)
+
+    ax.set_xlabel("Cytoplasmic Mean Intensity")
+    ax.set_ylabel("Droplet Total Area (px)")
+    ax.set_title("DropFit: Droplet Size Distribution")
+    ax.legend(fontsize=7, loc="upper left")
+    fig.tight_layout()
+    return fig

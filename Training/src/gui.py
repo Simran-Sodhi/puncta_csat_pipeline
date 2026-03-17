@@ -2436,6 +2436,11 @@ class SegmentationGUI(tk.Tk):
         self.ana_n_bootstrap = tk.IntVar(value=1000)
         ttk.Entry(p_row0, textvariable=self.ana_n_bootstrap, width=6).pack(side=tk.LEFT)
 
+        # DropFit bins
+        ttk.Label(p_row0, text="   DropFit bins:").pack(side=tk.LEFT, padx=(10, 5))
+        self.ana_dropfit_bins = tk.IntVar(value=20)
+        ttk.Entry(p_row0, textvariable=self.ana_dropfit_bins, width=4).pack(side=tk.LEFT)
+
         # Method 2 X-axis selection
         p_row1 = ttk.Frame(param_frame)
         p_row1.pack(fill=tk.X, pady=2)
@@ -2463,8 +2468,13 @@ class SegmentationGUI(tk.Tk):
             command=self._ana_run_csat, state=tk.DISABLED)
         self.btn_ana_csat.pack(side=tk.LEFT, padx=5)
 
+        self.btn_ana_dropfit = ttk.Button(
+            btn_frame, text="3. DropFit Csat Analysis",
+            command=self._ana_run_dropfit, state=tk.DISABLED)
+        self.btn_ana_dropfit.pack(side=tk.LEFT, padx=5)
+
         self.btn_ana_export = ttk.Button(
-            btn_frame, text="3. Export CSV",
+            btn_frame, text="4. Export CSV",
             command=self._ana_export_csv, state=tk.DISABLED)
         self.btn_ana_export.pack(side=tk.LEFT, padx=5)
 
@@ -2494,15 +2504,16 @@ class SegmentationGUI(tk.Tk):
             (1, 0, "Intensity vs Puncta Count"),
             (1, 1, "Method 1: Binary Phase Transition"),
             (2, 0, "Method 2: Intensity Sigmoid"),
+            (2, 1, "DropFit: Probability vs Intensity"),
+            (3, 0, "DropFit: Size Distribution"),
         ]:
             f = ttk.LabelFrame(plot_frame, text=title, padding=2)
             f.grid(row=r, column=c, padx=4, pady=4, sticky="nsew")
             self._ana_plot_frames[title] = f
         plot_frame.columnconfigure(0, weight=1)
         plot_frame.columnconfigure(1, weight=1)
-        plot_frame.rowconfigure(0, weight=1)
-        plot_frame.rowconfigure(1, weight=1)
-        plot_frame.rowconfigure(2, weight=1)
+        for r in range(4):
+            plot_frame.rowconfigure(r, weight=1)
 
         # ---- Log ----
         log_frame = ttk.LabelFrame(body, text="Log", padding=5)
@@ -2517,6 +2528,7 @@ class SegmentationGUI(tk.Tk):
         self._ana_df_clean = None
         self._ana_result_m1 = None
         self._ana_result_m2 = None
+        self._ana_result_dropfit = None
 
     def _ana_browse_csv(self):
         path = filedialog.asksaveasfilename(
@@ -2603,6 +2615,7 @@ class SegmentationGUI(tk.Tk):
 
         self.btn_ana_measure.config(state=tk.DISABLED)
         self.btn_ana_csat.config(state=tk.DISABLED)
+        self.btn_ana_dropfit.config(state=tk.DISABLED)
         self.btn_ana_export.config(state=tk.DISABLED)
         self.ana_progress.config(value=0)
         self.ana_status.set("Matching files and extracting measurements...")
@@ -2786,6 +2799,103 @@ class SegmentationGUI(tk.Tk):
 
         threading.Thread(target=task, daemon=True).start()
 
+    # ---- DropFit Csat Analysis ----
+    def _ana_run_dropfit(self):
+        if self._ana_df is None or len(self._ana_df) == 0:
+            messagebox.showwarning("No data", "Run measurement extraction first.")
+            return
+
+        z_thresh = self.ana_z_thresh.get()
+        n_boot = self.ana_n_bootstrap.get()
+        n_bins = self.ana_dropfit_bins.get()
+
+        self.btn_ana_dropfit.config(state=tk.DISABLED)
+        self.ana_status.set("Running DropFit Csat analysis...")
+        self._ana_log_append("DropFit: Cleaning data and fitting logistic model...")
+
+        def task():
+            try:
+                from phase_separation import (
+                    clean_data, fit_dropfit_csat,
+                    plot_dropfit_csat, plot_dropfit_size_distribution,
+                )
+
+                # Clean data
+                df_clean = clean_data(self._ana_df,
+                                      intensity_col="cytoplasm_mean_intensity",
+                                      z_threshold=z_thresh)
+                self._ana_df_clean = df_clean
+                n_removed = len(self._ana_df) - len(df_clean)
+                self._ana_log_append_q(
+                    f"Cleaned: {len(df_clean)} cells kept, {n_removed} removed")
+
+                # Fit DropFit Csat
+                self._ana_log_append_q(
+                    f"DropFit: Fitting logistic on {n_bins} bins, "
+                    f"{n_boot} bootstrap iterations...")
+                result_df = fit_dropfit_csat(
+                    df_clean, x_col="cytoplasm_mean_intensity",
+                    n_bins=n_bins, n_bootstrap=n_boot)
+                self._ana_result_dropfit = result_df
+
+                if "error" in result_df:
+                    self._ana_log_append_q(
+                        f"  [WARN] DropFit: {result_df['error']}")
+                else:
+                    self._ana_log_append_q(
+                        f"  DropFit Csat = {result_df['csat']:.2f}  "
+                        f"(95% CI: [{result_df['ci_low']:.2f}, "
+                        f"{result_df['ci_high']:.2f}])")
+
+                # Build summary
+                lines = []
+                n_images = (df_clean["image"].nunique()
+                            if "image" in df_clean.columns else "?")
+                lines.append("=" * 50)
+                lines.append(f"DropFit Csat Analysis")
+                lines.append(f"Images: {n_images}  |  "
+                             f"Cells: {len(df_clean)}  |  "
+                             f"Bins: {n_bins}")
+                lines.append("")
+                if "error" not in result_df:
+                    lines.append(
+                        f"Csat = {result_df['csat']:.2f}  "
+                        f"(95% CI: [{result_df['ci_low']:.2f}, "
+                        f"{result_df['ci_high']:.2f}])")
+                    # Show bin summary
+                    bin_df = result_df.get("bin_df")
+                    if bin_df is not None and len(bin_df) > 0:
+                        lines.append("")
+                        lines.append("Per-bin summary (non-empty bins):")
+                        for _, row in bin_df.iterrows():
+                            lines.append(
+                                f"  [{row['bin_low']:.0f}-{row['bin_high']:.0f}]  "
+                                f"cells={row['total_cells']:.0f}  "
+                                f"P={row['droplet_probability']:.2f}  "
+                                f"mean_area={row['mean_droplet_area']:.1f}")
+                else:
+                    lines.append(f"  {result_df['error']}")
+                lines.append("=" * 50)
+
+                summary_text = "\n".join(lines)
+                self.log_queue.put(f"__ANA_SUMMARY__{summary_text}")
+
+                # Plots
+                fig_prob = plot_dropfit_csat(df_clean, result_df)
+                fig_size = plot_dropfit_size_distribution(df_clean, result_df)
+                self.log_queue.put((
+                    "__ANA_PLOT__",
+                    "DropFit: Probability vs Intensity", fig_prob))
+                self.log_queue.put((
+                    "__ANA_PLOT__",
+                    "DropFit: Size Distribution", fig_size))
+
+                self.log_queue.put("__ANA_DROPFIT_DONE__")
+            except Exception as exc:
+                self.log_queue.put(f"__ANA_ERROR__{exc}")
+
+        threading.Thread(target=task, daemon=True).start()
+
     # ---- Export CSV ----
     def _ana_export_csv(self):
         df = self._ana_df_clean if self._ana_df_clean is not None else self._ana_df
@@ -2835,6 +2945,24 @@ class SegmentationGUI(tk.Tk):
             df_summary.to_csv(summary_path, index=False)
             self._ana_log_append(f"Summary CSV exported: {summary_path}")
 
+        # --- DropFit binned CSV (Prism-ready) ---
+        if self._ana_result_dropfit is not None:
+            bin_df = self._ana_result_dropfit.get("bin_df")
+            if bin_df is not None and len(bin_df) > 0:
+                import math
+                dropfit_path = path.replace(".csv", "_dropfit_bins.csv")
+                bin_df.to_csv(dropfit_path, index=False)
+                self._ana_log_append(
+                    f"DropFit binned CSV exported: {dropfit_path}  "
+                    f"({len(bin_df)} bins)")
+                csat = self._ana_result_dropfit.get("csat", float("nan"))
+                ci_lo = self._ana_result_dropfit.get("ci_low", float("nan"))
+                ci_hi = self._ana_result_dropfit.get("ci_high", float("nan"))
+                if not math.isnan(csat):
+                    self._ana_log_append(
+                        f"  DropFit Csat = {csat:.2f}  "
+                        f"(95% CI: [{ci_lo:.2f}, {ci_hi:.2f}])")
+
         self.ana_status.set(f"CSV exported to {Path(path).name}")
 
     # ---- Queue message handlers (called from _poll_log_queue) ----
@@ -2842,6 +2970,7 @@ class SegmentationGUI(tk.Tk):
         """Handle analysis error messages."""
         self.btn_ana_measure.config(state=tk.NORMAL)
         self.btn_ana_csat.config(state=tk.NORMAL)
+        self.btn_ana_dropfit.config(state=tk.NORMAL)
         self.btn_ana_export.config(state=tk.NORMAL)
         self.ana_progress.config(value=100)
         if error:
@@ -2854,6 +2983,7 @@ class SegmentationGUI(tk.Tk):
         """Called when measurement extraction finishes."""
         self.btn_ana_measure.config(state=tk.NORMAL)
         self.btn_ana_csat.config(state=tk.NORMAL)
+        self.btn_ana_dropfit.config(state=tk.NORMAL)
         self.btn_ana_export.config(state=tk.NORMAL)
         self.ana_progress.config(value=100)
         self.ana_status.set("Bulk extraction complete. Ready for Csat estimation.")
@@ -2861,9 +2991,17 @@ class SegmentationGUI(tk.Tk):
     def _on_ana_cstar_done(self):
         """Called when Csat estimation finishes."""
         self.btn_ana_csat.config(state=tk.NORMAL)
+        self.btn_ana_dropfit.config(state=tk.NORMAL)
         self.btn_ana_export.config(state=tk.NORMAL)
         self.ana_progress.config(value=100)
         self.ana_status.set("Csat estimation complete (both methods).")
+
+    def _on_ana_dropfit_done(self):
+        """Called when DropFit Csat estimation finishes."""
+        self.btn_ana_dropfit.config(state=tk.NORMAL)
+        self.btn_ana_export.config(state=tk.NORMAL)
+        self.ana_progress.config(value=100)
+        self.ana_status.set("DropFit Csat estimation complete.")
 
     # ==================================================================
     # Helper: generic directory browse
@@ -5130,6 +5268,9 @@ class SegmentationGUI(tk.Tk):
                 continue
             if msg == "__ANA_CSTAR_DONE__":
                 self._on_ana_cstar_done()
+                continue
+            if msg == "__ANA_DROPFIT_DONE__":
+                self._on_ana_dropfit_done()
                 continue
             if msg.startswith("__ANA_ERROR__"):
                 self._on_ana_finished(error=msg[len("__ANA_ERROR__"):])
