@@ -2320,8 +2320,17 @@ class SegmentationGUI(tk.Tk):
         p_row0 = ttk.Frame(param_frame)
         p_row0.pack(fill=tk.X, pady=2)
 
-        ttk.Label(p_row0, text="Intensity channel (0: DIC, 1: mEGFP, 2: mScarlet, 3: miRFPnano3):").pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(p_row0, text="Intensity channel:").pack(side=tk.LEFT, padx=(0, 5))
         self.ana_fluor_ch = tk.IntVar(value=1)
+        self.ana_fluor_ch_name = tk.StringVar(value="")
+        self.ana_channel_combo = ttk.Combobox(
+            p_row0, textvariable=self.ana_fluor_ch_name, width=22, state="readonly")
+        self.ana_channel_combo.pack(side=tk.LEFT, padx=(0, 5))
+        self.ana_channel_combo.bind("<<ComboboxSelected>>", self._ana_on_channel_select)
+        self._ana_ome_channel_names = []  # populated by detect
+        ttk.Button(p_row0, text="Detect from image",
+                   command=self._ana_detect_channels).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(p_row0, text="or index:").pack(side=tk.LEFT, padx=(0, 3))
         ttk.Entry(p_row0, textvariable=self.ana_fluor_ch, width=4).pack(side=tk.LEFT, padx=(0, 15))
 
         ttk.Label(p_row0, text="Outlier Z-threshold:").pack(side=tk.LEFT, padx=(0, 5))
@@ -2444,6 +2453,63 @@ class SegmentationGUI(tk.Tk):
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
+    # ---- Channel detection helpers ----
+    def _ana_detect_channels(self):
+        """Read OME-TIFF channel names from the first image in the image dir."""
+        img_dir = self.ana_image_dir.get()
+        if not img_dir:
+            messagebox.showwarning(
+                "No image directory",
+                "Set the fluorescence images folder first.")
+            return
+
+        from phase_separation import get_ome_channel_names
+        from pathlib import Path
+
+        tiff_exts = {".tif", ".tiff"}
+        img_path = Path(img_dir)
+        first_tiff = None
+        for f in sorted(img_path.iterdir()):
+            if f.suffix.lower() in tiff_exts and f.is_file():
+                first_tiff = f
+                break
+
+        if first_tiff is None:
+            messagebox.showinfo("No images", "No TIFF files found in the image directory.")
+            return
+
+        names = get_ome_channel_names(first_tiff)
+        if not names:
+            messagebox.showinfo(
+                "No OME metadata",
+                f"No channel names found in OME metadata of:\n{first_tiff.name}\n\n"
+                "Use the fallback index field instead.")
+            return
+
+        self._ana_ome_channel_names = names
+        display_values = [f"{i}: {n}" for i, n in enumerate(names)]
+        self.ana_channel_combo["values"] = display_values
+
+        # Auto-select GFP/EGFP/mEGFP if found
+        for i, n in enumerate(names):
+            if any(kw in n.lower() for kw in ("gfp", "egfp", "green")):
+                self.ana_channel_combo.current(i)
+                self.ana_fluor_ch.set(i)
+                self.ana_fluor_ch_name.set(display_values[i])
+                break
+        else:
+            self.ana_channel_combo.current(0)
+            self.ana_fluor_ch.set(0)
+
+        self._ana_log_append(
+            f"Detected channels from {first_tiff.name}: {names}")
+
+    def _ana_on_channel_select(self, event=None):
+        """Update channel index when user selects from dropdown."""
+        sel = self.ana_channel_combo.current()
+        if sel >= 0:
+            self.ana_fluor_ch.set(sel)
+
     # ---- Run Bulk Measurement Extraction ----
     def _ana_run_measurement(self):
         img_dir = self.ana_image_dir.get()
@@ -2458,7 +2524,13 @@ class SegmentationGUI(tk.Tk):
                 "- Puncta masks folder")
             return
 
-        fluor_ch = self.ana_fluor_ch.get()  # already 0-based (0=DIC,1=mEGFP,2=mScarlet,3=miRFPnano3)
+        fluor_ch = self.ana_fluor_ch.get()  # 0-based index (fallback)
+        # Extract channel name from OME-detected list if available
+        fluor_ch_name = None
+        if self._ana_ome_channel_names:
+            sel_idx = self.ana_channel_combo.current()
+            if 0 <= sel_idx < len(self._ana_ome_channel_names):
+                fluor_ch_name = self._ana_ome_channel_names[sel_idx]
         nuc_dir = self.ana_nuc_mask_dir.get() or None
 
         self.btn_ana_measure.config(state=tk.DISABLED)
@@ -2498,6 +2570,7 @@ class SegmentationGUI(tk.Tk):
                 df_all, last_overlay = extract_bulk(
                     matched_files=matched,
                     channel_index=fluor_ch,
+                    channel_name=fluor_ch_name,
                     log_callback=self._ana_log_append_q,
                     progress_callback=_on_progress,
                 )

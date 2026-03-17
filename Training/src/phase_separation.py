@@ -43,9 +43,90 @@ TIFF_EXTENSIONS = {".tif", ".tiff"}
 #  1. Image / mask loading helpers
 # ------------------------------------------------------------------ #
 
-def load_image_channel(path, channel_index=0, z_index=0):
-    """Load a single 2D channel from a (possibly multi-dim) TIFF."""
+def get_ome_channel_names(path):
+    """Read channel names from OME-TIFF metadata.
+
+    Returns
+    -------
+    list[str] : channel names in order, e.g. ["DIC", "Cy5", "GFP", "Cy3"].
+                Returns empty list if no OME metadata is found.
+    """
+    import xml.etree.ElementTree as ET
     import tifffile as tiff
+
+    path = Path(path)
+    names = []
+    try:
+        with tiff.TiffFile(str(path)) as tf:
+            if not tf.ome_metadata:
+                return names
+            root = ET.fromstring(tf.ome_metadata)
+    except Exception:
+        return names
+
+    # Try common OME namespace URIs
+    for ns_uri in [
+        "http://www.openmicroscopy.org/Schemas/OME/2016-06",
+        "",
+    ]:
+        ns_prefix = f"{{{ns_uri}}}" if ns_uri else ""
+        # Find all Channel elements within the first Image/Pixels
+        for pixels in root.iter(f"{ns_prefix}Pixels"):
+            for ch in pixels.iter(f"{ns_prefix}Channel"):
+                name = ch.get("Name") or ch.get("ID") or f"ch{len(names)}"
+                names.append(name)
+            break  # only first Pixels element
+        if names:
+            break
+    return names
+
+
+def resolve_channel_index(path, channel_index=0, channel_name=None):
+    """Resolve a channel index, optionally by name from OME metadata.
+
+    If *channel_name* is provided (e.g. ``"GFP"``), the OME channel names
+    are read and a case-insensitive substring match is performed.  If the
+    name is not found the function falls back to *channel_index*.
+
+    Returns
+    -------
+    int : resolved 0-based channel index
+    str or None : matched channel name (None if matched by index only)
+    """
+    if channel_name:
+        ome_names = get_ome_channel_names(path)
+        if ome_names:
+            target = channel_name.strip().lower()
+            for idx, n in enumerate(ome_names):
+                if target in n.lower():
+                    return idx, n
+            logger.warning(
+                "Channel name '%s' not found in OME metadata %s; "
+                "falling back to index %d", channel_name, ome_names, channel_index)
+    return channel_index, None
+
+
+def load_image_channel(path, channel_index=0, z_index=0, channel_name=None):
+    """Load a single 2D channel from a (possibly multi-dim) TIFF.
+
+    Parameters
+    ----------
+    path : str or Path
+    channel_index : int — 0-based fallback index
+    z_index : int — Z-slice to extract
+    channel_name : str or None — if given, resolve index from OME metadata
+        (case-insensitive substring match, e.g. "GFP", "Cy5")
+    """
+    import tifffile as tiff
+
+    resolved_idx, matched = resolve_channel_index(
+        path, channel_index=channel_index, channel_name=channel_name)
+    if matched:
+        logger.info("Channel '%s' resolved to index %d (OME name: %s)",
+                     channel_name, resolved_idx, matched)
+
+    channel_index = resolved_idx
+
     with tiff.TiffFile(str(path)) as tf:
         data = tf.series[0].asarray()
         axes = getattr(tf.series[0], "axes", None)
@@ -275,7 +356,7 @@ def extract_cell_measurements(fluorescence_img, cell_mask,
     return df, puncta_binary
 
 
-def extract_bulk(matched_files, channel_index=1,
+def extract_bulk(matched_files, channel_index=1, channel_name=None,
                  log_callback=None, progress_callback=None):
     """
     Process all matched file sets and return aggregated DataFrame.
@@ -283,7 +364,9 @@ def extract_bulk(matched_files, channel_index=1,
     Parameters
     ----------
     matched_files : list of dict from match_files()
-    channel_index : int — mEGFP channel index
+    channel_index : int — fallback channel index (0-based)
+    channel_name : str or None — channel name to resolve from OME metadata
+        (e.g. "GFP").  If given, takes priority over channel_index.
     log_callback : callable(str) or None — for logging messages
     progress_callback : callable(current, total) or None
 
@@ -296,6 +379,23 @@ def extract_bulk(matched_files, channel_index=1,
     n_total = len(matched_files)
     last_overlay_data = None
 
+    # Log channel resolution from the first image
+    if log_callback and n_total > 0 and channel_name:
+        first_path = matched_files[0]["image"]
+        ome_names = get_ome_channel_names(first_path)
+        if ome_names:
+            log_callback(f"  OME channel order: {ome_names}")
+        resolved_idx, matched_name = resolve_channel_index(
+            first_path, channel_index=channel_index, channel_name=channel_name)
+        if matched_name:
+            log_callback(
+                f"  Channel '{channel_name}' -> index {resolved_idx} "
+                f"(OME name: '{matched_name}')")
+        else:
+            log_callback(
+                f"  Channel name '{channel_name}' not found in OME; "
+                f"using fallback index {channel_index}")
+
     for file_idx, entry in enumerate(matched_files):
         stem = entry["stem"]
         if progress_callback:
@@ -303,7 +403,9 @@ def extract_bulk(matched_files, channel_index=1,
         if log_callback:
             log_callback(f"[{file_idx+1}/{n_total}] Processing {stem}...")
 
-        fluor_img = load_image_channel(entry["image"], channel_index=channel_index)
+        fluor_img = load_image_channel(
+            entry["image"], channel_index=channel_index,
+            channel_name=channel_name)
         cell_mask = load_mask_2d(entry["cell_mask"])
         puncta_mask = load_mask_2d(entry["puncta_mask"])
 
