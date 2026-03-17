@@ -4,6 +4,9 @@ phase_separation.py
 Backend module for estimating the critical concentration (Csat) for
 protein phase separation from live-cell fluorescence images.
 
+Supports bulk processing: provide directories of images and masks,
+files are auto-matched by name stem.
+
 Two methods for Csat estimation:
 
   Method 1 (Binary):
@@ -16,21 +19,24 @@ Two methods for Csat estimation:
     Csat = intensity at 50% of the fitted maximum.
 
 Pipeline:
-  1. Load mEGFP fluorescence image + cell/nucleus/puncta masks
-  2. Extract per-cell measurements using puncta mask directly
-  3. Fit both Csat models with bootstrap confidence intervals
-
-Designed for GUI integration — all heavy computation in functions
-that accept a progress_callback(current, total) for reporting.
+  1. Match files across directories by name stem
+  2. For each matched set: load mEGFP channel + masks, extract per-cell
+  3. Aggregate all cells into one DataFrame
+  4. Fit both Csat models with bootstrap confidence intervals
 """
 
 import logging
+import os
+import re
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from scipy.ndimage import label as ndi_label
 
 logger = logging.getLogger(__name__)
+
+TIFF_EXTENSIONS = {".tif", ".tiff"}
 
 
 # ------------------------------------------------------------------ #
@@ -79,37 +85,115 @@ def load_mask_2d(path):
 
 
 # ------------------------------------------------------------------ #
-#  2. Per-cell measurement extraction (puncta mask required)
+#  2. Bulk file matching
+# ------------------------------------------------------------------ #
+
+def _normalize_stem(filename):
+    """
+    Extract a normalised stem for matching files across directories.
+
+    Strips common suffixes like _mask, _cp_masks, _seg, _nuclei, _puncta,
+    _cell, channel indicators, and the file extension.
+    """
+    stem = Path(filename).stem
+    # Remove .ome if present (e.g. file.ome.tif -> stem is file.ome)
+    if stem.lower().endswith(".ome"):
+        stem = stem[:-4]
+    # Strip common mask/channel suffixes (greedy, order matters)
+    stem = re.sub(
+        r'(_cp_masks|_masks|_mask|_seg|_nuclei|_nucleus|_nuc'
+        r'|_puncta|_cell|_cells|_labels?'
+        r'|_ch\d+|_c\d+|_mEGFP|_mScarlet|_Cy5|_DIC)$',
+        '', stem, flags=re.IGNORECASE)
+    return stem.lower()
+
+
+def list_tiffs(directory):
+    """Return dict {normalized_stem: full_path} for all TIFFs in directory."""
+    result = {}
+    d = Path(directory)
+    if not d.is_dir():
+        return result
+    for f in sorted(d.iterdir()):
+        if f.is_file() and f.suffix.lower() in TIFF_EXTENSIONS:
+            stem = _normalize_stem(f.name)
+            result[stem] = str(f)
+    return result
+
+
+def match_files(image_dir, cell_mask_dir, puncta_mask_dir,
+                nucleus_mask_dir=None):
+    """
+    Auto-match files across directories by normalised name stem.
+
+    Returns
+    -------
+    matched : list of dict
+        Each dict has keys: 'stem', 'image', 'cell_mask', 'puncta_mask',
+        and optionally 'nucleus_mask'.
+    warnings : list of str
+        Files that could not be matched.
+    """
+    images = list_tiffs(image_dir)
+    cells = list_tiffs(cell_mask_dir)
+    puncta = list_tiffs(puncta_mask_dir)
+    nuclei = list_tiffs(nucleus_mask_dir) if nucleus_mask_dir else {}
+
+    # Intersect on stems present in all required directories
+    common = set(images.keys()) & set(cells.keys()) & set(puncta.keys())
+    if nucleus_mask_dir:
+        common = common & set(nuclei.keys())
+
+    matched = []
+    for stem in sorted(common):
+        entry = {
+            "stem": stem,
+            "image": images[stem],
+            "cell_mask": cells[stem],
+            "puncta_mask": puncta[stem],
+        }
+        if nucleus_mask_dir and stem in nuclei:
+            entry["nucleus_mask"] = nuclei[stem]
+        matched.append(entry)
+
+    # Warnings for unmatched
+    warnings = []
+    all_stems = set(images.keys()) | set(cells.keys()) | set(puncta.keys())
+    if nucleus_mask_dir:
+        all_stems |= set(nuclei.keys())
+    unmatched = all_stems - common
+    for s in sorted(unmatched):
+        present_in = []
+        if s in images:
+            present_in.append("images")
+        if s in cells:
+            present_in.append("cell_masks")
+        if s in puncta:
+            present_in.append("puncta_masks")
+        if s in nuclei:
+            present_in.append("nucleus_masks")
+        warnings.append(f"'{s}' only in: {', '.join(present_in)}")
+
+    return matched, warnings
+
+
+# ------------------------------------------------------------------ #
+#  3. Per-image measurement extraction (puncta mask required)
 # ------------------------------------------------------------------ #
 
 def extract_cell_measurements(fluorescence_img, cell_mask,
                               puncta_mask,
                               nucleus_mask=None,
+                              image_name="",
                               progress_callback=None):
     """
-    Extract per-cell measurements from mEGFP fluorescence + masks.
-
-    Parameters
-    ----------
-    fluorescence_img : 2D array
-        The mEGFP fluorescence channel.
-    cell_mask : 2D int array
-        Labeled cell mask (0=background, 1..N=cells).
-    puncta_mask : 2D int array
-        Labeled puncta (droplet) mask. Used directly — no auto-detection.
-    nucleus_mask : 2D int array or None
-        Labeled nucleus mask. If provided, cytoplasm = cell - nucleus.
-    progress_callback : callable(current, total) or None
+    Extract per-cell measurements from mEGFP fluorescence + masks
+    for a single image.
 
     Returns
     -------
-    df : pd.DataFrame with columns:
-        cell_id, cell_area, total_cell_intensity,
-        cytoplasm_mean_intensity, nucleus_mean_intensity,
-        puncta_present, puncta_count, puncta_total_area,
-        puncta_sum_intensity
+    df : pd.DataFrame
     puncta_binary : 2D bool array
-        Combined puncta mask (for visualization).
     """
     cell_ids = np.unique(cell_mask)
     cell_ids = cell_ids[cell_ids != 0]
@@ -134,10 +218,7 @@ def extract_cell_measurements(fluorescence_img, cell_mask,
         puncta_area = int(cell_puncta.sum())
 
         # Sum intensity of puncta pixels in mEGFP channel
-        if cell_puncta.any():
-            puncta_sum_int = float(fluorescence_img[cell_puncta].sum())
-        else:
-            puncta_sum_int = 0.0
+        puncta_sum_int = float(fluorescence_img[cell_puncta].sum()) if cell_puncta.any() else 0.0
 
         # Nucleus region
         if nucleus_mask is not None:
@@ -152,7 +233,7 @@ def extract_cell_measurements(fluorescence_img, cell_mask,
         cyto_pixels = fluorescence_img[cyto_no_puncta]
         cyto_mean = float(np.mean(cyto_pixels)) if cyto_pixels.size > 0 else np.nan
 
-        # Nucleus mean intensity
+        # Nucleus mean intensity (excluding puncta)
         if nuc_binary is not None:
             nuc_no_puncta = nuc_binary & ~cell_puncta
             nuc_pixels = fluorescence_img[nuc_no_puncta]
@@ -161,6 +242,7 @@ def extract_cell_measurements(fluorescence_img, cell_mask,
             nuc_mean = np.nan
 
         records.append({
+            "image": image_name,
             "cell_id": int(cid),
             "cell_area": cell_area,
             "total_cell_intensity": total_intensity,
@@ -179,8 +261,71 @@ def extract_cell_measurements(fluorescence_img, cell_mask,
     return df, puncta_binary
 
 
+def extract_bulk(matched_files, channel_index=1,
+                 log_callback=None, progress_callback=None):
+    """
+    Process all matched file sets and return aggregated DataFrame.
+
+    Parameters
+    ----------
+    matched_files : list of dict from match_files()
+    channel_index : int — mEGFP channel index
+    log_callback : callable(str) or None — for logging messages
+    progress_callback : callable(current, total) or None
+
+    Returns
+    -------
+    df_all : pd.DataFrame — aggregated per-cell measurements
+    last_overlay_data : tuple (fluor, cell_mask, puncta_binary) — for overlay plot
+    """
+    all_dfs = []
+    n_total = len(matched_files)
+    last_overlay_data = None
+
+    for file_idx, entry in enumerate(matched_files):
+        stem = entry["stem"]
+        if progress_callback:
+            progress_callback(file_idx, n_total)
+        if log_callback:
+            log_callback(f"[{file_idx+1}/{n_total}] Processing {stem}...")
+
+        fluor_img = load_image_channel(entry["image"], channel_index=channel_index)
+        cell_mask = load_mask_2d(entry["cell_mask"])
+        puncta_mask = load_mask_2d(entry["puncta_mask"])
+
+        nuc_mask = None
+        if "nucleus_mask" in entry:
+            nuc_mask = load_mask_2d(entry["nucleus_mask"])
+
+        df, puncta_binary = extract_cell_measurements(
+            fluorescence_img=fluor_img,
+            cell_mask=cell_mask,
+            puncta_mask=puncta_mask,
+            nucleus_mask=nuc_mask,
+            image_name=stem,
+        )
+
+        if log_callback:
+            n_cells = len(df)
+            n_with = int(df["puncta_present"].sum()) if n_cells > 0 else 0
+            log_callback(f"  -> {n_cells} cells, {n_with} with puncta")
+
+        all_dfs.append(df)
+        last_overlay_data = (fluor_img, cell_mask, puncta_binary)
+
+    if progress_callback:
+        progress_callback(n_total, n_total)
+
+    if all_dfs:
+        df_all = pd.concat(all_dfs, ignore_index=True)
+    else:
+        df_all = pd.DataFrame()
+
+    return df_all, last_overlay_data
+
+
 # ------------------------------------------------------------------ #
-#  3. Data cleaning
+#  4. Data cleaning
 # ------------------------------------------------------------------ #
 
 def clean_data(df, intensity_col="cytoplasm_mean_intensity", z_threshold=3.0):
@@ -206,7 +351,7 @@ def clean_data(df, intensity_col="cytoplasm_mean_intensity", z_threshold=3.0):
 
 
 # ------------------------------------------------------------------ #
-#  4. Method 1: Binary logistic regression  P(puncta) ~ intensity
+#  5. Method 1: Binary logistic regression  P(puncta) ~ intensity
 # ------------------------------------------------------------------ #
 
 def fit_logistic_binary(df, x_col="cytoplasm_mean_intensity",
@@ -214,8 +359,6 @@ def fit_logistic_binary(df, x_col="cytoplasm_mean_intensity",
     """
     Method 1: Logistic regression P(puncta_present) ~ x_col.
     Csat = x where P = 0.5 (the decision boundary).
-
-    Returns dict with: csat, slope, ci_low, ci_high, model, counts, method.
     """
     from sklearn.linear_model import LogisticRegression
 
@@ -269,7 +412,7 @@ def fit_logistic_binary(df, x_col="cytoplasm_mean_intensity",
 
 
 # ------------------------------------------------------------------ #
-#  5. Method 2: Sigmoid fit  puncta_sum_intensity ~ avg_intensity
+#  6. Method 2: Sigmoid fit  puncta_sum_intensity ~ avg_intensity
 # ------------------------------------------------------------------ #
 
 def _sigmoid(x, L, k, x0, b):
@@ -282,8 +425,6 @@ def fit_sigmoid_intensity(df, x_col="cytoplasm_mean_intensity",
     """
     Method 2: Fit sigmoid curve to puncta_sum_intensity vs x_col.
     Csat = x0, the midpoint where the response reaches 50% of its max.
-
-    Returns dict with: csat, L, k, x0, b, ci_low, ci_high, method.
     """
     from scipy.optimize import curve_fit
 
@@ -348,7 +489,7 @@ def fit_sigmoid_intensity(df, x_col="cytoplasm_mean_intensity",
 
 
 # ------------------------------------------------------------------ #
-#  6. Plotting helpers (return matplotlib Figure objects)
+#  7. Plotting helpers (return matplotlib Figure objects)
 # ------------------------------------------------------------------ #
 
 def _make_figure(w=5, h=3.5):

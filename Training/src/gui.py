@@ -2265,51 +2265,52 @@ class SegmentationGUI(tk.Tk):
         info = ttk.Label(
             body,
             text="Estimate the critical concentration (Csat) for protein phase separation\n"
-                 "from mEGFP fluorescence images using pre-computed masks.\n\n"
+                 "from mEGFP fluorescence images using pre-computed masks.\n"
+                 "Provide directories of images and masks -- files are auto-matched by name.\n\n"
                  "Method 1 (Binary): P(puncta present) vs cytoplasmic intensity -> Csat at P=0.5\n"
                  "Method 2 (Intensity): Puncta sum intensity vs avg cytoplasm/nucleus intensity -> sigmoid midpoint",
             foreground="gray",
         )
         info.pack(anchor=tk.W, padx=10, pady=(10, 5))
 
-        # ---- Inputs ----
-        io_frame = ttk.LabelFrame(body, text="Input Files", padding=10)
+        # ---- Input Directories ----
+        io_frame = ttk.LabelFrame(body, text="Input Directories", padding=10)
         io_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        ttk.Label(io_frame, text="Fluorescence Image (OME-TIFF):").grid(
+        ttk.Label(io_frame, text="Fluorescence Images (OME-TIFF):").grid(
             row=0, column=0, sticky=tk.W, pady=2)
-        self.ana_image_path = tk.StringVar()
-        ttk.Entry(io_frame, textvariable=self.ana_image_path, width=55).grid(
+        self.ana_image_dir = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.ana_image_dir, width=55).grid(
             row=0, column=1, padx=5, pady=2)
         ttk.Button(io_frame, text="Browse...",
-                   command=lambda: self._ana_browse_file(self.ana_image_path)).grid(
+                   command=lambda: self._browse_dir(self.ana_image_dir)).grid(
             row=0, column=2, pady=2)
 
-        ttk.Label(io_frame, text="Cell Mask (DIC or mScarlet):").grid(
+        ttk.Label(io_frame, text="Cell Masks (DIC or mScarlet):").grid(
             row=1, column=0, sticky=tk.W, pady=2)
-        self.ana_cell_mask_path = tk.StringVar()
-        ttk.Entry(io_frame, textvariable=self.ana_cell_mask_path, width=55).grid(
+        self.ana_cell_mask_dir = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.ana_cell_mask_dir, width=55).grid(
             row=1, column=1, padx=5, pady=2)
         ttk.Button(io_frame, text="Browse...",
-                   command=lambda: self._ana_browse_file(self.ana_cell_mask_path)).grid(
+                   command=lambda: self._browse_dir(self.ana_cell_mask_dir)).grid(
             row=1, column=2, pady=2)
 
-        ttk.Label(io_frame, text="Nucleus Mask (Cy5/miRFPnano3):").grid(
+        ttk.Label(io_frame, text="Puncta Masks (mEGFP):").grid(
             row=2, column=0, sticky=tk.W, pady=2)
-        self.ana_nuc_mask_path = tk.StringVar()
-        ttk.Entry(io_frame, textvariable=self.ana_nuc_mask_path, width=55).grid(
+        self.ana_puncta_mask_dir = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.ana_puncta_mask_dir, width=55).grid(
             row=2, column=1, padx=5, pady=2)
         ttk.Button(io_frame, text="Browse...",
-                   command=lambda: self._ana_browse_file(self.ana_nuc_mask_path)).grid(
+                   command=lambda: self._browse_dir(self.ana_puncta_mask_dir)).grid(
             row=2, column=2, pady=2)
 
-        ttk.Label(io_frame, text="Puncta Mask (mEGFP):").grid(
+        ttk.Label(io_frame, text="Nucleus Masks (optional):").grid(
             row=3, column=0, sticky=tk.W, pady=2)
-        self.ana_puncta_mask_path = tk.StringVar()
-        ttk.Entry(io_frame, textvariable=self.ana_puncta_mask_path, width=55).grid(
+        self.ana_nuc_mask_dir = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.ana_nuc_mask_dir, width=55).grid(
             row=3, column=1, padx=5, pady=2)
         ttk.Button(io_frame, text="Browse...",
-                   command=lambda: self._ana_browse_file(self.ana_puncta_mask_path)).grid(
+                   command=lambda: self._browse_dir(self.ana_nuc_mask_dir)).grid(
             row=3, column=2, pady=2)
 
         # ---- Parameters ----
@@ -2349,7 +2350,7 @@ class SegmentationGUI(tk.Tk):
         btn_frame.pack(fill=tk.X, padx=10, pady=5)
 
         self.btn_ana_measure = ttk.Button(
-            btn_frame, text="1. Extract Measurements",
+            btn_frame, text="1. Extract Measurements (Bulk)",
             command=self._ana_run_measurement)
         self.btn_ana_measure.pack(side=tk.LEFT, padx=5)
 
@@ -2410,21 +2411,8 @@ class SegmentationGUI(tk.Tk):
         # Internal state
         self._ana_df = None
         self._ana_df_clean = None
-        self._ana_result_m1 = None  # Method 1 result
-        self._ana_result_m2 = None  # Method 2 result
-        self._ana_puncta_binary = None
-        self._ana_fluor_img = None
-        self._ana_cell_mask = None
-
-    # ---- File browse helper ----
-    def _ana_browse_file(self, string_var):
-        path = filedialog.askopenfilename(
-            title="Select File",
-            filetypes=[("TIFF files", "*.tif *.tiff *.ome.tif *.ome.tiff"),
-                       ("All files", "*.*")],
-        )
-        if path:
-            string_var.set(path)
+        self._ana_result_m1 = None
+        self._ana_result_m2 = None
 
     def _ana_browse_csv(self):
         path = filedialog.asksaveasfilename(
@@ -2456,75 +2444,79 @@ class SegmentationGUI(tk.Tk):
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-    # ---- Run Measurement Extraction ----
+    # ---- Run Bulk Measurement Extraction ----
     def _ana_run_measurement(self):
-        img_path = self.ana_image_path.get()
-        cell_path = self.ana_cell_mask_path.get()
-        puncta_path = self.ana_puncta_mask_path.get()
-        if not img_path or not cell_path or not puncta_path:
+        img_dir = self.ana_image_dir.get()
+        cell_dir = self.ana_cell_mask_dir.get()
+        puncta_dir = self.ana_puncta_mask_dir.get()
+        if not img_dir or not cell_dir or not puncta_dir:
             messagebox.showwarning(
                 "Missing input",
-                "Please provide all required files:\n"
-                "- Fluorescence image (OME-TIFF)\n"
-                "- Cell mask\n"
-                "- Puncta mask")
+                "Please provide all required directories:\n"
+                "- Fluorescence images folder\n"
+                "- Cell masks folder\n"
+                "- Puncta masks folder")
             return
 
         fluor_ch = self.ana_fluor_ch.get()
-        nuc_path = self.ana_nuc_mask_path.get() or None
+        nuc_dir = self.ana_nuc_mask_dir.get() or None
 
         self.btn_ana_measure.config(state=tk.DISABLED)
         self.btn_ana_csat.config(state=tk.DISABLED)
         self.btn_ana_export.config(state=tk.DISABLED)
         self.ana_progress.config(value=0)
-        self.ana_status.set("Extracting measurements...")
-        self._ana_log_append(f"Loading mEGFP channel {fluor_ch} from {Path(img_path).name}...")
+        self.ana_status.set("Matching files and extracting measurements...")
+        self._ana_log_append("Starting bulk extraction...")
 
         def task():
             try:
                 from phase_separation import (
-                    load_image_channel, load_mask_2d,
-                    extract_cell_measurements, plot_overlay,
+                    match_files, extract_bulk, plot_overlay,
                 )
 
-                fluor_img = load_image_channel(img_path, channel_index=fluor_ch)
-                cell_mask = load_mask_2d(cell_path)
-                puncta_mask = load_mask_2d(puncta_path)
-                self._ana_fluor_img = fluor_img
-                self._ana_cell_mask = cell_mask
+                # Match files across directories
+                matched, warnings = match_files(
+                    img_dir, cell_dir, puncta_dir, nuc_dir)
+
+                if warnings:
+                    for w in warnings:
+                        self._ana_log_append_q(f"  [WARN] Unmatched: {w}")
+
+                if not matched:
+                    self.log_queue.put(
+                        "__ANA_ERROR__No matching files found across directories. "
+                        "Check that file names match between folders.")
+                    return
 
                 self._ana_log_append_q(
-                    f"Image: {fluor_img.shape}, Cell mask: {int(cell_mask.max())} cells, "
-                    f"Puncta mask: {int(puncta_mask.max())} objects")
-
-                nuc_mask = None
-                if nuc_path:
-                    nuc_mask = load_mask_2d(nuc_path)
-                    self._ana_log_append_q(f"Nucleus mask loaded: {int(nuc_mask.max())} nuclei")
+                    f"Matched {len(matched)} image sets across directories")
 
                 def _on_progress(current, total):
                     pct = int(100 * current / total) if total > 0 else 0
                     self.log_queue.put(f"__ANA_PROGRESS__{pct}")
 
-                df, puncta_binary = extract_cell_measurements(
-                    fluorescence_img=fluor_img,
-                    cell_mask=cell_mask,
-                    puncta_mask=puncta_mask,
-                    nucleus_mask=nuc_mask,
+                df_all, last_overlay = extract_bulk(
+                    matched_files=matched,
+                    channel_index=fluor_ch,
+                    log_callback=self._ana_log_append_q,
                     progress_callback=_on_progress,
                 )
 
-                self._ana_df = df
-                self._ana_puncta_binary = puncta_binary
+                self._ana_df = df_all
 
-                n_with = int(df["puncta_present"].sum())
-                n_total = len(df)
+                n_total = len(df_all)
+                n_images = df_all["image"].nunique() if n_total > 0 else 0
+                n_with = int(df_all["puncta_present"].sum()) if n_total > 0 else 0
                 self._ana_log_append_q(
-                    f"Extraction complete: {n_total} cells, "
-                    f"{n_with} with puncta ({100*n_with/max(n_total,1):.1f}%)")
+                    f"Bulk extraction complete: {n_images} images, "
+                    f"{n_total} cells, {n_with} with puncta "
+                    f"({100*n_with/max(n_total,1):.1f}%)")
 
-                fig_overlay = plot_overlay(fluor_img, cell_mask, puncta_binary)
-                self.log_queue.put(("__ANA_PLOT__", "Overlay", fig_overlay))
+                # Overlay from last processed image
+                if last_overlay is not None:
+                    fluor, cmask, pmask = last_overlay
+                    fig_overlay = plot_overlay(fluor, cmask, pmask)
+                    self.log_queue.put(("__ANA_PLOT__", "Overlay", fig_overlay))
 
                 self.log_queue.put("__ANA_MEASURE_DONE__")
             except Exception as exc:
@@ -2554,8 +2546,8 @@ class SegmentationGUI(tk.Tk):
         if m2_xaxis == "nucleus" and self._ana_df["nucleus_mean_intensity"].isna().all():
             messagebox.showwarning(
                 "No nucleus data",
-                "Nucleus mask was not provided during extraction.\n"
-                "Please re-extract with a nucleus mask, or select 'Cytoplasm' for Method 2.")
+                "Nucleus masks were not provided during extraction.\n"
+                "Please re-extract with nucleus masks, or select 'Cytoplasm' for Method 2.")
             return
 
         self.btn_ana_csat.config(state=tk.DISABLED)
@@ -2609,7 +2601,10 @@ class SegmentationGUI(tk.Tk):
 
                 # --- Build summary ---
                 lines = []
+                n_images = df_clean["image"].nunique() if "image" in df_clean.columns else "?"
                 lines.append("=" * 50)
+                lines.append(f"Images processed: {n_images}  |  Cells analyzed: {len(df_clean)}")
+                lines.append("")
                 lines.append("METHOD 1: Binary Logistic Regression")
                 lines.append(f"  P(puncta_present) vs Cytoplasmic Mean Intensity (mEGFP)")
                 if "error" not in result_m1:
@@ -2629,7 +2624,6 @@ class SegmentationGUI(tk.Tk):
                 else:
                     lines.append(f"  {result_m2['error']}")
                 lines.append("=" * 50)
-                lines.append(f"Total cells analyzed: {len(df_clean)}")
 
                 summary_text = "\n".join(lines)
                 self.log_queue.put(f"__ANA_SUMMARY__{summary_text}")
@@ -2662,7 +2656,7 @@ class SegmentationGUI(tk.Tk):
         if not path:
             return
 
-        cols = ["cell_id", "cell_area", "cytoplasm_mean_intensity",
+        cols = ["image", "cell_id", "cell_area", "cytoplasm_mean_intensity",
                 "nucleus_mean_intensity", "total_cell_intensity",
                 "puncta_present", "puncta_count", "puncta_total_area",
                 "puncta_sum_intensity"]
@@ -2690,7 +2684,7 @@ class SegmentationGUI(tk.Tk):
         self.btn_ana_csat.config(state=tk.NORMAL)
         self.btn_ana_export.config(state=tk.NORMAL)
         self.ana_progress.config(value=100)
-        self.ana_status.set("Measurement extraction complete. Ready for Csat estimation.")
+        self.ana_status.set("Bulk extraction complete. Ready for Csat estimation.")
 
     def _on_ana_cstar_done(self):
         """Called when Csat estimation finishes."""
