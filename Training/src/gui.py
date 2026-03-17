@@ -138,7 +138,7 @@ class SegmentationGUI(tk.Tk):
         self.notebook.add(self.tab_deconv, text="  Deconvolution  ")
         self.notebook.add(self.tab_segmentation, text="  Segmentation  ")
         self.notebook.add(self.tab_puncta_seg, text="  Puncta Segmentation  ")
-        self.notebook.add(self.tab_analysis, text="  Analysis  ")
+        self.notebook.add(self.tab_analysis, text="  Phase Separation Analysis  ")
         self.notebook.add(self.tab_rename, text="  File Renaming  ")
         self.notebook.add(self.tab_config, text="  Configuration  ")
         self.notebook.add(self.tab_train, text="  Training  ")
@@ -2239,142 +2239,196 @@ class SegmentationGUI(tk.Tk):
     # ==================================================================
     # TAB: INTENSITY & PUNCTA ANALYSIS
     # ==================================================================
+    # ==================================================================
+    # Phase Separation Analysis tab
+    # ==================================================================
+
     def _build_analysis_tab(self):
         tab = self.tab_analysis
 
+        # Use a canvas+scrollbar so the tab is scrollable
+        canvas = tk.Canvas(tab, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(tab, orient=tk.VERTICAL, command=canvas.yview)
+        self._ana_scroll_frame = ttk.Frame(canvas)
+        self._ana_scroll_frame.bind(
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=self._ana_scroll_frame, anchor=tk.NW)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        # Mousewheel scrolling
+        canvas.bind_all("<MouseWheel>",
+                        lambda e: canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+        body = self._ana_scroll_frame
+
+        # ---- Description ----
         info = ttk.Label(
-            tab,
-            text="Post-mask analysis: compute per-cell metrics from pre-computed masks.\n"
-                 "Provide nucleus masks, puncta masks, and raw images. Optionally add cell masks\n"
-                 "for cytoplasm metrics. Outputs per-cell CSV and optional per-puncta CSV.",
+            body,
+            text="Estimate the critical concentration (C*) for protein phase separation\n"
+                 "from live-cell fluorescence images. C* is the cytoplasmic protein\n"
+                 "concentration where 50% of cells show phase-separated droplets.",
             foreground="gray",
         )
         info.pack(anchor=tk.W, padx=10, pady=(10, 5))
 
-        # Inputs
-        io_frame = ttk.LabelFrame(tab, text="Input Directories", padding=10)
+        # ---- Inputs ----
+        io_frame = ttk.LabelFrame(body, text="Input Files", padding=10)
         io_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        ttk.Label(io_frame, text="Nucleus Masks Folder:").grid(row=0, column=0, sticky=tk.W, pady=2)
-        self.ana_nuc_dir = tk.StringVar()
-        ttk.Entry(io_frame, textvariable=self.ana_nuc_dir, width=50).grid(row=0, column=1, padx=5, pady=2)
-        ttk.Button(io_frame, text="Browse...", command=lambda: self._browse_dir(self.ana_nuc_dir)).grid(
-            row=0, column=2, pady=2
-        )
+        ttk.Label(io_frame, text="Fluorescence Image (OME-TIFF):").grid(
+            row=0, column=0, sticky=tk.W, pady=2)
+        self.ana_image_path = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.ana_image_path, width=55).grid(
+            row=0, column=1, padx=5, pady=2)
+        ttk.Button(io_frame, text="Browse...",
+                   command=lambda: self._ana_browse_file(self.ana_image_path)).grid(
+            row=0, column=2, pady=2)
 
-        ttk.Label(io_frame, text="Puncta Masks Folder:").grid(row=1, column=0, sticky=tk.W, pady=2)
-        self.ana_puncta_dir = tk.StringVar()
-        ttk.Entry(io_frame, textvariable=self.ana_puncta_dir, width=50).grid(row=1, column=1, padx=5, pady=2)
-        ttk.Button(io_frame, text="Browse...", command=lambda: self._browse_dir(self.ana_puncta_dir)).grid(
-            row=1, column=2, pady=2
-        )
+        ttk.Label(io_frame, text="Cell Mask (DIC or mScarlet):").grid(
+            row=1, column=0, sticky=tk.W, pady=2)
+        self.ana_cell_mask_path = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.ana_cell_mask_path, width=55).grid(
+            row=1, column=1, padx=5, pady=2)
+        ttk.Button(io_frame, text="Browse...",
+                   command=lambda: self._ana_browse_file(self.ana_cell_mask_path)).grid(
+            row=1, column=2, pady=2)
 
-        ttk.Label(io_frame, text="Raw OME-TIFF Images Folder:").grid(row=2, column=0, sticky=tk.W, pady=2)
-        self.ana_intensity_dir = tk.StringVar()
-        ttk.Entry(io_frame, textvariable=self.ana_intensity_dir, width=50).grid(row=2, column=1, padx=5, pady=2)
-        ttk.Button(io_frame, text="Browse...", command=lambda: self._browse_dir(self.ana_intensity_dir)).grid(
-            row=2, column=2, pady=2
-        )
+        ttk.Label(io_frame, text="Nucleus Mask (Cy5/miRFPnano3):").grid(
+            row=2, column=0, sticky=tk.W, pady=2)
+        self.ana_nuc_mask_path = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.ana_nuc_mask_path, width=55).grid(
+            row=2, column=1, padx=5, pady=2)
+        ttk.Button(io_frame, text="Browse...",
+                   command=lambda: self._ana_browse_file(self.ana_nuc_mask_path)).grid(
+            row=2, column=2, pady=2)
 
-        ttk.Label(io_frame, text="Cell Masks Folder (optional):").grid(row=3, column=0, sticky=tk.W, pady=2)
-        self.ana_cell_dir = tk.StringVar()
-        ttk.Entry(io_frame, textvariable=self.ana_cell_dir, width=50).grid(row=3, column=1, padx=5, pady=2)
-        ttk.Button(io_frame, text="Browse...", command=lambda: self._browse_dir(self.ana_cell_dir)).grid(
-            row=3, column=2, pady=2
-        )
+        ttk.Label(io_frame, text="Puncta Mask (mEGFP, optional):").grid(
+            row=3, column=0, sticky=tk.W, pady=2)
+        self.ana_puncta_mask_path = tk.StringVar()
+        ttk.Entry(io_frame, textvariable=self.ana_puncta_mask_path, width=55).grid(
+            row=3, column=1, padx=5, pady=2)
+        ttk.Button(io_frame, text="Browse...",
+                   command=lambda: self._ana_browse_file(self.ana_puncta_mask_path)).grid(
+            row=3, column=2, pady=2)
 
-        # Output
-        out_frame = ttk.LabelFrame(tab, text="Output", padding=10)
-        out_frame.pack(fill=tk.X, padx=10, pady=5)
-
-        ttk.Label(out_frame, text="Per-cell CSV:").grid(row=0, column=0, sticky=tk.W, pady=2)
-        self.ana_csv_path = tk.StringVar()
-        ttk.Entry(out_frame, textvariable=self.ana_csv_path, width=50).grid(row=0, column=1, padx=5, pady=2)
-        ttk.Button(out_frame, text="Browse...", command=self._ana_browse_csv).grid(
-            row=0, column=2, pady=2
-        )
-
-        ttk.Label(out_frame, text="Triptych Output Folder:").grid(row=1, column=0, sticky=tk.W, pady=2)
-        self.ana_trip_dir = tk.StringVar()
-        ttk.Entry(out_frame, textvariable=self.ana_trip_dir, width=50).grid(row=1, column=1, padx=5, pady=2)
-        ttk.Button(out_frame, text="Browse...", command=lambda: self._browse_dir(self.ana_trip_dir)).grid(
-            row=1, column=2, pady=2
-        )
-
-        # Parameters
-        param_frame = ttk.LabelFrame(tab, text="Parameters", padding=10)
+        # ---- Channel / detection parameters ----
+        param_frame = ttk.LabelFrame(body, text="Parameters", padding=10)
         param_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        row0 = ttk.Frame(param_frame)
-        row0.pack(fill=tk.X, pady=2)
+        p_row0 = ttk.Frame(param_frame)
+        p_row0.pack(fill=tk.X, pady=2)
 
-        ttk.Label(row0, text="Nucleus channel:").pack(side=tk.LEFT, padx=(0, 5))
-        self.ana_int_ch = tk.IntVar(value=2)
-        ttk.Entry(row0, textvariable=self.ana_int_ch, width=5).pack(side=tk.LEFT, padx=(0, 15))
+        ttk.Label(p_row0, text="Fluorescence channel (mEGFP):").pack(side=tk.LEFT, padx=(0, 5))
+        self.ana_fluor_ch = tk.IntVar(value=1)
+        ttk.Entry(p_row0, textvariable=self.ana_fluor_ch, width=4).pack(side=tk.LEFT, padx=(0, 15))
 
-        ttk.Label(row0, text="Puncta channel:").pack(side=tk.LEFT, padx=(0, 5))
-        self.ana_pun_ch = tk.IntVar(value=1)
-        ttk.Entry(row0, textvariable=self.ana_pun_ch, width=5).pack(side=tk.LEFT, padx=(0, 15))
+        ttk.Label(p_row0, text="Droplet threshold (x*std):").pack(side=tk.LEFT, padx=(0, 5))
+        self.ana_thresh_factor = tk.DoubleVar(value=2.0)
+        ttk.Entry(p_row0, textvariable=self.ana_thresh_factor, width=5).pack(side=tk.LEFT, padx=(0, 15))
 
-        ttk.Label(row0, text="Min puncta area:").pack(side=tk.LEFT, padx=(0, 5))
-        self.ana_min_area = tk.IntVar(value=5)
-        ttk.Entry(row0, textvariable=self.ana_min_area, width=5).pack(side=tk.LEFT, padx=(0, 15))
+        ttk.Label(p_row0, text="Min droplet area (px):").pack(side=tk.LEFT, padx=(0, 5))
+        self.ana_min_drop_area = tk.IntVar(value=5)
+        ttk.Entry(p_row0, textvariable=self.ana_min_drop_area, width=5).pack(side=tk.LEFT, padx=(0, 15))
 
-        ttk.Label(row0, text="Open radius:").pack(side=tk.LEFT, padx=(0, 5))
-        self.ana_open_radius = tk.IntVar(value=1)
-        ttk.Entry(row0, textvariable=self.ana_open_radius, width=5).pack(side=tk.LEFT)
+        ttk.Label(p_row0, text="Gaussian sigma:").pack(side=tk.LEFT, padx=(0, 5))
+        self.ana_sigma = tk.DoubleVar(value=1.5)
+        ttk.Entry(p_row0, textvariable=self.ana_sigma, width=5).pack(side=tk.LEFT)
 
-        row1 = ttk.Frame(param_frame)
-        row1.pack(fill=tk.X, pady=2)
+        p_row1 = ttk.Frame(param_frame)
+        p_row1.pack(fill=tk.X, pady=2)
 
-        self.ana_trip_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row1, text="Generate QC triptychs", variable=self.ana_trip_var).pack(
-            side=tk.LEFT, padx=8
-        )
+        ttk.Label(p_row1, text="Min circularity:").pack(side=tk.LEFT, padx=(0, 5))
+        self.ana_min_circ = tk.DoubleVar(value=0.3)
+        ttk.Entry(p_row1, textvariable=self.ana_min_circ, width=5).pack(side=tk.LEFT, padx=(0, 15))
 
-        self.ana_per_puncta_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            row1, text="Export per-puncta CSV (individual puncta metrics)",
-            variable=self.ana_per_puncta_var
-        ).pack(side=tk.LEFT, padx=8)
+        ttk.Label(p_row1, text="Outlier Z-threshold:").pack(side=tk.LEFT, padx=(0, 5))
+        self.ana_z_thresh = tk.DoubleVar(value=3.0)
+        ttk.Entry(p_row1, textvariable=self.ana_z_thresh, width=5).pack(side=tk.LEFT, padx=(0, 15))
 
-        # Metrics info
-        metrics_frame = ttk.LabelFrame(tab, text="Output Metrics", padding=10)
-        metrics_frame.pack(fill=tk.X, padx=10, pady=5)
-        metrics_text = (
-            "Per-cell CSV columns:\n"
-            "  Shape: num_nuc_pixels, eccentricity, solidity\n"
-            "  Puncta: num_puncta_objects, puncta_density, has_puncta, puncta_area_in_nuc\n"
-            "  Nuc intensity: nuc_mean_raw, nuc_median_raw, nuc_std_raw, nuc_mean_bgsub\n"
-            "  Puncta ch intensity: puncta_ch_mean, puncta_ch_median, puncta_ch_std, puncta_ch_mean_bgsub\n"
-            "  Puncta spot intensity: puncta_mean_intensity, puncta_max_intensity, puncta_median_intensity\n"
-            "  Cell (if cell masks): cell_area, cyto_area, cyto_nuc_mean, cyto_puncta_ch_mean, nuc_cyto_ratio\n"
-            "\n"
-            "Per-puncta CSV (optional): puncta_area, puncta_mean/max_intensity, centroid, eccentricity"
-        )
-        ttk.Label(metrics_frame, text=metrics_text, foreground="gray", justify=tk.LEFT,
-                  font=("Courier", 8)).pack(anchor=tk.W)
+        ttk.Label(p_row1, text="Bootstrap iterations:").pack(side=tk.LEFT, padx=(0, 5))
+        self.ana_n_bootstrap = tk.IntVar(value=1000)
+        ttk.Entry(p_row1, textvariable=self.ana_n_bootstrap, width=6).pack(side=tk.LEFT)
 
-        # Run button
-        btn_frame = ttk.Frame(tab)
+        # ---- Action buttons ----
+        btn_frame = ttk.LabelFrame(body, text="Actions", padding=10)
         btn_frame.pack(fill=tk.X, padx=10, pady=5)
-        self.btn_ana_run = ttk.Button(btn_frame, text="Run Analysis", command=self._ana_run)
-        self.btn_ana_run.pack(side=tk.LEFT, padx=5)
 
-        # Progress
-        self.ana_progress = ttk.Progressbar(tab, mode="determinate")
+        self.btn_ana_measure = ttk.Button(
+            btn_frame, text="Run Measurement Extraction",
+            command=self._ana_run_measurement)
+        self.btn_ana_measure.pack(side=tk.LEFT, padx=5)
+
+        self.btn_ana_cstar = ttk.Button(
+            btn_frame, text="Estimate Critical Concentration",
+            command=self._ana_run_cstar, state=tk.DISABLED)
+        self.btn_ana_cstar.pack(side=tk.LEFT, padx=5)
+
+        self.btn_ana_export = ttk.Button(
+            btn_frame, text="Export CSV",
+            command=self._ana_export_csv, state=tk.DISABLED)
+        self.btn_ana_export.pack(side=tk.LEFT, padx=5)
+
+        # ---- Progress ----
+        self.ana_progress = ttk.Progressbar(body, mode="determinate")
         self.ana_progress.pack(fill=tk.X, padx=10, pady=5)
-
         self.ana_status = tk.StringVar(value="Ready")
-        ttk.Label(tab, textvariable=self.ana_status).pack(padx=10, anchor=tk.W)
+        ttk.Label(body, textvariable=self.ana_status).pack(padx=10, anchor=tk.W)
 
-        # Log
-        log_frame = ttk.LabelFrame(tab, text="Log", padding=5)
+        # ---- Results summary ----
+        summary_frame = ttk.LabelFrame(body, text="Results Summary", padding=10)
+        summary_frame.pack(fill=tk.X, padx=10, pady=5)
+        self.ana_summary_text = tk.StringVar(
+            value="Run measurement extraction and C* estimation to see results here."
+        )
+        ttk.Label(summary_frame, textvariable=self.ana_summary_text,
+                  justify=tk.LEFT, wraplength=700).pack(anchor=tk.W)
+
+        # ---- Plot panels (2x2 grid) ----
+        plot_frame = ttk.LabelFrame(body, text="Visualization", padding=5)
+        plot_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        # Create 4 sub-frames for plots
+        self._ana_plot_frames = {}
+        for idx, (r, c, title) in enumerate([
+            (0, 0, "Overlay"),
+            (0, 1, "Intensity Histogram"),
+            (1, 0, "Intensity vs Droplet Count"),
+            (1, 1, "Phase Transition Curve"),
+        ]):
+            f = ttk.LabelFrame(plot_frame, text=title, padding=2)
+            f.grid(row=r, column=c, padx=4, pady=4, sticky="nsew")
+            self._ana_plot_frames[title] = f
+        plot_frame.columnconfigure(0, weight=1)
+        plot_frame.columnconfigure(1, weight=1)
+        plot_frame.rowconfigure(0, weight=1)
+        plot_frame.rowconfigure(1, weight=1)
+
+        # ---- Log ----
+        log_frame = ttk.LabelFrame(body, text="Log", padding=5)
         log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(5, 10))
         self.ana_log = scrolledtext.ScrolledText(
-            log_frame, wrap=tk.WORD, height=8, state=tk.DISABLED, font=("Courier", 9)
+            log_frame, wrap=tk.WORD, height=6, state=tk.DISABLED, font=("Courier", 9)
         )
         self.ana_log.pack(fill=tk.BOTH, expand=True)
+
+        # Internal state
+        self._ana_df = None           # per-cell DataFrame
+        self._ana_df_clean = None     # cleaned DataFrame
+        self._ana_fit_result = None   # logistic fit result dict
+        self._ana_droplet_mask = None # combined droplet mask
+        self._ana_fluor_img = None    # loaded fluorescence image
+        self._ana_cell_mask = None    # loaded cell mask
+
+    # ---- File browse helper ----
+    def _ana_browse_file(self, string_var):
+        path = filedialog.askopenfilename(
+            title="Select File",
+            filetypes=[("TIFF files", "*.tif *.tiff *.ome.tif *.ome.tiff"),
+                       ("All files", "*.*")],
+        )
+        if path:
+            string_var.set(path)
 
     def _ana_browse_csv(self):
         path = filedialog.asksaveasfilename(
@@ -2383,7 +2437,8 @@ class SegmentationGUI(tk.Tk):
             defaultextension=".csv",
         )
         if path:
-            self.ana_csv_path.set(path)
+            return path
+        return None
 
     def _ana_log_append(self, msg):
         self.ana_log.config(state=tk.NORMAL)
@@ -2391,85 +2446,224 @@ class SegmentationGUI(tk.Tk):
         self.ana_log.see(tk.END)
         self.ana_log.config(state=tk.DISABLED)
 
-    def _ana_run(self):
-        nuc = self.ana_nuc_dir.get()
-        puncta = self.ana_puncta_dir.get()
-        intensity = self.ana_intensity_dir.get()
-        csv_path = self.ana_csv_path.get()
+    def _ana_log_append_q(self, msg):
+        """Thread-safe log append via queue."""
+        self.log_queue.put(f"__ANA_LOG__{msg}")
 
-        if not all([nuc, puncta, intensity, csv_path]):
+    # ---- Embed matplotlib figure in a tk frame ----
+    def _ana_embed_figure(self, fig, parent_frame):
+        """Embed a matplotlib Figure into a ttk frame, replacing old content."""
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        for w in parent_frame.winfo_children():
+            w.destroy()
+        canvas = FigureCanvasTkAgg(fig, master=parent_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    # ---- Run Measurement Extraction ----
+    def _ana_run_measurement(self):
+        img_path = self.ana_image_path.get()
+        cell_path = self.ana_cell_mask_path.get()
+        if not img_path or not cell_path:
             messagebox.showwarning(
                 "Missing input",
-                "Please fill in all required fields:\n"
-                "- Nucleus masks folder\n"
-                "- Puncta masks folder\n"
-                "- Raw images folder\n"
-                "- Output CSV path"
-            )
-            return
-        if NUCLEUS_SCRIPTS_DIR is None:
-            messagebox.showerror(
-                "Nucleus/Scripts not found",
-                "Cannot find Nucleus/Scripts/.\n"
-                "Make sure the Nucleus/ folder is in the repository root."
-            )
+                "Please provide:\n- Fluorescence image\n- Cell mask")
             return
 
-        int_ch = self.ana_int_ch.get()
-        pun_ch = self.ana_pun_ch.get()
-        min_a = self.ana_min_area.get()
-        open_r = self.ana_open_radius.get()
-        trip = self.ana_trip_var.get()
-        trip_dir = self.ana_trip_dir.get() or None
-        cell_dir = self.ana_cell_dir.get() or None
-        per_puncta = self.ana_per_puncta_var.get()
+        fluor_ch = self.ana_fluor_ch.get()
+        sigma = self.ana_sigma.get()
+        thresh_f = self.ana_thresh_factor.get()
+        min_area = self.ana_min_drop_area.get()
+        min_circ = self.ana_min_circ.get()
+        nuc_path = self.ana_nuc_mask_path.get() or None
+        puncta_path = self.ana_puncta_mask_path.get() or None
 
-        self._ana_log_append(f"Analysis: nuc_ch={int_ch}, puncta_ch={pun_ch}, min_area={min_a}")
-        if cell_dir:
-            self._ana_log_append(f"  Cell masks: {cell_dir}")
-        if per_puncta:
-            self._ana_log_append("  Per-puncta CSV export enabled")
-        self.btn_ana_run.config(state=tk.DISABLED)
-        self.ana_status.set("Running analysis...")
+        self.btn_ana_measure.config(state=tk.DISABLED)
+        self.btn_ana_cstar.config(state=tk.DISABLED)
+        self.btn_ana_export.config(state=tk.DISABLED)
+        self.ana_progress.config(value=0)
+        self.ana_status.set("Extracting measurements...")
+        self._ana_log_append(f"Loading image channel {fluor_ch} from {Path(img_path).name}...")
 
         def task():
             try:
-                from puncta_detection.mean_intensity_and_puncta import main as run_analysis
+                from phase_separation import (
+                    load_image_channel, load_mask_2d,
+                    extract_cell_measurements, plot_overlay,
+                )
+
+                fluor_img = load_image_channel(img_path, channel_index=fluor_ch)
+                cell_mask = load_mask_2d(cell_path)
+                self._ana_fluor_img = fluor_img
+                self._ana_cell_mask = cell_mask
+
+                self._ana_log_append_q(
+                    f"Image: {fluor_img.shape}, Cell mask: {cell_mask.shape}, "
+                    f"{int(cell_mask.max())} cells")
+
+                nuc_mask = None
+                if nuc_path:
+                    nuc_mask = load_mask_2d(nuc_path)
+                    self._ana_log_append_q(f"Nucleus mask loaded: {int(nuc_mask.max())} nuclei")
+
+                puncta_mask = None
+                if puncta_path:
+                    puncta_mask = load_mask_2d(puncta_path)
+                    self._ana_log_append_q(f"Puncta mask loaded: {int(puncta_mask.max())} puncta objects")
 
                 def _on_progress(current, total):
-                    pct = int(100 * current / total)
+                    pct = int(100 * current / total) if total > 0 else 0
                     self.log_queue.put(f"__ANA_PROGRESS__{pct}")
 
-                run_analysis(
-                    nuc_dir=nuc,
-                    puncta_dir=puncta,
-                    intensity_dir=intensity,
-                    out_csv=csv_path,
-                    cell_dir=cell_dir,
-                    min_puncta_area=min_a,
-                    puncta_open_radius=open_r,
-                    make_triptychs=trip,
-                    triptych_out_dir=trip_dir,
-                    intensity_channel=int_ch,
-                    puncta_channel=pun_ch,
-                    export_per_puncta=per_puncta,
+                df, droplet_mask = extract_cell_measurements(
+                    fluorescence_img=fluor_img,
+                    cell_mask=cell_mask,
+                    nucleus_mask=nuc_mask,
+                    puncta_mask=puncta_mask,
+                    sigma=sigma,
+                    threshold_factor=thresh_f,
+                    min_droplet_area=min_area,
+                    min_circularity=min_circ,
                     progress_callback=_on_progress,
                 )
-                self.log_queue.put(f"__ANA_DONE__{csv_path}")
+
+                self._ana_df = df
+                self._ana_droplet_mask = droplet_mask
+
+                n_with = int(df["droplet_present"].sum())
+                n_total = len(df)
+                self._ana_log_append_q(
+                    f"Extraction complete: {n_total} cells, "
+                    f"{n_with} with droplets ({100*n_with/max(n_total,1):.1f}%)")
+
+                # Generate overlay plot
+                fig_overlay = plot_overlay(fluor_img, cell_mask, droplet_mask)
+                self.log_queue.put(("__ANA_PLOT__", "Overlay", fig_overlay))
+
+                self.log_queue.put("__ANA_MEASURE_DONE__")
             except Exception as exc:
                 self.log_queue.put(f"__ANA_ERROR__{exc}")
 
         threading.Thread(target=task, daemon=True).start()
 
+    # ---- Estimate C* ----
+    def _ana_run_cstar(self):
+        if self._ana_df is None or len(self._ana_df) == 0:
+            messagebox.showwarning("No data", "Run measurement extraction first.")
+            return
+
+        z_thresh = self.ana_z_thresh.get()
+        n_boot = self.ana_n_bootstrap.get()
+
+        self.btn_ana_cstar.config(state=tk.DISABLED)
+        self.ana_status.set("Fitting logistic model & bootstrapping...")
+        self._ana_log_append("Cleaning data and fitting logistic regression...")
+
+        def task():
+            try:
+                from phase_separation import (
+                    clean_data, fit_logistic,
+                    plot_intensity_histogram,
+                    plot_scatter_droplet_count,
+                    plot_phase_transition,
+                )
+
+                df_clean = clean_data(self._ana_df, z_threshold=z_thresh)
+                self._ana_df_clean = df_clean
+                n_removed = len(self._ana_df) - len(df_clean)
+                self._ana_log_append_q(
+                    f"Cleaned: {len(df_clean)} cells kept, {n_removed} removed "
+                    f"(NaN or outlier)")
+
+                result = fit_logistic(df_clean, n_bootstrap=n_boot)
+                self._ana_fit_result = result
+
+                if "error" in result:
+                    self._ana_log_append_q(f"[WARN] {result['error']}")
+
+                c_star = result["c_star"]
+                ci_lo = result["ci_low"]
+                ci_hi = result["ci_high"]
+                self._ana_log_append_q(
+                    f"C* = {c_star:.2f}  (95% CI: [{ci_lo:.2f}, {ci_hi:.2f}])")
+                self._ana_log_append_q(
+                    f"Cells with droplets: {result['n_with_drops']}, "
+                    f"without: {result['n_no_drops']}")
+
+                # Build summary text
+                summary = (
+                    f"Estimated Critical Concentration (C*): {c_star:.2f}\n"
+                    f"95% Confidence Interval: [{ci_lo:.2f}, {ci_hi:.2f}]\n"
+                    f"Total cells analyzed: {result['n_cells']}\n"
+                    f"  With droplets: {result['n_with_drops']}  |  "
+                    f"Without: {result['n_no_drops']}\n"
+                    f"Logistic slope: {result['slope']:.4f}\n\n"
+                    f"C* is the cytoplasmic protein concentration at which 50% of cells\n"
+                    f"show phase-separated droplets, providing an estimate of the\n"
+                    f"phase separation threshold."
+                )
+                self.log_queue.put(f"__ANA_SUMMARY__{summary}")
+
+                # Generate plots
+                fig_hist = plot_intensity_histogram(df_clean)
+                fig_scatter = plot_scatter_droplet_count(df_clean)
+                fig_phase = plot_phase_transition(df_clean, result)
+
+                self.log_queue.put(("__ANA_PLOT__", "Intensity Histogram", fig_hist))
+                self.log_queue.put(("__ANA_PLOT__", "Intensity vs Droplet Count", fig_scatter))
+                self.log_queue.put(("__ANA_PLOT__", "Phase Transition Curve", fig_phase))
+
+                self.log_queue.put("__ANA_CSTAR_DONE__")
+            except Exception as exc:
+                self.log_queue.put(f"__ANA_ERROR__{exc}")
+
+        threading.Thread(target=task, daemon=True).start()
+
+    # ---- Export CSV ----
+    def _ana_export_csv(self):
+        df = self._ana_df_clean if self._ana_df_clean is not None else self._ana_df
+        if df is None or len(df) == 0:
+            messagebox.showwarning("No data", "Run measurement extraction first.")
+            return
+
+        path = self._ana_browse_csv()
+        if not path:
+            return
+
+        cols = ["cell_id", "cytoplasm_mean_intensity", "total_cell_intensity",
+                "droplet_present", "droplet_count", "droplet_total_area"]
+        export_cols = [c for c in cols if c in df.columns]
+        df[export_cols].to_csv(path, index=False)
+        self._ana_log_append(f"CSV exported: {path}  ({len(df)} rows)")
+        self.ana_status.set(f"CSV exported to {Path(path).name}")
+
+    # ---- Queue message handlers (called from _poll_log_queue) ----
     def _on_ana_finished(self, csv_path=None, error=None):
-        self.btn_ana_run.config(state=tk.NORMAL)
+        """Handle analysis error messages."""
+        self.btn_ana_measure.config(state=tk.NORMAL)
+        self.btn_ana_cstar.config(state=tk.NORMAL)
+        self.btn_ana_export.config(state=tk.NORMAL)
         self.ana_progress.config(value=100)
         if error:
             self.ana_status.set(f"Error: {str(error)[:80]}")
             self._ana_log_append(f"[ERROR] {error}")
         else:
-            self.ana_status.set("Analysis complete")
-            self._ana_log_append(f"[DONE] Analysis complete. CSV: {csv_path}")
+            self.ana_status.set("Complete")
+
+    def _on_ana_measure_done(self):
+        """Called when measurement extraction finishes."""
+        self.btn_ana_measure.config(state=tk.NORMAL)
+        self.btn_ana_cstar.config(state=tk.NORMAL)
+        self.btn_ana_export.config(state=tk.NORMAL)
+        self.ana_progress.config(value=100)
+        self.ana_status.set("Measurement extraction complete. Ready for C* estimation.")
+
+    def _on_ana_cstar_done(self):
+        """Called when C* estimation finishes."""
+        self.btn_ana_cstar.config(state=tk.NORMAL)
+        self.btn_ana_export.config(state=tk.NORMAL)
+        self.ana_progress.config(value=100)
+        self.ana_status.set("C* estimation complete.")
 
     # ==================================================================
     # Helper: generic directory browse
@@ -4589,6 +4783,14 @@ class SegmentationGUI(tk.Tk):
 
             # Check for control messages
 
+            # -- Tuple messages (e.g. plot embeds) --
+            if isinstance(msg, tuple):
+                if msg[0] == "__ANA_PLOT__":
+                    _, plot_title, fig = msg
+                    if plot_title in self._ana_plot_frames:
+                        self._ana_embed_figure(fig, self._ana_plot_frames[plot_title])
+                continue
+
             # -- ND2 Conversion --
             if msg == "__ND2_DONE__":
                 self._on_nd2_finished()
@@ -4673,14 +4875,23 @@ class SegmentationGUI(tk.Tk):
                                       values=(name, n if n >= 0 else "-", status))
                 continue
 
-            # -- Analysis --
+            # -- Phase Separation Analysis --
             if msg.startswith("__ANA_PROGRESS__"):
                 pct = int(msg[len("__ANA_PROGRESS__"):])
                 self.ana_progress.config(value=pct)
-                self.ana_status.set(f"Analysing... {pct}%")
+                self.ana_status.set(f"Processing... {pct}%")
                 continue
-            if msg.startswith("__ANA_DONE__"):
-                self._on_ana_finished(csv_path=msg[len("__ANA_DONE__"):])
+            if msg.startswith("__ANA_LOG__"):
+                self._ana_log_append(msg[len("__ANA_LOG__"):])
+                continue
+            if msg.startswith("__ANA_SUMMARY__"):
+                self.ana_summary_text.set(msg[len("__ANA_SUMMARY__"):])
+                continue
+            if msg == "__ANA_MEASURE_DONE__":
+                self._on_ana_measure_done()
+                continue
+            if msg == "__ANA_CSTAR_DONE__":
+                self._on_ana_cstar_done()
                 continue
             if msg.startswith("__ANA_ERROR__"):
                 self._on_ana_finished(error=msg[len("__ANA_ERROR__"):])
