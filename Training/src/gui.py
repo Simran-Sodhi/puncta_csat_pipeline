@@ -2320,8 +2320,8 @@ class SegmentationGUI(tk.Tk):
         p_row0 = ttk.Frame(param_frame)
         p_row0.pack(fill=tk.X, pady=2)
 
-        ttk.Label(p_row0, text="Intensity channel (1-based):").pack(side=tk.LEFT, padx=(0, 5))
-        self.ana_fluor_ch = tk.IntVar(value=2)
+        ttk.Label(p_row0, text="Intensity channel (0: DIC, 1: mEGFP, 2: mScarlet, 3: miRFPnano3):").pack(side=tk.LEFT, padx=(0, 5))
+        self.ana_fluor_ch = tk.IntVar(value=1)
         ttk.Entry(p_row0, textvariable=self.ana_fluor_ch, width=4).pack(side=tk.LEFT, padx=(0, 15))
 
         ttk.Label(p_row0, text="Outlier Z-threshold:").pack(side=tk.LEFT, padx=(0, 5))
@@ -2458,7 +2458,7 @@ class SegmentationGUI(tk.Tk):
                 "- Puncta masks folder")
             return
 
-        fluor_ch = self.ana_fluor_ch.get() - 1  # convert 1-based UI to 0-based index
+        fluor_ch = self.ana_fluor_ch.get()  # already 0-based (0=DIC,1=mEGFP,2=mScarlet,3=miRFPnano3)
         nuc_dir = self.ana_nuc_mask_dir.get() or None
 
         self.btn_ana_measure.config(state=tk.DISABLED)
@@ -2656,13 +2656,43 @@ class SegmentationGUI(tk.Tk):
         if not path:
             return
 
+        # --- Per-cell CSV ---
         cols = ["image", "cell_id", "cell_area", "cytoplasm_mean_intensity",
                 "nucleus_mean_intensity", "total_cell_intensity",
                 "puncta_present", "puncta_count", "puncta_total_area",
                 "puncta_sum_intensity"]
         export_cols = [c for c in cols if c in df.columns]
         df[export_cols].to_csv(path, index=False)
-        self._ana_log_append(f"CSV exported: {path}  ({len(df)} rows)")
+        self._ana_log_append(f"Per-cell CSV exported: {path}  ({len(df)} rows)")
+
+        # --- Per-image summary CSV ---
+        summary_path = path.replace(".csv", "_summary.csv")
+        if "image" in df.columns:
+            summary_records = []
+            for img_name, grp in df.groupby("image"):
+                n_total = len(grp)
+                n_with = int(grp["puncta_present"].sum())
+                n_without = n_total - n_with
+                summary_records.append({
+                    "image": img_name,
+                    "total_cells": n_total,
+                    "cells_with_puncta": n_with,
+                    "cells_without_puncta": n_without,
+                })
+            # Add grand total row
+            grand_total = len(df)
+            grand_with = int(df["puncta_present"].sum())
+            summary_records.append({
+                "image": "TOTAL",
+                "total_cells": grand_total,
+                "cells_with_puncta": grand_with,
+                "cells_without_puncta": grand_total - grand_with,
+            })
+            import pandas as pd
+            df_summary = pd.DataFrame(summary_records)
+            df_summary.to_csv(summary_path, index=False)
+            self._ana_log_append(f"Summary CSV exported: {summary_path}")
+
         self.ana_status.set(f"CSV exported to {Path(path).name}")
 
     # ---- Queue message handlers (called from _poll_log_queue) ----
