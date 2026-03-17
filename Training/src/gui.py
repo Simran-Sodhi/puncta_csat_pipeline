@@ -2320,8 +2320,8 @@ class SegmentationGUI(tk.Tk):
         p_row0 = ttk.Frame(param_frame)
         p_row0.pack(fill=tk.X, pady=2)
 
-        ttk.Label(p_row0, text="mEGFP channel index:").pack(side=tk.LEFT, padx=(0, 5))
-        self.ana_fluor_ch = tk.IntVar(value=1)
+        ttk.Label(p_row0, text="Intensity channel (1-based):").pack(side=tk.LEFT, padx=(0, 5))
+        self.ana_fluor_ch = tk.IntVar(value=2)
         ttk.Entry(p_row0, textvariable=self.ana_fluor_ch, width=4).pack(side=tk.LEFT, padx=(0, 15))
 
         ttk.Label(p_row0, text="Outlier Z-threshold:").pack(side=tk.LEFT, padx=(0, 5))
@@ -2458,7 +2458,7 @@ class SegmentationGUI(tk.Tk):
                 "- Puncta masks folder")
             return
 
-        fluor_ch = self.ana_fluor_ch.get()
+        fluor_ch = self.ana_fluor_ch.get() - 1  # convert 1-based UI to 0-based index
         nuc_dir = self.ana_nuc_mask_dir.get() or None
 
         self.btn_ana_measure.config(state=tk.DISABLED)
