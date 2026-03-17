@@ -228,18 +228,30 @@ def extract_cell_measurements(fluorescence_img, cell_mask,
             nuc_binary = None
             cyto_binary = cell_binary
 
-        # Cytoplasm intensity EXCLUDING puncta (unbiased for Csat)
-        cyto_no_puncta = cyto_binary & ~cell_puncta
-        cyto_pixels = fluorescence_img[cyto_no_puncta]
+        # Cytoplasm mean intensity = Cell - Nucleus (mEGFP ch1)
+        cyto_pixels = fluorescence_img[cyto_binary]
         cyto_mean = float(np.mean(cyto_pixels)) if cyto_pixels.size > 0 else np.nan
 
-        # Nucleus mean intensity (excluding puncta)
+        # Nucleus mean intensity = Nucleus region only (mEGFP ch1,
+        # nucleus mask from Cy5/miRFPnano3 ch3)
         if nuc_binary is not None:
-            nuc_no_puncta = nuc_binary & ~cell_puncta
-            nuc_pixels = fluorescence_img[nuc_no_puncta]
+            nuc_pixels = fluorescence_img[nuc_binary]
             nuc_mean = float(np.mean(nuc_pixels)) if nuc_pixels.size > 0 else np.nan
         else:
             nuc_mean = np.nan
+
+        # Dilute phase: cytoplasm minus puncta (mEGFP ch1)
+        cyto_dilute_binary = cyto_binary & ~cell_puncta
+        cyto_dilute_pixels = fluorescence_img[cyto_dilute_binary]
+        cyto_dilute_mean = float(np.mean(cyto_dilute_pixels)) if cyto_dilute_pixels.size > 0 else np.nan
+
+        # Dilute phase: nucleus minus puncta (mEGFP ch1)
+        if nuc_binary is not None:
+            nuc_dilute_binary = nuc_binary & ~cell_puncta
+            nuc_dilute_pixels = fluorescence_img[nuc_dilute_binary]
+            nuc_dilute_mean = float(np.mean(nuc_dilute_pixels)) if nuc_dilute_pixels.size > 0 else np.nan
+        else:
+            nuc_dilute_mean = np.nan
 
         records.append({
             "image": image_name,
@@ -248,6 +260,8 @@ def extract_cell_measurements(fluorescence_img, cell_mask,
             "total_cell_intensity": total_intensity,
             "cytoplasm_mean_intensity": cyto_mean,
             "nucleus_mean_intensity": nuc_mean,
+            "cyto_dilute_mean_intensity": cyto_dilute_mean,
+            "nuc_dilute_mean_intensity": nuc_dilute_mean,
             "puncta_present": 1 if n_puncta > 0 else 0,
             "puncta_count": n_puncta,
             "puncta_total_area": puncta_area,

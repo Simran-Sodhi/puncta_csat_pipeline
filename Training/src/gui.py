@@ -2658,7 +2658,8 @@ class SegmentationGUI(tk.Tk):
 
         # --- Per-cell CSV ---
         cols = ["image", "cell_id", "cell_area", "cytoplasm_mean_intensity",
-                "nucleus_mean_intensity", "total_cell_intensity",
+                "nucleus_mean_intensity", "cyto_dilute_mean_intensity",
+                "nuc_dilute_mean_intensity", "total_cell_intensity",
                 "puncta_present", "puncta_count", "puncta_total_area",
                 "puncta_sum_intensity"]
         export_cols = [c for c in cols if c in df.columns]
