@@ -339,8 +339,19 @@ class SegmentationGUI(tk.Tk):
 
         ch_frame = ttk.Frame(io_frame)
         ch_frame.grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(5, 0))
-        ttk.Label(ch_frame, text="Channel index:").pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(ch_frame, text="Channel:").pack(side=tk.LEFT, padx=(0, 5))
         self.deconv_channel = tk.IntVar(value=0)
+        self.deconv_channel_name = tk.StringVar(value="")
+        self._deconv_ome_channel_names = []
+        self.deconv_channel_combo = ttk.Combobox(
+            ch_frame, textvariable=self.deconv_channel_name, width=22, state="readonly")
+        self.deconv_channel_combo.pack(side=tk.LEFT, padx=(0, 5))
+        self.deconv_channel_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self.deconv_channel.set(self.deconv_channel_combo.current()))
+        ttk.Button(ch_frame, text="Detect",
+                   command=self._deconv_detect_channels).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(ch_frame, text="or index:").pack(side=tk.LEFT, padx=(0, 3))
         ttk.Spinbox(ch_frame, from_=0, to=10, textvariable=self.deconv_channel, width=4).pack(
             side=tk.LEFT, padx=(0, 15))
         ttk.Label(ch_frame, text="Z-plane index:").pack(side=tk.LEFT, padx=(0, 5))
@@ -683,6 +694,17 @@ class SegmentationGUI(tk.Tk):
         if path:
             self.deconv_psf_path.set(path)
 
+    def _deconv_detect_channels(self):
+        """Detect channels from OME-TIFF for deconvolution tab."""
+        names = self._detect_ome_channels(self.deconv_input_dir)
+        if names:
+            self._deconv_ome_channel_names = names
+            display = [f"{i}: {n}" for i, n in enumerate(names)]
+            self.deconv_channel_combo["values"] = display
+            self.deconv_channel_combo.current(0)
+            self.deconv_channel.set(0)
+            self._deconv_log_append(f"Detected channels: {names}")
+
     def _deconv_autodetect_metadata(self):
         """Read OME-TIFF metadata from the first image in the input dir
         and populate emission wavelength, NA, pixel size fields."""
@@ -780,6 +802,11 @@ class SegmentationGUI(tk.Tk):
 
         method = self.deconv_method.get()
         channel = self.deconv_channel.get()
+        # Resolve channel by OME name if detected
+        if self._deconv_ome_channel_names:
+            sel = self.deconv_channel_combo.current()
+            if 0 <= sel < len(self._deconv_ome_channel_names):
+                channel = sel  # use OME-resolved index
         z_idx = self.deconv_z_index.get()
 
         self.btn_deconv_run.config(state=tk.DISABLED)
@@ -952,38 +979,46 @@ class SegmentationGUI(tk.Tk):
         norm_frame = ttk.LabelFrame(body, text="Channel & Normalization", padding=10)
         norm_frame.pack(fill=tk.X, padx=10, pady=5)
 
+        # Detect channels button
+        self._seg_ome_channel_names = []
+        ttk.Button(norm_frame, text="Detect channels from image",
+                   command=self._seg_detect_channels).grid(
+            row=0, column=0, columnspan=4, sticky=tk.W, pady=(0, 5))
+
         # Segment channel with label
-        ttk.Label(norm_frame, text="Segment Channel:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        ttk.Label(norm_frame, text="Segment Channel:").grid(row=1, column=0, sticky=tk.W, pady=2)
         self.seg_channel = tk.IntVar(value=0)
         seg_combo = ttk.Combobox(
             norm_frame, textvariable=self.seg_channel, values=[0, 1, 2, 3],
             width=5, state="readonly",
         )
-        seg_combo.grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
+        seg_combo.grid(row=1, column=1, padx=5, pady=2, sticky=tk.W)
         self.seg_ch_label = tk.StringVar(value="DIC")
         ttk.Label(norm_frame, textvariable=self.seg_ch_label, foreground="gray").grid(
-            row=0, column=2, sticky=tk.W, padx=5
+            row=1, column=2, sticky=tk.W, padx=5
         )
         seg_combo.bind("<<ComboboxSelected>>", self._seg_update_channel_labels)
+        self._seg_combo = seg_combo  # keep reference for updating values
 
         # Nuclear channel (for dual-channel input)
-        ttk.Label(norm_frame, text="Nuclear Channel:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        ttk.Label(norm_frame, text="Nuclear Channel:").grid(row=2, column=0, sticky=tk.W, pady=2)
         self.seg_nuc_channel = tk.IntVar(value=0)
         nuc_combo = ttk.Combobox(
             norm_frame, textvariable=self.seg_nuc_channel, values=[0, 1, 2, 3],
             width=5, state="readonly",
         )
-        nuc_combo.grid(row=1, column=1, padx=5, pady=2, sticky=tk.W)
+        nuc_combo.grid(row=2, column=1, padx=5, pady=2, sticky=tk.W)
         self.seg_nuc_label = tk.StringVar(value="None (grayscale)")
         ttk.Label(norm_frame, textvariable=self.seg_nuc_label, foreground="gray").grid(
-            row=1, column=2, sticky=tk.W, padx=5
+            row=2, column=2, sticky=tk.W, padx=5
         )
+        self._seg_nuc_combo = nuc_combo  # keep reference for updating values
         nuc_combo.bind("<<ComboboxSelected>>", self._seg_update_channel_labels)
 
         # Percentile range
-        ttk.Label(norm_frame, text="Normalization Percentile:").grid(row=2, column=0, sticky=tk.W, pady=2)
+        ttk.Label(norm_frame, text="Normalization Percentile:").grid(row=3, column=0, sticky=tk.W, pady=2)
         pct_frame = ttk.Frame(norm_frame)
-        pct_frame.grid(row=2, column=1, columnspan=2, sticky=tk.W, padx=5)
+        pct_frame.grid(row=3, column=1, columnspan=2, sticky=tk.W, padx=5)
         ttk.Label(pct_frame, text="Low:").pack(side=tk.LEFT)
         self.seg_lower_pct = tk.DoubleVar(value=1.0)
         ttk.Entry(pct_frame, textvariable=self.seg_lower_pct, width=6).pack(side=tk.LEFT, padx=(2, 10))
@@ -992,25 +1027,25 @@ class SegmentationGUI(tk.Tk):
         ttk.Entry(pct_frame, textvariable=self.seg_upper_pct, width=6).pack(side=tk.LEFT, padx=2)
 
         # DIC tile blocksize
-        ttk.Label(norm_frame, text="DIC Tile Blocksize:").grid(row=3, column=0, sticky=tk.W, pady=2)
+        ttk.Label(norm_frame, text="DIC Tile Blocksize:").grid(row=4, column=0, sticky=tk.W, pady=2)
         self.seg_tile_bs = tk.IntVar(value=128)
         ttk.Entry(norm_frame, textvariable=self.seg_tile_bs, width=8).grid(
-            row=3, column=1, padx=5, pady=2, sticky=tk.W
+            row=4, column=1, padx=5, pady=2, sticky=tk.W
         )
         ttk.Label(norm_frame, text="(0 = global, >0 = tile-based for uneven illumination)",
-                  foreground="gray").grid(row=3, column=2, sticky=tk.W, padx=5)
+                  foreground="gray").grid(row=4, column=2, sticky=tk.W, padx=5)
 
         # Z-slice
-        ttk.Label(norm_frame, text="Z-Slice:").grid(row=4, column=0, sticky=tk.W, pady=2)
+        ttk.Label(norm_frame, text="Z-Slice:").grid(row=5, column=0, sticky=tk.W, pady=2)
         z_frame = ttk.Frame(norm_frame)
-        z_frame.grid(row=4, column=1, columnspan=2, sticky=tk.W, padx=5)
+        z_frame.grid(row=5, column=1, columnspan=2, sticky=tk.W, padx=5)
         self.seg_z_idx = tk.StringVar(value="0")
         ttk.Entry(z_frame, textvariable=self.seg_z_idx, width=6).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Label(z_frame, text="(0-indexed)", foreground="gray").pack(side=tk.LEFT)
 
         # Invert DIC + DIC normalization checkboxes
         chk_frame = ttk.Frame(norm_frame)
-        chk_frame.grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=2)
+        chk_frame.grid(row=6, column=0, columnspan=3, sticky=tk.W, pady=2)
 
         self.seg_dic_norm_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(chk_frame, text="DIC normalization (CLAHE)",
@@ -1021,10 +1056,10 @@ class SegmentationGUI(tk.Tk):
                         variable=self.seg_invert_dic).pack(side=tk.LEFT)
 
         # CLAHE clip limit
-        ttk.Label(norm_frame, text="CLAHE Clip Limit:").grid(row=6, column=0, sticky=tk.W, pady=2)
+        ttk.Label(norm_frame, text="CLAHE Clip Limit:").grid(row=7, column=0, sticky=tk.W, pady=2)
         self.seg_clahe_clip = tk.DoubleVar(value=0.02)
         clahe_frame = ttk.Frame(norm_frame)
-        clahe_frame.grid(row=6, column=1, columnspan=2, sticky=tk.W, padx=5)
+        clahe_frame.grid(row=7, column=1, columnspan=2, sticky=tk.W, padx=5)
         ttk.Scale(clahe_frame, from_=0.005, to=0.10, variable=self.seg_clahe_clip,
                   orient=tk.HORIZONTAL, length=180).pack(side=tk.LEFT)
         ttk.Label(clahe_frame, textvariable=self.seg_clahe_clip, width=6).pack(side=tk.LEFT, padx=5)
@@ -1206,6 +1241,20 @@ class SegmentationGUI(tk.Tk):
         self._seg_on_mode_change()
 
     _CHANNEL_NAMES = {0: "DIC", 1: "mEGFP", 2: "mScarlet", 3: "miRFPnano3"}
+
+    def _seg_detect_channels(self):
+        """Detect channels from OME-TIFF for cell segmentation tab."""
+        names = self._detect_ome_channels(self.seg_input_dir)
+        if names:
+            self._seg_ome_channel_names = names
+            # Update _CHANNEL_NAMES to reflect actual OME names
+            self._CHANNEL_NAMES = {i: n for i, n in enumerate(names)}
+            # Update combobox values
+            values = list(range(len(names)))
+            self._seg_combo["values"] = values
+            self._seg_nuc_combo["values"] = values
+            self._seg_update_channel_labels()
+            self._seg_log_append(f"Detected channels: {names}")
 
     def _seg_update_channel_labels(self, event=None):
         seg = self.seg_channel.get()
@@ -1418,6 +1467,10 @@ class SegmentationGUI(tk.Tk):
         mode = self.seg_mode_var.get()
         diam_str = self.seg_diameter.get().strip()
         channel = self.seg_channel.get()
+        # Resolve channel name from OME detection
+        seg_ch_name = None
+        if self._seg_ome_channel_names and channel < len(self._seg_ome_channel_names):
+            seg_ch_name = self._seg_ome_channel_names[channel]
         z_val = self.seg_z_idx.get().strip()
         z = int(z_val) if z_val else 0
         min_sz = self.seg_min_size.get()
@@ -1537,7 +1590,8 @@ class SegmentationGUI(tk.Tk):
                         torch.cuda.set_device(gpu_idx)
                     n_objects = -1
                     try:
-                        img2d = load_image_2d(img_path, channel_index=channel, z_index=z)
+                        img2d = load_image_2d(img_path, channel_index=channel, z_index=z,
+                                             channel_name=seg_ch_name)
                         if use_dic_norm:
                             img_norm = normalize_dic(img2d, clip_limit=clahe_clip)
                         else:
@@ -1704,16 +1758,30 @@ class SegmentationGUI(tk.Tk):
         ch_frame = ttk.LabelFrame(body, text="Channel Selection", padding=10)
         ch_frame.pack(fill=tk.X, padx=10, pady=5)
 
-        ttk.Label(ch_frame, text="Puncta Channel:").grid(row=0, column=0, sticky=tk.W, pady=2)
-        self.pseg_channel = tk.IntVar(value=1)
-        ttk.Combobox(ch_frame, textvariable=self.pseg_channel, values=[0, 1, 2, 3],
-                     width=5, state="readonly").grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
-        ttk.Label(ch_frame, text="(1 = mEGFP for most datasets)", foreground="gray").grid(
-            row=0, column=2, sticky=tk.W, padx=5)
+        self._pseg_ome_channel_names = []
+        ttk.Button(ch_frame, text="Detect channels from image",
+                   command=self._pseg_detect_channels).grid(
+            row=0, column=0, columnspan=4, sticky=tk.W, pady=(0, 5))
 
-        ttk.Label(ch_frame, text="Z-Slice:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        ttk.Label(ch_frame, text="Puncta Channel:").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.pseg_channel = tk.IntVar(value=1)
+        self._pseg_ch_combo = ttk.Combobox(
+            ch_frame, textvariable=self.pseg_channel, values=[0, 1, 2, 3],
+            width=5, state="readonly")
+        self._pseg_ch_combo.grid(row=1, column=1, padx=5, pady=2, sticky=tk.W)
+        self.pseg_ch_label = tk.StringVar(value="mEGFP")
+        ttk.Label(ch_frame, textvariable=self.pseg_ch_label, foreground="gray").grid(
+            row=1, column=2, sticky=tk.W, padx=5)
+        self._pseg_ch_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda e: self.pseg_ch_label.set(
+                self._pseg_ome_channel_names[self.pseg_channel.get()]
+                if self._pseg_ome_channel_names and self.pseg_channel.get() < len(self._pseg_ome_channel_names)
+                else f"Channel {self.pseg_channel.get()}"))
+
+        ttk.Label(ch_frame, text="Z-Slice:").grid(row=2, column=0, sticky=tk.W, pady=2)
         self.pseg_z_idx = tk.IntVar(value=0)
-        ttk.Entry(ch_frame, textvariable=self.pseg_z_idx, width=6).grid(row=1, column=1, padx=5, pady=2, sticky=tk.W)
+        ttk.Entry(ch_frame, textvariable=self.pseg_z_idx, width=6).grid(row=2, column=1, padx=5, pady=2, sticky=tk.W)
 
         # ---- Detection Method ----
         method_frame = ttk.LabelFrame(body, text="Detection Method", padding=10)
@@ -1975,6 +2043,24 @@ class SegmentationGUI(tk.Tk):
         elif method == "consensus":
             self.pseg_cons_frame.pack(fill=tk.X, pady=(5, 0))
 
+    def _pseg_detect_channels(self):
+        """Detect channels from OME-TIFF for puncta segmentation tab."""
+        names = self._detect_ome_channels(self.pseg_input_dir)
+        if names:
+            self._pseg_ome_channel_names = names
+            self._pseg_ch_combo["values"] = list(range(len(names)))
+            # Auto-select GFP if found
+            for i, n in enumerate(names):
+                if any(kw in n.lower() for kw in ("gfp", "egfp", "green")):
+                    self.pseg_channel.set(i)
+                    self.pseg_ch_label.set(n)
+                    break
+            else:
+                self.pseg_ch_label.set(names[self.pseg_channel.get()]
+                                       if self.pseg_channel.get() < len(names)
+                                       else f"Channel {self.pseg_channel.get()}")
+            self._pseg_log_append(f"Detected channels: {names}")
+
     def _pseg_log_append(self, msg):
         self.pseg_log.config(state=tk.NORMAL)
         self.pseg_log.insert(tk.END, msg + "\n")
@@ -1995,6 +2081,10 @@ class SegmentationGUI(tk.Tk):
 
         method = self.pseg_method.get()
         channel = self.pseg_channel.get()
+        # Resolve channel name from OME detection
+        pseg_ch_name = None
+        if self._pseg_ome_channel_names and channel < len(self._pseg_ome_channel_names):
+            pseg_ch_name = self._pseg_ome_channel_names[channel]
         z_idx = self.pseg_z_idx.get()
         sigma = self.pseg_sigma.get()
         bg_sub = self.pseg_bg_sub.get()
@@ -2076,6 +2166,7 @@ class SegmentationGUI(tk.Tk):
                     image_dir=img_dir,
                     out_dir=out_dir,
                     channel=channel,
+                    channel_name=pseg_ch_name,
                     z_index=z_idx,
                     method=method,
                     sigma=sigma,
@@ -2142,6 +2233,9 @@ class SegmentationGUI(tk.Tk):
             return
 
         channel = self.pseg_channel.get()
+        bench_ch_name = None
+        if self._pseg_ome_channel_names and channel < len(self._pseg_ome_channel_names):
+            bench_ch_name = self._pseg_ome_channel_names[channel]
         z_idx = self.pseg_z_idx.get()
         cell_mask_dir = self.pseg_cell_mask_dir.get() or None
 
@@ -2204,6 +2298,7 @@ class SegmentationGUI(tk.Tk):
                         out_dir=bench_dir,
                         methods=methods,
                         channel=channel,
+                        channel_name=bench_ch_name,
                         z_index=z_idx,
                         gt_mask_dir=gt_dir,
                         cell_mask_dir=cell_mask_dir,
@@ -2456,34 +2551,8 @@ class SegmentationGUI(tk.Tk):
     # ---- Channel detection helpers ----
     def _ana_detect_channels(self):
         """Read OME-TIFF channel names from the first image in the image dir."""
-        img_dir = self.ana_image_dir.get()
-        if not img_dir:
-            messagebox.showwarning(
-                "No image directory",
-                "Set the fluorescence images folder first.")
-            return
-
-        from phase_separation import get_ome_channel_names
-        from pathlib import Path
-
-        tiff_exts = {".tif", ".tiff"}
-        img_path = Path(img_dir)
-        first_tiff = None
-        for f in sorted(img_path.iterdir()):
-            if f.suffix.lower() in tiff_exts and f.is_file():
-                first_tiff = f
-                break
-
-        if first_tiff is None:
-            messagebox.showinfo("No images", "No TIFF files found in the image directory.")
-            return
-
-        names = get_ome_channel_names(first_tiff)
+        names = self._detect_ome_channels(self.ana_image_dir)
         if not names:
-            messagebox.showinfo(
-                "No OME metadata",
-                f"No channel names found in OME metadata of:\n{first_tiff.name}\n\n"
-                "Use the fallback index field instead.")
             return
 
         self._ana_ome_channel_names = names
@@ -2501,8 +2570,7 @@ class SegmentationGUI(tk.Tk):
             self.ana_channel_combo.current(0)
             self.ana_fluor_ch.set(0)
 
-        self._ana_log_append(
-            f"Detected channels from {first_tiff.name}: {names}")
+        self._ana_log_append(f"Detected channels: {names}")
 
     def _ana_on_channel_select(self, event=None):
         """Update channel index when user selects from dropdown."""
@@ -2804,6 +2872,44 @@ class SegmentationGUI(tk.Tk):
         d = filedialog.askdirectory()
         if d:
             string_var.set(d)
+
+    def _detect_ome_channels(self, img_dir_var):
+        """Read OME channel names from the first TIFF in a directory.
+
+        Returns list of channel name strings, or empty list.
+        """
+        from pathlib import Path
+        img_dir = img_dir_var.get() if hasattr(img_dir_var, 'get') else str(img_dir_var)
+        if not img_dir:
+            messagebox.showwarning("No image directory",
+                                   "Set the image directory first.")
+            return []
+
+        # Import from segmentation_utils (shared across all tabs)
+        try:
+            from segmentation_utils import get_ome_channel_names
+        except ImportError:
+            from phase_separation import get_ome_channel_names
+
+        tiff_exts = {".tif", ".tiff"}
+        first_tiff = None
+        for f in sorted(Path(img_dir).iterdir()):
+            if f.suffix.lower() in tiff_exts and f.is_file():
+                first_tiff = f
+                break
+
+        if first_tiff is None:
+            messagebox.showinfo("No images",
+                                "No TIFF files found in the image directory.")
+            return []
+
+        names = get_ome_channel_names(first_tiff)
+        if not names:
+            messagebox.showinfo(
+                "No OME metadata",
+                f"No channel names in OME metadata of:\n{first_tiff.name}\n\n"
+                "Use the fallback index field instead.")
+        return names
 
     # ==================================================================
     # TAB 1: FILE RENAMING

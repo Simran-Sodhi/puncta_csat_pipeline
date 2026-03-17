@@ -22,10 +22,73 @@ from skimage.segmentation import relabel_sequential
 
 
 # ------------------------------------------------------------------ #
+#  OME channel metadata
+# ------------------------------------------------------------------ #
+
+def get_ome_channel_names(path):
+    """Read channel names from OME-TIFF metadata.
+
+    Returns
+    -------
+    list[str] : channel names in file order, e.g. ["DIC", "Cy5", "GFP", "Cy3"].
+                Returns empty list if no OME metadata is found.
+    """
+    import xml.etree.ElementTree as ET
+
+    path = Path(path)
+    names = []
+    try:
+        with tiff.TiffFile(str(path)) as tf:
+            if not tf.ome_metadata:
+                return names
+            root = ET.fromstring(tf.ome_metadata)
+    except Exception:
+        return names
+
+    for ns_uri in [
+        "http://www.openmicroscopy.org/Schemas/OME/2016-06",
+        "",
+    ]:
+        ns_prefix = f"{{{ns_uri}}}" if ns_uri else ""
+        for pixels in root.iter(f"{ns_prefix}Pixels"):
+            for ch in pixels.iter(f"{ns_prefix}Channel"):
+                name = ch.get("Name") or ch.get("ID") or f"ch{len(names)}"
+                names.append(name)
+            break  # only first Pixels element
+        if names:
+            break
+    return names
+
+
+def resolve_channel_index(path, channel_index=0, channel_name=None):
+    """Resolve a channel index, optionally by name from OME metadata.
+
+    If *channel_name* is provided (e.g. ``"GFP"``), the OME channel names
+    are read and a case-insensitive substring match is performed.  If the
+    name is not found the function falls back to *channel_index*.
+
+    Returns
+    -------
+    int : resolved 0-based channel index
+    str or None : matched OME channel name (None if matched by index only)
+    """
+    if channel_name:
+        ome_names = get_ome_channel_names(path)
+        if ome_names:
+            target = channel_name.strip().lower()
+            for idx, n in enumerate(ome_names):
+                if target in n.lower():
+                    return idx, n
+            print(f"[WARN] Channel name '{channel_name}' not found in OME metadata "
+                  f"{ome_names}; falling back to index {channel_index}")
+    return channel_index, None
+
+
+# ------------------------------------------------------------------ #
 #  Image loading
 # ------------------------------------------------------------------ #
 
-def load_image_2d(path, channel_index=0, z_index=0):
+def load_image_2d(path, channel_index=0, z_index=0, channel_name=None):
     """
     Load a single 2D plane from an OME-TIFF or regular TIFF.
 
@@ -37,15 +100,23 @@ def load_image_2d(path, channel_index=0, z_index=0):
     path : str or Path
         Path to the image file.
     channel_index : int
-        0-based channel index to extract.
+        0-based channel index to extract (fallback if channel_name not found).
     z_index : int
         0-based Z-plane index to extract.
+    channel_name : str or None
+        If given, resolve the correct channel index from OME metadata
+        (case-insensitive substring match, e.g. "GFP", "Cy5").
 
     Returns
     -------
     img2d : np.ndarray (Y, X)
     """
     path = str(path)
+
+    # Resolve channel by name from OME metadata if provided
+    resolved_idx, _ = resolve_channel_index(
+        path, channel_index=channel_index, channel_name=channel_name)
+    channel_index = resolved_idx
 
     with tiff.TiffFile(path) as tf:
         series = tf.series[0]

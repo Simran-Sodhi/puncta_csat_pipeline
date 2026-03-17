@@ -148,6 +148,7 @@ def run_benchmark(
     out_dir,
     methods=None,
     channel=1,
+    channel_name=None,
     z_index=0,
     gt_mask_dir=None,
     cell_mask_dir=None,
@@ -267,7 +268,8 @@ def run_benchmark(
         print(f"  [{idx}/{total}] {img_path.name}")
 
         try:
-            img2d = load_image_2d(img_path, channel_index=channel, z_index=z_index)
+            img2d = load_image_2d(img_path, channel_index=channel, z_index=z_index,
+                                 channel_name=channel_name)
         except Exception as exc:
             print(f"    [ERROR] Could not load: {exc}")
             continue

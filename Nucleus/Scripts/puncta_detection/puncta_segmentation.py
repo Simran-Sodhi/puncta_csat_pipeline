@@ -1063,6 +1063,7 @@ def batch_segment(
     image_dir,
     out_dir,
     channel=1,
+    channel_name=None,
     z_index=0,
     method="threshold",
     sigma=1.0,
@@ -1150,7 +1151,8 @@ def batch_segment(
         print(f"  [{idx}/{total}] {img_path.name}")
 
         try:
-            img2d = load_image_2d(img_path, channel_index=channel, z_index=z_index)
+            img2d = load_image_2d(img_path, channel_index=channel, z_index=z_index,
+                                 channel_name=channel_name)
 
             # Look up matching cell mask
             cell_mask = None
