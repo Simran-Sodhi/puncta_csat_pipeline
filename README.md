@@ -1,7 +1,5 @@
-End-to-end pipeline for segmentation and quantitative analysis of fluorescence microscopy data to study phase separation.
 
-Segmentation and analysis of nuclear puncta to study phase separation–associated proteins from fluorescence microscopy images.
-
+## End-to-end pipeline for segmentation and quantitative analysis of fluorescence microscopy data to study phase separation.
 ---
 
 ## Quickstart (TL;DR)
