@@ -47,8 +47,7 @@ This repository is organized into two main folders:
 
 ## Overall workflow
 
-The figure below summarizes the complete analysis pipeline, starting from raw ND2 files and ending with C_sat estimation.
-
+This pipeline processes raw microscopy data to detect puncta formation and estimate phase separation behavior at differing protein concentrations.
 ![Workflow overview](workflow-nucleus-puncta.png)
 
 **High-level steps:**
